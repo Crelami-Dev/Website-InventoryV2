@@ -1,4 +1,5 @@
 import { jsPDF } from 'jspdf';
+import { resolveDocumentItemQuantity } from '../utils/documentQuantity.js';
 
 /**
  * Format tanggal ke dd-Month-yyyy (contoh: 22-July-2026)
@@ -115,24 +116,6 @@ function getUnitHelpers(customUnits) {
   };
 
   return { multipliers, isLusin, parseSn };
-}
-
-function getItemQtyInPcs(item, helpers = null) {
-  const isSerial = item.metadata?.isSerial === true || !!item.metadata?.serialNumber;
-  const serialNumber = item.metadata?.serialNumber || '';
-  let unit = (item.metadata?.qtyUnit || item.qtyUnit || item.unit || 'pcs').toLowerCase();
-  if (isSerial && serialNumber && (!unit || unit === 'pcs' || unit === 'piece')) {
-    unit = helpers ? helpers.parseSn(serialNumber, unit) : parseUnitFromSn(serialNumber, unit);
-  }
-  const qty = isSerial ? 1 : Number(item.metadata?.qtyInput ?? item.quantity ?? item.qty ?? 1);
-  const mult = (helpers ? helpers.multipliers[unit] : MULTIPLIERS[unit]) || ((helpers ? helpers.isLusin(unit) : isLusinUnit(unit)) ? 12 : 1);
-  return {
-    isSerial,
-    serialNumber,
-    unit,
-    qty,
-    pcs: qty * mult,
-  };
 }
 
 function formatDocumentQty(totalLusin, totalPcs) {
@@ -454,14 +437,41 @@ function getGroupedProductItems(items, doc = null, customUnits = null) {
   const helpers = getUnitHelpers(unitsData);
   const groupMap = new Map();
 
+  // Parse active return transactions from doc metadata
+  const activeReturns = Array.isArray(doc?.metadata?.returns)
+    ? doc.metadata.returns.filter((r) => r && r.status !== 'restored')
+    : [];
+
+  const returnedSerialSet = new Set();
+  const returnedNonSerialQtyByItem = new Map();
+
+  activeReturns.forEach((r) => {
+    (r.items || []).forEach((ri) => {
+      const isSerial = ri.isSerial === true || !!ri.serialNumber;
+      if (isSerial && ri.serialNumber) {
+        returnedSerialSet.add(String(ri.serialNumber).trim().toLowerCase());
+      } else {
+        const idKey = String(ri.itemId || ri.productId || '').trim();
+        if (idKey) {
+          const retQty = Number(ri.returnedQty ?? ri.quantity ?? 1) || 0;
+          returnedNonSerialQtyByItem.set(idKey, (returnedNonSerialQtyByItem.get(idKey) || 0) + retQty);
+        }
+      }
+    });
+  });
+
   (items || []).forEach((item) => {
     const productId = item.product_id ?? item.productId ?? item.sku ?? item.item_name ?? item.productName ?? 'default';
+    const itemId = item.id || item.itemId || productId;
     const name = item.item_name || item.itemName || item.product_name || item.name || 'Produk';
     let sku = item.sku || '—';
     if (sku.includes('|')) {
       sku = sku.split('|')[0];
     }
-    const itemInfo = getItemQtyInPcs(item, helpers);
+    const itemInfo = resolveDocumentItemQuantity(item, {
+      multipliers: helpers.multipliers,
+      parseSn: helpers.parseSn,
+    });
 
     if (!groupMap.has(productId)) {
       groupMap.set(productId, {
@@ -471,8 +481,13 @@ function getGroupedProductItems(items, doc = null, customUnits = null) {
         totalPcs: 0,
         totalLusin: 0,
         totalPcsOnly: 0,
+        returnedPcs: 0,
+        returnedLusin: 0,
+        returnedPcsOnly: 0,
         serials: [],
+        returnedSerials: [],
         unitCounts: {},
+        returnedUnitCounts: {},
         purpose: item.metadata?.purpose || 'Pesanan',
         condition: item.metadata?.condition || 'Baik',
       });
@@ -485,6 +500,34 @@ function getGroupedProductItems(items, doc = null, customUnits = null) {
       current.totalLusin += (itemInfo.qty * mult) / 12;
     } else {
       current.totalPcsOnly += itemInfo.pcs;
+    }
+
+    // Check return for this item
+    let itemReturnedQty = 0;
+    if (itemInfo.isSerial && itemInfo.serialNumber) {
+      if (returnedSerialSet.has(itemInfo.serialNumber.toLowerCase())) {
+        itemReturnedQty = itemInfo.qty;
+        if (!current.returnedSerials.includes(itemInfo.serialNumber)) {
+          current.returnedSerials.push(itemInfo.serialNumber);
+        }
+      }
+    } else {
+      const retFromId = returnedNonSerialQtyByItem.get(String(itemId)) || returnedNonSerialQtyByItem.get(String(productId)) || 0;
+      if (retFromId > 0) {
+        itemReturnedQty = Math.min(itemInfo.qty, retFromId);
+      }
+    }
+
+    if (itemReturnedQty > 0) {
+      const retMult = helpers.multipliers[itemInfo.unit] || (helpers.isLusin(itemInfo.unit) ? 12 : 1);
+      const retPcs = itemReturnedQty * retMult;
+      current.returnedPcs += retPcs;
+      if (helpers.isLusin(itemInfo.unit)) {
+        current.returnedLusin += retPcs / 12;
+      } else {
+        current.returnedPcsOnly += retPcs;
+      }
+      current.returnedUnitCounts[itemInfo.unit] = (current.returnedUnitCounts[itemInfo.unit] || 0) + itemReturnedQty;
     }
 
     if (itemInfo.isSerial && itemInfo.serialNumber) {
@@ -512,32 +555,53 @@ function getGroupedProductItems(items, doc = null, customUnits = null) {
       const sn = typeof s === 'string' ? s : (s.serialNumber || s.serial_number);
       if (!sn) return;
       const sProdId = s.productId || s.product_id;
+      const sDocItemId = s.goodsInItemId || s.goods_in_item_id;
       let matched = null;
       if (sProdId && groupMap.has(sProdId)) {
         matched = groupMap.get(sProdId);
       } else {
         for (const g of groupMap.values()) {
-          if (g.productId === sProdId || (s.sku && g.sku === s.sku)) {
+          if (g.productId === sProdId || g.productId === sDocItemId || (s.sku && g.sku === s.sku)) {
             matched = g;
             break;
           }
         }
       }
-      if (matched && !matched.serials.includes(sn)) {
-        matched.serials.push(sn);
+      if (matched) {
+        if (!matched.serials.includes(sn)) {
+          matched.serials.push(sn);
+        }
+        if (returnedSerialSet.has(String(sn).trim().toLowerCase()) && !matched.returnedSerials.includes(sn)) {
+          matched.returnedSerials.push(sn);
+        }
       }
     });
   }
 
   return Array.from(groupMap.values()).map((g) => {
     g.serials.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+    g.returnedSerials.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
     const unitEntries = Object.entries(g.unitCounts);
     const breakdown = unitEntries.map(([u, q]) => `${q} ${u}`).join(', ');
     const formattedQty = formatDocumentQty(g.totalLusin, g.totalPcsOnly);
+
+    const netLusin = Math.max(0, g.totalLusin - g.returnedLusin);
+    const netPcsOnly = Math.max(0, g.totalPcsOnly - g.returnedPcsOnly);
+    const netFormattedQty = formatDocumentQty(netLusin, netPcsOnly);
+    const returnedFormattedQty = formatDocumentQty(g.returnedLusin, g.returnedPcsOnly);
+    const hasReturns = (g.returnedLusin > 0 || g.returnedPcsOnly > 0 || g.returnedSerials.length > 0);
+    const isFullyReturned = hasReturns && netLusin === 0 && netPcsOnly === 0;
+
     return {
       ...g,
       breakdown,
       formattedQty,
+      netLusin,
+      netPcsOnly,
+      netFormattedQty,
+      returnedFormattedQty,
+      hasReturns,
+      isFullyReturned,
     };
   });
 }
@@ -829,6 +893,36 @@ export function generateGoodsOutPdf(docData, settings = {}, contact = {}) {
 
   const title = settings?.documents?.goodsOutTitle || (docData.document_type === 'delivery_note' ? 'SURAT JALAN' : 'SURAT JALAN / GOODS OUT');
 
+  // Compute grouped items and active returns upfront
+  const rawItems = Array.isArray(docData.items) ? docData.items : (docData.metadata?.items || []);
+  const customUnits = settings?.custom_units || settings?.customUnits;
+  const groupedItems = getGroupedProductItems(rawItems, docData, customUnits);
+  const grandTotalLusin = groupedItems.reduce((sum, g) => sum + (g.totalLusin || 0), 0);
+  const grandTotalPcsOnly = groupedItems.reduce((sum, g) => sum + (g.totalPcsOnly || 0), 0);
+  const totalLusinPcs = formatDocumentQty(grandTotalLusin, grandTotalPcsOnly);
+
+  const grandReturnedLusin = groupedItems.reduce((sum, g) => sum + (g.returnedLusin || 0), 0);
+  const grandReturnedPcsOnly = groupedItems.reduce((sum, g) => sum + (g.returnedPcsOnly || 0), 0);
+  const totalReturnedLusinPcs = formatDocumentQty(grandReturnedLusin, grandReturnedPcsOnly);
+
+  const grandNetLusin = groupedItems.reduce((sum, g) => sum + (g.netLusin || 0), 0);
+  const grandNetPcsOnly = groupedItems.reduce((sum, g) => sum + (g.netPcsOnly || 0), 0);
+  const totalNetLusinPcs = formatDocumentQty(grandNetLusin, grandNetPcsOnly);
+
+  const activeReturns = Array.isArray(docData.metadata?.returns)
+    ? docData.metadata.returns.filter((r) => r && r.status !== 'restored')
+    : [];
+  const hasReturns = activeReturns.length > 0;
+  const isFullReturn = hasReturns && (grandNetLusin <= 0 && grandNetPcsOnly <= 0);
+
+  const unitTotals = {};
+  groupedItems.forEach((g) => {
+    Object.entries(g.unitCounts || {}).forEach(([u, q]) => {
+      unitTotals[u] = (unitTotals[u] || 0) + q;
+    });
+  });
+  const unitSummary = Object.entries(unitTotals).map(([u, q]) => `${q} ${u}`).join(', ');
+
   // 1. Header Left
   let headerTextX = margin;
   if (compLogo && compLogo.startsWith('data:image/')) {
@@ -878,8 +972,33 @@ export function generateGoodsOutPdf(docData, settings = {}, contact = {}) {
   const docDateFormatted = formatDate(docData.issue_date || docData.created_at);
   doc.text(`Tanggal: ${docDateFormatted}`, pageWidth - margin, 24.5, { align: 'right' });
 
+  let headerRightBottomY = 24.5;
+  if (hasReturns) {
+    const badgeText = isFullReturn ? 'STATUS: DIRETUR TOTAL' : 'STATUS: DIRETUR SEBAGIAN';
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7.5);
+    const badgeW = doc.getTextWidth(badgeText) + 6;
+    const badgeX = pageWidth - margin - badgeW;
+    const badgeY = 26;
+
+    if (isFullReturn) {
+      doc.setFillColor(254, 242, 242);
+      doc.setDrawColor(220, 38, 38);
+      doc.setTextColor(220, 38, 38);
+    } else {
+      doc.setFillColor(255, 251, 235);
+      doc.setDrawColor(217, 119, 6);
+      doc.setTextColor(180, 83, 9);
+    }
+    doc.setLineWidth(0.3);
+    doc.rect(badgeX, badgeY, badgeW, 4.8, 'FD');
+    doc.text(badgeText, badgeX + 3, badgeY + 3.5);
+    doc.setTextColor(0, 0, 0);
+    headerRightBottomY = badgeY + 6;
+  }
+
   // Divider Line Header
-  const headerLineY = Math.max(currentY + 2, 28);
+  const headerLineY = Math.max(currentY + 2, headerRightBottomY + 2, 28);
   doc.setDrawColor(0, 0, 0);
   doc.setLineWidth(0.5);
   doc.line(margin, headerLineY, pageWidth - margin, headerLineY);
@@ -959,21 +1078,6 @@ export function generateGoodsOutPdf(docData, settings = {}, contact = {}) {
   }
 
   // 3. Grouped Items Table
-  const rawItems = Array.isArray(docData.items) ? docData.items : (docData.metadata?.items || []);
-  const customUnits = settings?.custom_units || settings?.customUnits;
-  const groupedItems = getGroupedProductItems(rawItems, docData, customUnits);
-  const grandTotalLusin = groupedItems.reduce((sum, g) => sum + (g.totalLusin || 0), 0);
-  const grandTotalPcsOnly = groupedItems.reduce((sum, g) => sum + (g.totalPcsOnly || 0), 0);
-  const totalLusinPcs = formatDocumentQty(grandTotalLusin, grandTotalPcsOnly);
-
-  const unitTotals = {};
-  groupedItems.forEach((g) => {
-    Object.entries(g.unitCounts || {}).forEach(([u, q]) => {
-      unitTotals[u] = (unitTotals[u] || 0) + q;
-    });
-  });
-  const unitSummary = Object.entries(unitTotals).map(([u, q]) => `${q} ${u}`).join(', ');
-
   let tableY = gridY + 28;
   const drawTableHeader = (startY) => {
     doc.setFillColor(0, 0, 0);
@@ -986,7 +1090,7 @@ export function generateGoodsOutPdf(docData, settings = {}, contact = {}) {
     doc.text('No', margin + 3, startY + 4.8);
     doc.text('Kode SKU', margin + 12, startY + 4.8);
     doc.text('Nama Barang & Nomor Seri', margin + 44, startY + 4.8);
-    doc.text('Jumlah', pageWidth - margin - 35, startY + 4.8, { align: 'right' });
+    doc.text(hasReturns ? 'Qty (Awal/Ret/Net)' : 'Jumlah', pageWidth - margin - 35, startY + 4.8, { align: 'right' });
     doc.text('Keterangan', pageWidth - margin - 3, startY + 4.8, { align: 'right' });
   };
 
@@ -999,12 +1103,22 @@ export function generateGoodsOutPdf(docData, settings = {}, contact = {}) {
     const skuText = (g.sku && g.sku !== '—' && g.sku !== '-') ? String(g.sku) : '-';
     const nameLines = doc.splitTextToSize(g.name, 76);
     const hasSerials = Array.isArray(g.serials) && g.serials.length > 0;
-    const serialsText = hasSerials ? `No. Seri (${g.serials.length}): ${g.serials.join(', ')}` : '';
+    
+    let serialsText = '';
+    if (hasSerials) {
+      const serialTokens = g.serials.map((s) => {
+        const isRet = Array.isArray(g.returnedSerials) && g.returnedSerials.includes(s);
+        return isRet ? `${s} [RETUR]` : s;
+      });
+      serialsText = `No. Seri (${g.serials.length}): ${serialTokens.join(', ')}`;
+    }
     const serialsLines = hasSerials ? doc.splitTextToSize(serialsText, 74) : [];
 
+    const extraQtyHeight = g.hasReturns ? 9 : 0;
     const rowHeight = Math.max(
-      7.5,
-      nameLines.length * 3.6 + (hasSerials ? serialsLines.length * 2.8 + 4.5 : 0) + 2.5
+      8,
+      nameLines.length * 3.6 + (hasSerials ? serialsLines.length * 2.8 + 4.5 : 0) + 2.5,
+      extraQtyHeight + 4
     );
 
     if (y + rowHeight > pageHeight - 55) {
@@ -1054,16 +1168,34 @@ export function generateGoodsOutPdf(docData, settings = {}, contact = {}) {
     }
 
     // Jumlah
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(8.5);
-    doc.setTextColor(0, 0, 0);
-    doc.text(g.formattedQty, pageWidth - margin - 35, y + 3.5, { align: 'right' });
+    if (g.hasReturns) {
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(8);
+      doc.setTextColor(0, 0, 0);
+      doc.text(g.formattedQty, pageWidth - margin - 35, y + 3.2, { align: 'right' });
 
-    if (g.breakdown) {
       doc.setFont('helvetica', 'normal');
       doc.setFontSize(6.8);
+      doc.setTextColor(220, 38, 38);
+      doc.text(`-${g.returnedFormattedQty}`, pageWidth - margin - 35, y + 6.6, { align: 'right' });
+
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(7.5);
+      doc.setTextColor(22, 163, 74);
+      doc.text(`Net: ${g.netFormattedQty}`, pageWidth - margin - 35, y + 10.2, { align: 'right' });
       doc.setTextColor(0, 0, 0);
-      doc.text(`(${g.breakdown})`, pageWidth - margin - 35, y + 7.0, { align: 'right' });
+    } else {
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(8.5);
+      doc.setTextColor(0, 0, 0);
+      doc.text(g.formattedQty, pageWidth - margin - 35, y + 3.5, { align: 'right' });
+
+      if (g.breakdown) {
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(6.8);
+        doc.setTextColor(0, 0, 0);
+        doc.text(`(${g.breakdown})`, pageWidth - margin - 35, y + 7.0, { align: 'right' });
+      }
     }
 
     // Purpose / Keterangan
@@ -1076,7 +1208,8 @@ export function generateGoodsOutPdf(docData, settings = {}, contact = {}) {
   });
 
   // 4. Bottom Section (Notes + Total + 3-Signatures)
-  const bottomHeight = 52;
+  const boxHeight = hasReturns ? 22 : 18;
+  const bottomHeight = hasReturns ? 56 : 52;
   if (y + bottomHeight > pageHeight - margin) {
     doc.addPage();
     y = 15;
@@ -1087,11 +1220,10 @@ export function generateGoodsOutPdf(docData, settings = {}, contact = {}) {
   // Notes box (Left)
   const notesWidth = contentWidth * 0.58;
   const notesText = docData.notes || 'Barang telah diperiksa dan diserahkan dalam keadaan baik, lengkap, serta sesuai dengan rincian di atas.';
-  const noticeLines = doc.splitTextToSize(notesText, notesWidth - 8);
 
   doc.setFillColor(255, 255, 255);
   doc.setDrawColor(0, 0, 0);
-  doc.rect(margin, bottomY, notesWidth, 18, 'D');
+  doc.rect(margin, bottomY, notesWidth, boxHeight, 'D');
 
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(7);
@@ -1099,9 +1231,23 @@ export function generateGoodsOutPdf(docData, settings = {}, contact = {}) {
   doc.text('CATATAN PENGIRIMAN:', margin + 4, bottomY + 4.5);
 
   doc.setFont('helvetica', 'normal');
-  doc.setFontSize(7);
+  doc.setFontSize(6.8);
   doc.setTextColor(0, 0, 0);
-  doc.text(noticeLines.slice(0, 3), margin + 4, bottomY + 8.5);
+
+  if (hasReturns) {
+    const retSummary = activeReturns.map((r) => {
+      const retNum = r.returnNumber || 'RET-DOKUMEN';
+      const retDate = formatDate(r.returnedAt || r.date);
+      const retReason = r.reason ? ` - ${r.reason}` : '';
+      return `${retNum} (${retDate})${retReason}`;
+    }).join('; ');
+    const fullNotes = `${notesText}\n[RIWAYAT RETUR]: ${retSummary}`;
+    const noticeLines = doc.splitTextToSize(fullNotes, notesWidth - 8);
+    doc.text(noticeLines.slice(0, 4), margin + 4, bottomY + 8);
+  } else {
+    const noticeLines = doc.splitTextToSize(notesText, notesWidth - 8);
+    doc.text(noticeLines.slice(0, 3), margin + 4, bottomY + 8.5);
+  }
 
   // Total box (Right)
   const totalBoxX = margin + notesWidth + 4;
@@ -1110,27 +1256,53 @@ export function generateGoodsOutPdf(docData, settings = {}, contact = {}) {
   doc.setFillColor(255, 255, 255);
   doc.setDrawColor(0, 0, 0);
   doc.setLineWidth(0.4);
-  doc.rect(totalBoxX, bottomY, totalBoxWidth, 18, 'D');
+  doc.rect(totalBoxX, bottomY, totalBoxWidth, boxHeight, 'D');
 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(7.5);
   doc.setTextColor(0, 0, 0);
-  doc.text(`Total: ${groupedItems.length} Item Produk`, totalBoxX + 4, bottomY + 5.5);
+  doc.text(`Total: ${groupedItems.length} Item`, totalBoxX + 4, bottomY + 5);
 
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(10);
-  doc.setTextColor(0, 0, 0);
-  doc.text(totalLusinPcs, totalBoxX + totalBoxWidth - 4, bottomY + 11.5, { align: 'right' });
-
-  if (unitSummary) {
+  if (hasReturns) {
     doc.setFont('helvetica', 'normal');
-    doc.setFontSize(6.8);
+    doc.setFontSize(7.5);
     doc.setTextColor(0, 0, 0);
-    doc.text(`(${unitSummary})`, totalBoxX + totalBoxWidth - 4, bottomY + 15.5, { align: 'right' });
+    doc.text(`Awal: ${totalLusinPcs}`, totalBoxX + totalBoxWidth - 4, bottomY + 5, { align: 'right' });
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(7.5);
+    doc.setTextColor(220, 38, 38);
+    doc.text(`Retur: -${totalReturnedLusinPcs}`, totalBoxX + totalBoxWidth - 4, bottomY + 9.2, { align: 'right' });
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(9);
+    doc.setTextColor(22, 163, 74);
+    doc.text(`Net: ${totalNetLusinPcs}`, totalBoxX + totalBoxWidth - 4, bottomY + 14, { align: 'right' });
+    doc.setTextColor(0, 0, 0);
+
+    if (unitSummary) {
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(6.5);
+      doc.setTextColor(100, 100, 100);
+      doc.text(`(${unitSummary})`, totalBoxX + totalBoxWidth - 4, bottomY + 18.5, { align: 'right' });
+      doc.setTextColor(0, 0, 0);
+    }
+  } else {
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(10);
+    doc.setTextColor(0, 0, 0);
+    doc.text(totalLusinPcs, totalBoxX + totalBoxWidth - 4, bottomY + 11.5, { align: 'right' });
+
+    if (unitSummary) {
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(6.8);
+      doc.setTextColor(0, 0, 0);
+      doc.text(`(${unitSummary})`, totalBoxX + totalBoxWidth - 4, bottomY + 15.5, { align: 'right' });
+    }
   }
 
   // 3-Signatures Box
-  const sigY = bottomY + 22;
+  const sigY = bottomY + boxHeight + 3.5;
   const colWidth = contentWidth / 3;
 
   const signatures = [
@@ -1399,6 +1571,28 @@ export function generateGoodsOutPdfCompact(docData, settings = {}, contact = {})
   const compLogo = settings.companyLogo || settings.logoUrl || '';
   const title = settings?.documents?.goodsOutTitle || (docData.document_type === 'delivery_note' ? 'Surat Jalan' : 'Surat Jalan / Goods Out');
 
+  // Compute grouped items and active returns upfront
+  const rawItems = Array.isArray(docData.items) ? docData.items : (docData.metadata?.items || []);
+  const customUnits = settings?.custom_units || settings?.customUnits;
+  const groupedItems = getGroupedProductItems(rawItems, docData, customUnits);
+  const grandTotalLusin = groupedItems.reduce((sum, g) => sum + (g.totalLusin || 0), 0);
+  const grandTotalPcsOnly = groupedItems.reduce((sum, g) => sum + (g.totalPcsOnly || 0), 0);
+  const totalLusinPcs = formatDocumentQty(grandTotalLusin, grandTotalPcsOnly);
+
+  const grandReturnedLusin = groupedItems.reduce((sum, g) => sum + (g.returnedLusin || 0), 0);
+  const grandReturnedPcsOnly = groupedItems.reduce((sum, g) => sum + (g.returnedPcsOnly || 0), 0);
+  const totalReturnedLusinPcs = formatDocumentQty(grandReturnedLusin, grandReturnedPcsOnly);
+
+  const grandNetLusin = groupedItems.reduce((sum, g) => sum + (g.netLusin || 0), 0);
+  const grandNetPcsOnly = groupedItems.reduce((sum, g) => sum + (g.netPcsOnly || 0), 0);
+  const totalNetLusinPcs = formatDocumentQty(grandNetLusin, grandNetPcsOnly);
+
+  const activeReturns = Array.isArray(docData.metadata?.returns)
+    ? docData.metadata.returns.filter((r) => r && r.status !== 'restored')
+    : [];
+  const hasReturns = activeReturns.length > 0;
+  const isFullReturn = hasReturns && (grandNetLusin <= 0 && grandNetPcsOnly <= 0);
+
   const drawHeader = () => {
     let headerTextX = margin;
     if (compLogo && compLogo.startsWith('data:image/')) {
@@ -1431,15 +1625,28 @@ export function generateGoodsOutPdfCompact(docData, settings = {}, contact = {})
     }
 
     doc.setFont('helvetica', 'bold');
-    doc.setFontSize(15);
-    doc.text(title, pageWidth - margin, 12, { align: 'right' });
+    doc.setFontSize(14);
+    doc.text(title, pageWidth - margin, 11, { align: 'right' });
+
+    if (hasReturns) {
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(7.5);
+      if (isFullReturn) {
+        doc.setTextColor(220, 38, 38);
+        doc.text('[DIRETUR TOTAL]', pageWidth - margin, 15, { align: 'right' });
+      } else {
+        doc.setTextColor(217, 119, 6);
+        doc.text('[DIRETUR SEBAGIAN]', pageWidth - margin, 15, { align: 'right' });
+      }
+      doc.setTextColor(0, 0, 0);
+    }
 
     doc.setFont('helvetica', 'normal');
-    doc.setFontSize(8);
+    doc.setFontSize(7.5);
     const formattedDate = formatDate(docData.issue_date || docData.created_at);
-    doc.text(`${docData.document_number ?? '-'} · ${formattedDate}`, pageWidth - margin, 17, { align: 'right' });
+    doc.text(`${docData.document_number ?? '-'} · ${formattedDate}`, pageWidth - margin, hasReturns ? 19 : 16, { align: 'right' });
 
-    const headerLineY = Math.max(currentY + 1, 23);
+    const headerLineY = Math.max(currentY + 1, hasReturns ? 24 : 22);
     doc.setDrawColor(0, 0, 0);
     doc.setLineWidth(0.4);
     doc.line(margin, headerLineY, pageWidth - margin, headerLineY);
@@ -1480,8 +1687,8 @@ export function generateGoodsOutPdfCompact(docData, settings = {}, contact = {})
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(8.5);
     doc.setTextColor(0, 0, 0);
-    doc.text('Barang', margin + 2, startY + 4);
-    doc.text('Jumlah', pageWidth - margin - 30, startY + 4, { align: 'right' });
+    doc.text('Barang & Nomor Seri', margin + 2, startY + 4);
+    doc.text(hasReturns ? 'Qty (Awal/Ret/Net)' : 'Jumlah', pageWidth - margin - 30, startY + 4, { align: 'right' });
     doc.text('Ket.', pageWidth - margin - 2, startY + 4, { align: 'right' });
 
     doc.setDrawColor(0, 0, 0);
@@ -1491,13 +1698,6 @@ export function generateGoodsOutPdfCompact(docData, settings = {}, contact = {})
 
   drawTableHeader(tableY);
 
-  const rawItems = Array.isArray(docData.items) ? docData.items : (docData.metadata?.items || []);
-  const customUnits = settings?.custom_units || settings?.customUnits;
-  const groupedItems = getGroupedProductItems(rawItems, docData, customUnits);
-  const grandTotalLusin = groupedItems.reduce((sum, g) => sum + (g.totalLusin || 0), 0);
-  const grandTotalPcsOnly = groupedItems.reduce((sum, g) => sum + (g.totalPcsOnly || 0), 0);
-  const totalLusinPcs = formatDocumentQty(grandTotalLusin, grandTotalPcsOnly);
-
   let y = tableY + 11;
   doc.setFont('helvetica', 'normal');
   doc.setTextColor(0, 0, 0);
@@ -1505,7 +1705,21 @@ export function generateGoodsOutPdfCompact(docData, settings = {}, contact = {})
   groupedItems.forEach((g) => {
     const nameLines = doc.splitTextToSize(g.name, 120);
     const hasSku = g.sku && g.sku !== '—' && g.sku !== '-';
-    const rowHeight = nameLines.length * 4 + (hasSku ? 3.2 : 0) + 3;
+    const hasSerials = Array.isArray(g.serials) && g.serials.length > 0;
+    let serialsText = '';
+    if (hasSerials) {
+      const serialTokens = g.serials.map((s) => {
+        const isRet = Array.isArray(g.returnedSerials) && g.returnedSerials.includes(s);
+        return isRet ? `${s} [RETUR]` : s;
+      });
+      serialsText = `No. Seri (${g.serials.length}): ${serialTokens.join(', ')}`;
+    }
+    const serialLines = hasSerials ? doc.splitTextToSize(serialsText, 120) : [];
+    const extraQtyHeight = g.hasReturns ? 6 : 0;
+    const rowHeight = Math.max(
+      nameLines.length * 3.8 + (hasSku ? 3.0 : 0) + (hasSerials ? serialLines.length * 2.8 + 1 : 0) + 3,
+      extraQtyHeight + 6
+    );
 
     if (y + rowHeight > 88) {
       doc.addPage();
@@ -1524,29 +1738,59 @@ export function generateGoodsOutPdfCompact(docData, settings = {}, contact = {})
     doc.setFontSize(8.5);
     doc.text(nameLines, margin + 2, y);
 
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(8.5);
-    doc.text(g.formattedQty, pageWidth - margin - 30, y, { align: 'right' });
+    let textY = y + nameLines.length * 3.8;
+    if (hasSku) {
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(7);
+      doc.setTextColor(80, 80, 80);
+      doc.text(`SKU: ${g.sku}`, margin + 2, textY);
+      doc.setTextColor(0, 0, 0);
+      textY += 3.0;
+    }
+
+    if (hasSerials) {
+      doc.setFont('courier', 'normal');
+      doc.setFontSize(6.5);
+      doc.setTextColor(30, 30, 30);
+      doc.text(serialLines, margin + 2, textY);
+      doc.setTextColor(0, 0, 0);
+    }
+
+    if (g.hasReturns) {
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(8);
+      doc.text(g.formattedQty, pageWidth - margin - 30, y, { align: 'right' });
+
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(6.8);
+      doc.setTextColor(220, 38, 38);
+      doc.text(`-${g.returnedFormattedQty}`, pageWidth - margin - 30, y + 3.2, { align: 'right' });
+
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(7.5);
+      doc.setTextColor(22, 163, 74);
+      doc.text(`Net: ${g.netFormattedQty}`, pageWidth - margin - 30, y + 6.6, { align: 'right' });
+      doc.setTextColor(0, 0, 0);
+    } else {
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(8.5);
+      doc.text(g.formattedQty, pageWidth - margin - 30, y, { align: 'right' });
+    }
 
     doc.setFont('helvetica', 'normal');
     doc.setFontSize(8);
     doc.text(g.purpose || 'Pesanan', pageWidth - margin - 2, y, { align: 'right' });
-
-    if (hasSku) {
-      const skuY = y + nameLines.length * 3.8;
-      doc.setFont('helvetica', 'normal');
-      doc.setFontSize(7);
-      doc.setTextColor(80, 80, 80);
-      doc.text(`SKU: ${g.sku}`, margin + 2, skuY);
-      doc.setTextColor(0, 0, 0);
-    }
 
     y += rowHeight;
   });
 
   const fullWidth = pageWidth - 2 * margin;
   const notesText = docData.notes || 'Barang telah diperiksa dan diserahkan dalam keadaan baik, lengkap, serta sesuai dengan rincian di atas.';
-  const noticeLines = doc.splitTextToSize(notesText, fullWidth - 6);
+  const returnSummaryText = hasReturns
+    ? `\nRiwayat Retur: ${activeReturns.map((r) => `${r.returnNumber || 'RET'} (${formatDate(r.returnedAt || r.date)})`).join(', ')}`
+    : '';
+  const fullNotesText = `${notesText}${returnSummaryText}`;
+  const noticeLines = doc.splitTextToSize(fullNotesText, fullWidth - 6);
   const noticeBoxHeight = Math.max(8, noticeLines.length * 3.5 + 4.5);
   const neededHeight = 6 + 1.5 + noticeBoxHeight + 18;
 
@@ -1563,10 +1807,20 @@ export function generateGoodsOutPdfCompact(docData, settings = {}, contact = {})
   doc.rect(margin, bottomY, fullWidth, 6);
 
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(8.5);
+  doc.setFontSize(8);
   doc.setTextColor(0, 0, 0);
   doc.text('Total Jumlah:', margin + 3, bottomY + 4.2);
-  doc.text(totalLusinPcs, pageWidth - margin - 3, bottomY + 4.2, { align: 'right' });
+
+  if (hasReturns) {
+    const totalLine = `Awal: ${totalLusinPcs} | Retur: -${totalReturnedLusinPcs} | Net Terkirim: ${totalNetLusinPcs}`;
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7.8);
+    doc.text(totalLine, pageWidth - margin - 3, bottomY + 4.2, { align: 'right' });
+  } else {
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(8.5);
+    doc.text(totalLusinPcs, pageWidth - margin - 3, bottomY + 4.2, { align: 'right' });
+  }
 
   const noticeBoxY = bottomY + 7.5;
   doc.rect(margin, noticeBoxY, fullWidth, noticeBoxHeight);
@@ -1584,6 +1838,341 @@ export function generateGoodsOutPdfCompact(docData, settings = {}, contact = {})
   doc.setFontSize(8);
 
   doc.text('Penerima', margin + 35, sigY + 3, { align: 'center' });
+  doc.setLineWidth(0.3);
+  doc.line(margin + 15, sigY + 16, margin + 55, sigY + 16);
+
+  doc.text('Hormat Kami', pageWidth - margin - 35, sigY + 3, { align: 'center' });
+  doc.line(pageWidth - margin - 55, sigY + 16, pageWidth - margin - 15, sigY + 16);
+
+  const arrayBuffer = doc.output('arraybuffer');
+  return Buffer.from(arrayBuffer);
+}
+
+function formatReturnCompactDate(value) {
+  const date = value ? new Date(value) : new Date();
+  if (Number.isNaN(date.getTime())) return String(value || '-');
+  return date.toLocaleString('id-ID', {
+    timeZone: 'Asia/Jakarta',
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+}
+
+function groupReturnPdfItems(returnRecord, docData) {
+  const docItems = Array.isArray(docData?.items) ? docData.items : [];
+  const rawItems = Array.isArray(returnRecord?.items) ? returnRecord.items : [];
+  const grouped = [];
+  const groupMap = new Map();
+
+  rawItems.forEach((item) => {
+    const matchedDocItem =
+      docItems.find((di) => item.itemId && di.id === item.itemId) ||
+      docItems.find((di) => item.productId && (di.product_id ?? di.productId) === item.productId) ||
+      docItems.find(
+        (di) =>
+          item.serialNumber &&
+          di.metadata?.isSerial === true &&
+          String(di.metadata?.serialNumber || '').trim().toLowerCase() ===
+            String(item.serialNumber).trim().toLowerCase()
+      ) ||
+      null;
+
+    const productId =
+      item.productId || item.product_id || item.itemId || item.productName || item.item_name || 'unknown';
+    const productName =
+      item.productName || item.item_name || item.itemName || matchedDocItem?.item_name || 'Produk';
+    const sku = item.sku || matchedDocItem?.sku || '';
+    const unit = item.qtyUnit || item.unit || matchedDocItem?.metadata?.qtyUnit || 'pcs';
+    const condition = item.condition || item.targetStatus || 'available';
+    const returnedQty = Number(item.returnedQty ?? item.quantity ?? 1) || 1;
+    const serialNumber =
+      item.serialNumber ||
+      item.serial_number ||
+      (item.itemId && matchedDocItem?.metadata?.isSerial ? matchedDocItem?.metadata?.serialNumber : '') ||
+      '';
+    const key = `${productId}__${unit}__${condition}`;
+
+    if (!groupMap.has(key)) {
+      const group = {
+        key,
+        productId,
+        productName,
+        sku,
+        unit,
+        condition,
+        totalQty: returnedQty,
+        serials: serialNumber ? [serialNumber] : [],
+      };
+      groupMap.set(key, group);
+      grouped.push(group);
+      return;
+    }
+
+    const group = groupMap.get(key);
+    group.totalQty += returnedQty;
+    if (serialNumber && !group.serials.includes(serialNumber)) {
+      group.serials.push(serialNumber);
+    }
+  });
+
+  grouped.forEach((group) => {
+    group.serials.sort((a, b) => String(a).localeCompare(String(b), undefined, { numeric: true }));
+  });
+
+  return grouped;
+}
+
+export function generateReturnPdfCompact(returnRecord = {}, settings = {}, contact = {}, docData = {}) {
+  const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: [120, 210] });
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const margin = 10;
+  const fullWidth = pageWidth - 2 * margin;
+
+  const compName = settings.companyName || settings.company?.companyName || settings.company?.name || 'Docuflow';
+  const compAddr = settings.address || settings.companyAddress || settings.company?.address || '';
+  const compCity = settings.city || settings.companyCity || settings.company?.city || '';
+  const compPhone = settings.phone || settings.companyPhone || settings.company?.phone || '';
+  const compEmail = settings.email || settings.companyEmail || settings.company?.email || '';
+  const compLogo =
+    settings.companyLogo || settings.company?.companyLogo || settings.company?.logoUrl || settings.logoUrl || '';
+  const title = 'Return';
+
+  const documentNumber = returnRecord.documentNumber || docData.document_number || '-';
+  const returnNumber = returnRecord.returnNumber || `RET-${documentNumber}`;
+  const returnDate = formatReturnCompactDate(
+    returnRecord.returnedAt || returnRecord.date || returnRecord.createdAt || docData.created_at
+  );
+  const warehouse =
+    returnRecord.warehouseName || returnRecord.metadata?.warehouse || docData.metadata?.warehouse || 'Gudang Utama';
+  const documentType =
+    returnRecord.documentType ||
+    returnRecord.document_type ||
+    returnRecord.type ||
+    docData.document_type ||
+    'goods_out';
+  const isGoodsOut = documentType === 'goods_out';
+
+  const customerName =
+    docData.contact_name || returnRecord.contactName || contact.name || (isGoodsOut ? 'Pelanggan' : 'Pemasok');
+  const customerAddress = [
+    contact.address || docData.contact_address,
+    contact.city || docData.contact_city,
+    contact.province || docData.contact_province,
+  ]
+    .filter(Boolean)
+    .join(', ');
+  const customerDetail =
+    [customerAddress, contact.phone || docData.contact_phone].filter(Boolean).join(' | ') || '-';
+
+  const drawHeader = () => {
+    let headerTextX = margin;
+    if (compLogo && String(compLogo).startsWith('data:image/')) {
+      try {
+        doc.addImage(compLogo, 'PNG', margin, 5, 14, 14);
+        headerTextX = margin + 17;
+      } catch (_) {}
+    }
+
+    doc.setTextColor(0, 0, 0);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(13);
+    doc.text(String(compName), headerTextX, 11);
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(7.5);
+    let currentY = 15;
+    const addressLine = [compAddr, compCity].filter(Boolean).join(', ');
+    if (addressLine) {
+      const addressLines = doc.splitTextToSize(addressLine, 100);
+      addressLines.forEach((line) => {
+        doc.text(line, headerTextX, currentY);
+        currentY += 3.2;
+      });
+    }
+    const contactLine = [compEmail, compPhone].filter(Boolean).join(' | ');
+    if (contactLine) {
+      doc.text(contactLine, headerTextX, currentY);
+      currentY += 3.2;
+    }
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(16);
+    doc.text(title, pageWidth - margin, 12, { align: 'right' });
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8);
+    doc.text(`${returnNumber} | ${returnDate}`, pageWidth - margin, 17, { align: 'right' });
+
+    const headerLineY = Math.max(currentY + 1, 23);
+    doc.setDrawColor(0, 0, 0);
+    doc.setLineWidth(0.4);
+    doc.line(margin, headerLineY, pageWidth - margin, headerLineY);
+    return headerLineY;
+  };
+
+  const drawTableHeader = (startY) => {
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(8.5);
+    doc.setTextColor(0, 0, 0);
+    doc.text('Barang Diretur', margin + 2, startY + 4);
+    doc.text('Jumlah', pageWidth - margin - 42, startY + 4, { align: 'right' });
+    doc.text('Kondisi', pageWidth - margin - 2, startY + 4, { align: 'right' });
+
+    doc.setDrawColor(0, 0, 0);
+    doc.setLineWidth(0.3);
+    doc.line(margin, startY + 6, pageWidth - margin, startY + 6);
+  };
+
+  const headerLineY = drawHeader();
+
+  const gridY = headerLineY + 5;
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(7.5);
+  doc.setTextColor(0, 0, 0);
+  doc.text(isGoodsOut ? 'Pelanggan' : 'Pemasok', margin, gridY);
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(9.5);
+  doc.text(String(customerName), margin, gridY + 4.5);
+
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(7);
+  const customerLines = doc.splitTextToSize(customerDetail, 108);
+  doc.text(customerLines, margin, gridY + 7.8);
+  const leftBottomY = gridY + 7.8 + Math.max(1, customerLines.length) * 3.1;
+
+  const rightColX = 137;
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(7.5);
+  doc.text('Informasi Retur', rightColX, gridY);
+
+  doc.setFontSize(7);
+  const infoLines = [
+    ...doc.splitTextToSize(`Ref Dokumen: ${documentNumber}`, 63),
+    ...doc.splitTextToSize(`Gudang: ${warehouse}`, 63),
+  ];
+  doc.text(infoLines, rightColX, gridY + 4.5);
+  const rightBottomY = gridY + 4.5 + infoLines.length * 3.1;
+
+  const gridLineY = Math.max(gridY + 11, leftBottomY + 2, rightBottomY + 2);
+  doc.setLineWidth(0.2);
+  doc.line(margin, gridLineY, pageWidth - margin, gridLineY);
+
+  let tableY = gridLineY + 2;
+  drawTableHeader(tableY);
+
+  const groupedItems = groupReturnPdfItems(returnRecord, docData);
+  const totalUnits = groupedItems.reduce((sum, group) => sum + group.totalQty, 0);
+  const unitTotals = {};
+  groupedItems.forEach((group) => {
+    unitTotals[group.unit] = (unitTotals[group.unit] || 0) + group.totalQty;
+  });
+  const unitSummary =
+    Object.entries(unitTotals)
+      .map(([unit, qty]) => `${qty} ${unit}`)
+      .join(', ') || `${totalUnits} unit`;
+
+  let y = tableY + 11;
+
+  groupedItems.forEach((group, index) => {
+    const nameLines = doc.splitTextToSize(String(group.productName), 120);
+    const hasSku = Boolean(group.sku && group.sku !== '-' && group.sku !== '—');
+    const serialText =
+      group.serials.length > 0 ? `No. Seri (${group.serials.length}): ${group.serials.join(', ')}` : '';
+    const serialLines = serialText ? doc.splitTextToSize(serialText, 132) : [];
+    const rowHeight =
+      nameLines.length * 4 + (hasSku ? 3.2 : 0) + serialLines.length * 2.8 + 3;
+    const itemBottomLimit =
+      index === groupedItems.length - 1 ? pageHeight - margin - 31 : pageHeight - margin - 12;
+
+    if (y + rowHeight > itemBottomLimit) {
+      doc.addPage();
+      const newHeaderLineY = drawHeader();
+      const newTableY = newHeaderLineY + 5;
+      drawTableHeader(newTableY);
+      y = newTableY + 11;
+    }
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(8.5);
+    doc.setTextColor(0, 0, 0);
+    doc.text(nameLines, margin + 2, y);
+    doc.text(`${group.totalQty} ${group.unit}`, pageWidth - margin - 42, y, { align: 'right' });
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7.5);
+    doc.setTextColor(group.condition === 'damaged' ? 185 : 22, group.condition === 'damaged' ? 28 : 163, group.condition === 'damaged' ? 28 : 74);
+    doc.text(
+      group.condition === 'damaged' ? 'Rusak / Damaged' : 'Baik / Tersedia',
+      pageWidth - margin - 2,
+      y,
+      { align: 'right' }
+    );
+
+    let detailY = y + nameLines.length * 3.8;
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(7);
+    doc.setTextColor(80, 80, 80);
+    if (hasSku) {
+      doc.text(`SKU: ${group.sku}`, margin + 2, detailY);
+      detailY += 3.2;
+    }
+    if (serialLines.length > 0) {
+      doc.text(serialLines, margin + 2, detailY);
+    }
+
+    doc.setTextColor(0, 0, 0);
+    y += rowHeight;
+  });
+
+  const defaultNote = 'Barang telah diperiksa fisik dan dicatat dalam pembukuan retur gudang.';
+  const rawNote = String(returnRecord.notes || '').trim();
+  const rawReason = String(returnRecord.reason || returnRecord.return_reason || '').trim();
+  const notesText =
+    rawNote && rawNote.toLowerCase() !== rawReason.toLowerCase() ? rawNote : defaultNote;
+  const noticeLines = doc.splitTextToSize(notesText, fullWidth - 6);
+  const noticeBoxHeight = Math.max(8, noticeLines.length * 3.5 + 4.5);
+  const neededHeight = 6 + 1.5 + noticeBoxHeight + 18;
+  const getSigLineY = (bottomStartY) => bottomStartY + 6 + 1.5 + noticeBoxHeight + 4 + 16;
+
+  let bottomY = Math.max(y + 2, pageHeight - margin - neededHeight);
+  if (getSigLineY(bottomY) > pageHeight - 2) {
+    doc.addPage();
+    drawHeader();
+    y = 30;
+    bottomY = Math.max(y + 2, pageHeight - margin - neededHeight);
+  }
+
+  doc.setDrawColor(0, 0, 0);
+  doc.setLineWidth(0.3);
+  doc.rect(margin, bottomY, fullWidth, 6);
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(8);
+  doc.setTextColor(0, 0, 0);
+  doc.text(`Total Barang: ${groupedItems.length} Jenis`, margin + 3, bottomY + 4.2);
+  doc.text(`Total Retur: ${unitSummary}`, pageWidth - margin - 3, bottomY + 4.2, { align: 'right' });
+
+  const noticeBoxY = bottomY + 7.5;
+  doc.rect(margin, noticeBoxY, fullWidth, noticeBoxHeight);
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(7.5);
+  doc.text('CATATAN', margin + 3, noticeBoxY + 3.8);
+
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(7);
+  doc.text(noticeLines, margin + 3, noticeBoxY + 7.2);
+
+  const sigY = noticeBoxY + noticeBoxHeight + 4;
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(8);
+  doc.text(isGoodsOut ? 'Penerima / Pelanggan' : 'Pemasok', margin + 35, sigY + 3, { align: 'center' });
   doc.setLineWidth(0.3);
   doc.line(margin + 15, sigY + 16, margin + 55, sigY + 16);
 

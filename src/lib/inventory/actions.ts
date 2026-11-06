@@ -21,6 +21,12 @@ import {
   type RegisterGoodsInSerialsInput,
   type CreatePurchaseOrderInput,
   type PurchaseOrderRecord,
+  type StockOpnameSessionRecord,
+  type SubmitStockOpnameForReviewResult,
+  type ApproveAndPostStockOpnameAdjustmentInput,
+  type ApproveAndPostStockOpnameAdjustmentResult,
+  type CreateInventoryReturnInput,
+  type RevertInventoryReturnInput,
 } from "@/lib/db/repositories/inventory-repository";
 import { AppError } from "@/lib/errors/app-error";
 
@@ -713,6 +719,51 @@ export async function saveStockOpnameInvestigationAction(input: {
   }
 }
 
+export async function submitStockOpnameForReviewAction(
+  sessionId: string
+): Promise<SubmitStockOpnameForReviewResult | { success: false; error: string }> {
+  const session = await getServerSessionContext();
+  if (!session) {
+    return { success: false as const, error: "Akses tidak diizinkan. Silakan login terlebih dahulu." };
+  }
+
+  try {
+    const repo = new InventoryRepository();
+    const result = repo.submitStockOpnameForReview(session.context, sessionId);
+    revalidatePath(`/inventory/stock-opname/${sessionId}`);
+    revalidatePath("/inventory/stock-opname");
+    revalidatePath("/audit-log");
+    return result;
+  } catch (err: unknown) {
+    const message = err instanceof AppError ? err.message : (err instanceof Error ? err.message : "Gagal mengajukan sesi ke review.");
+    return { success: false as const, error: message };
+  }
+}
+
+export async function approveAndPostStockOpnameAdjustmentAction(
+  input: ApproveAndPostStockOpnameAdjustmentInput
+): Promise<ApproveAndPostStockOpnameAdjustmentResult | { success: false; error: string }> {
+  const session = await getServerSessionContext();
+  if (!session) {
+    return { success: false as const, error: "Akses tidak diizinkan. Silakan login terlebih dahulu." };
+  }
+
+  try {
+    const repo = new InventoryRepository();
+    const result = repo.approveAndPostStockOpnameAdjustment(session.context, input);
+    revalidatePath(`/inventory/stock-opname/${input.sessionId}`);
+    revalidatePath("/inventory/stock-opname");
+    revalidatePath("/inventory/products");
+    revalidatePath("/inventory/reports");
+    revalidatePath("/dashboard");
+    revalidatePath("/audit-log");
+    return result;
+  } catch (err: unknown) {
+    const message = err instanceof AppError ? err.message : (err instanceof Error ? err.message : "Gagal menyetujui dan memposting penyesuaian Stock Opname.");
+    return { success: false as const, error: message };
+  }
+}
+
 export async function createPurchaseOrderAction(
   input: CreatePurchaseOrderInput
 ): Promise<{ success: true; po: PurchaseOrderRecord } | { success: false; error: string; po?: undefined }> {
@@ -985,22 +1036,7 @@ export async function getDocumentPaymentsAction(documentId: string) {
   }
 }
 
-export async function createInventoryReturnAction(input: {
-  warehouseId: string;
-  customerId: string;
-  goodsOutId?: string;
-  returnNumber: string;
-  returnDate: string;
-  reason: "SALAH_KIRIM" | "PEMBATALAN" | "SALAH_INPUT" | "CACAT" | "LAINNYA";
-  notes?: string;
-  lines: Array<{
-    productId: string;
-    quantity: number;
-    unit?: string;
-    condition: "BAIK" | "RUSAK";
-    returnedSerials?: string[];
-  }>;
-}) {
+export async function createInventoryReturnAction(input: CreateInventoryReturnInput) {
   const session = await getServerSessionContext();
   if (!session) {
     return { success: false, error: "Akses tidak diizinkan. Silakan login terlebih dahulu." };
@@ -1012,6 +1048,8 @@ export async function createInventoryReturnAction(input: {
     revalidatePath("/inventory/returns");
     revalidatePath("/inventory/products");
     revalidatePath("/inventory/reports");
+    revalidatePath("/inventory/goods-out");
+    revalidatePath("/inventory/goods-in");
     revalidatePath("/audit-log");
     return { success: true, returnRecord };
   } catch (err: unknown) {
@@ -1032,11 +1070,81 @@ export async function approveAndReceiveReturnAction(returnId: string) {
     revalidatePath("/inventory/returns");
     revalidatePath("/inventory/products");
     revalidatePath("/inventory/reports");
+    revalidatePath("/inventory/goods-out");
+    revalidatePath("/inventory/goods-in");
+    revalidatePath("/inventory/grouping");
     revalidatePath("/purchase-orders");
     revalidatePath("/audit-log");
     return { success: true, ...result };
   } catch (err: unknown) {
     const message = err instanceof AppError ? err.message : (err instanceof Error ? err.message : "Gagal memproses penerimaan fisik retur.");
+    return { success: false, error: message };
+  }
+}
+
+export async function cancelDraftReturnAction(returnId: string, reason?: string) {
+  const session = await getServerSessionContext();
+  if (!session) {
+    return { success: false, error: "Akses tidak diizinkan. Silakan login terlebih dahulu." };
+  }
+
+  try {
+    const repo = new InventoryRepository();
+    const result = repo.cancelDraftInventoryReturn(session.context, returnId, reason);
+    revalidatePath("/inventory/returns");
+    revalidatePath("/audit-log");
+    return { success: true, ...result };
+  } catch (err: unknown) {
+    const message = err instanceof AppError ? err.message : (err instanceof Error ? err.message : "Gagal membatalkan draft retur.");
+    return { success: false, error: message };
+  }
+}
+
+export const cancelInventoryReturnAction = cancelDraftReturnAction;
+
+export async function revertReceivedReturnAction(input: RevertInventoryReturnInput | { returnId: string; reason?: string }) {
+  const session = await getServerSessionContext();
+  if (!session) {
+    return { success: false, error: "Akses tidak diizinkan. Silakan login terlebih dahulu." };
+  }
+
+  try {
+    const repo = new InventoryRepository();
+    const result = repo.revertReceivedInventoryReturn(session.context, input);
+    revalidatePath("/inventory/returns");
+    revalidatePath("/inventory/products");
+    revalidatePath("/inventory/reports");
+    revalidatePath("/inventory/goods-out");
+    revalidatePath("/inventory/goods-in");
+    revalidatePath("/purchase-orders");
+    revalidatePath("/audit-log");
+    return { success: true, ...result };
+  } catch (err: unknown) {
+    const message = err instanceof AppError ? err.message : (err instanceof Error ? err.message : "Gagal membatalkan transaksi retur (revert).");
+    return { success: false, error: message };
+  }
+}
+
+export async function revertInventoryReturnAction(returnId: string, reason: string) {
+  return revertReceivedReturnAction({ returnId, reason });
+}
+
+export async function getReturnableSerialsAction(params: {
+  goodsOutId?: string;
+  goodsInId?: string;
+  productId?: string;
+}) {
+  const session = await getServerSessionContext();
+  if (!session) {
+    return { success: false, error: "Akses tidak diizinkan. Silakan login terlebih dahulu." };
+  }
+
+  try {
+    const repo = new InventoryRepository();
+    const serials = repo.getReturnableSerials(session.context, params);
+    return { success: true, serials };
+  } catch (err: unknown) {
+    const message = err instanceof AppError ? err.message : (err instanceof Error ? err.message : "Gagal memuat serial yang dapat diretur.");
     return { success: false, error: message };
   }
 }
@@ -1155,4 +1263,155 @@ export async function deleteGoodsInAction(
     return { success: false, error: message };
   }
 }
+
+/**
+ * Server Action: Ekspor Detail Sesi Stock Opname ke Base64 Excel (Phase 7)
+ */
+export async function exportStockOpnameSessionExcelAction(
+  sessionId: string
+): Promise<{ success: true; filename: string; base64: string } | { success: false; error: string }> {
+  const session = await getServerSessionContext();
+  if (!session) {
+    return { success: false, error: "Akses tidak diizinkan. Silakan login terlebih dahulu." };
+  }
+
+  try {
+    const { exportStockOpnameSessionExcel } = await import("@/lib/export/stock-opname-export");
+    const result = exportStockOpnameSessionExcel(session.context, sessionId);
+    return {
+      success: true,
+      filename: result.filename,
+      base64: result.buffer.toString("base64"),
+    };
+  } catch (err: unknown) {
+    const message =
+      err instanceof AppError
+        ? err.message
+        : err instanceof Error
+        ? err.message
+        : "Gagal mengekspor file Excel.";
+    return { success: false, error: message };
+  }
+}
+
+/**
+ * Server Action: Ekspor Daftar Sesi Stock Opname ke Base64 Excel (Phase 7)
+ */
+export async function exportStockOpnameListExcelAction(
+  filters?: { warehouseId?: string; status?: string; search?: string }
+): Promise<{ success: true; filename: string; base64: string } | { success: false; error: string }> {
+  const session = await getServerSessionContext();
+  if (!session) {
+    return { success: false, error: "Akses tidak diizinkan. Silakan login terlebih dahulu." };
+  }
+
+  try {
+    const { exportStockOpnameListExcel } = await import("@/lib/export/stock-opname-export");
+    const result = exportStockOpnameListExcel(session.context, filters);
+    return {
+      success: true,
+      filename: result.filename,
+      base64: result.buffer.toString("base64"),
+    };
+  } catch (err: unknown) {
+    const message =
+      err instanceof AppError
+        ? err.message
+        : err instanceof Error
+        ? err.message
+        : "Gagal mengekspor daftar Stock Opname.";
+    return { success: false, error: message };
+  }
+}
+
+/**
+ * -------------------------------------------------------------
+ * SERVER ACTIONS UNTUK GROUPING SERIAL NUMBER
+ * -------------------------------------------------------------
+ */
+
+export async function createSerialGroupsBatchAction(input: import("@/lib/types/inventory-domain").CreateSerialGroupsBatchInput) {
+  const session = await getServerSessionContext();
+  if (!session) {
+    return { success: false, error: "Akses tidak diizinkan. Silakan login terlebih dahulu." };
+  }
+
+  try {
+    const repo = new InventoryRepository();
+    const result = repo.createSerialGroupsBatch(session.context, input);
+    return { success: true, createdGroups: result.createdGroups };
+  } catch (err: unknown) {
+    const message = err instanceof AppError ? err.message : err instanceof Error ? err.message : "Gagal membuat grouping serial.";
+    const code = err instanceof AppError ? err.code : undefined;
+    const details = err instanceof AppError ? err.details : undefined;
+    return { success: false, error: message, code, details };
+  }
+}
+
+export async function dissolveGroupingAction(groupingId: string, notes?: string) {
+  const session = await getServerSessionContext();
+  if (!session) {
+    return { success: false, error: "Akses tidak diizinkan. Silakan login terlebih dahulu." };
+  }
+
+  try {
+    const repo = new InventoryRepository();
+    const result = repo.dissolveGrouping(session.context, groupingId, notes);
+    return { success: true, ...result };
+  } catch (err: unknown) {
+    const message = err instanceof AppError ? err.message : err instanceof Error ? err.message : "Gagal membongkar grouping serial.";
+    const code = err instanceof AppError ? err.code : undefined;
+    return { success: false, error: message, code };
+  }
+}
+
+export async function getSerialGroupingsAction(warehouseId?: string, statusFilter?: string) {
+  const session = await getServerSessionContext();
+  if (!session) {
+    return { success: false, error: "Akses tidak diizinkan. Silakan login terlebih dahulu." };
+  }
+
+  try {
+    const repo = new InventoryRepository();
+    const groupings = repo.getSerialGroupings(session.context, warehouseId, statusFilter);
+    return { success: true, groupings };
+  } catch (err: unknown) {
+    const message = err instanceof AppError ? err.message : err instanceof Error ? err.message : "Gagal mengambil data grouping.";
+    return { success: false, error: message };
+  }
+}
+
+export async function getSerialGroupDetailAction(groupingId: string) {
+  const session = await getServerSessionContext();
+  if (!session) {
+    return { success: false, error: "Akses tidak diizinkan. Silakan login terlebih dahulu." };
+  }
+
+  try {
+    const repo = new InventoryRepository();
+    const detail = repo.getSerialGroupDetail(session.context, groupingId);
+    return { success: true, detail };
+  } catch (err: unknown) {
+    const message = err instanceof AppError ? err.message : err instanceof Error ? err.message : "Gagal mengambil detail grouping.";
+    return { success: false, error: message };
+  }
+}
+
+export async function resolveGroupForGoodsOutAction(groupNumber: string, warehouseId: string) {
+  const session = await getServerSessionContext();
+  if (!session) {
+    return { success: false, error: "Akses tidak diizinkan. Silakan login terlebih dahulu." };
+  }
+
+  try {
+    const repo = new InventoryRepository();
+    const result = repo.resolveGroupForGoodsOut(session.context, groupNumber, warehouseId);
+    return { success: true, ...result };
+  } catch (err: unknown) {
+    const message = err instanceof AppError ? err.message : err instanceof Error ? err.message : "Gagal memindai group serial.";
+    const code = err instanceof AppError ? err.code : undefined;
+    return { success: false, error: message, code };
+  }
+}
+
 

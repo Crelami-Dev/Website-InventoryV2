@@ -307,9 +307,27 @@ export default function GoodsOutReport() {
                           const rawQty = it.metadata?.qtyInput ?? it.quantity ?? it.qty ?? 1;
                           const unit = it.metadata?.qtyUnit || it.qtyUnit || it.unit || 'pcs';
                           const name = it.item_name || it.productName || it.name || 'Produk';
+                          const isUnrecorded = it.metadata?.isUnrecorded === true || it.metadata?.isUnrecordedStock === true;
                           return (
                             <span key={idx} className="reports-item-pill reports-item-pill--out">
                               {name} <span className="reports-item-qty">({rawQty} {unit})</span>
+                              {isUnrecorded && (
+                                <span
+                                  title="Barang Belum Terdata (Non-SN)"
+                                  style={{
+                                    marginLeft: '4px',
+                                    fontSize: '10px',
+                                    background: '#fef3c7',
+                                    color: '#b45309',
+                                    padding: '1px 5px',
+                                    borderRadius: '4px',
+                                    fontWeight: 600,
+                                    border: '1px solid #fde68a',
+                                  }}
+                                >
+                                  Non-SN
+                                </span>
+                              )}
                             </span>
                           );
                         })}

@@ -57,9 +57,12 @@ export default function GoodsOutList({ docs, onSelect }) {
             let returnBadge = null;
             if (returns.length > 0) {
               const totalOriginal = items.reduce((sum, it) => {
-                const isSerial = it.metadata?.isSerial === true;
-                const qty = isSerial ? 1 : Number(it.metadata?.qtyInput ?? it.quantity ?? 1);
-                return sum + qty;
+                const isSerial = it.metadata?.isSerial === true || !!it.metadata?.serialNumber;
+                const isGroup = it.metadata?.isGroup === true;
+                const qty = isSerial
+                  ? (isGroup ? Number(it.metadata?.targetQty ?? it.metadata?.qtyInput ?? 1) : 1)
+                  : Number(it.metadata?.qtyInput ?? it.quantity ?? 1);
+                return sum + (Number.isFinite(qty) && qty > 0 ? qty : 1);
               }, 0);
               const totalReturned = returns.reduce((sum, r) => {
                 return sum + (r.items ?? []).reduce((s, ri) => s + (ri.returnedQty || 0), 0);

@@ -365,6 +365,54 @@ test("PHASE 5: REKONSILIASI, INVESTIGASI SELISIH, DAN DELTA CONCURRENT", async (
     assert.equal(item.concurrentTransactions.length, 2);
   });
 
+  await t.test("5.6b Penanganan Concurrent Delta Retur Masuk dan Adjustment Keluar", () => {
+    const lineRow = db.prepare(`
+      SELECT snapshot_qty FROM stock_opname_lines
+      WHERE session_id = ? AND product_id = ?
+    `).get(sessionId, nonSerialProductId) as { snapshot_qty: number };
+
+    const snapshotQty = Number(lineRow.snapshot_qty);
+
+    // Simulasikan mutasi RETURN_IN_POSTED (+3)
+    const postSnapshotTimeReturn = new Date(Date.now() + 7000).toISOString();
+    const ledgerIdReturn = crypto.randomUUID();
+    db.prepare(`
+      INSERT INTO inventory_ledger (
+        id, sequence_number, owner_id, warehouse_id, product_id,
+        location_id, entry_type, source_doc_type, source_doc_id,
+        source_line_id, quantity_delta_base, serial_ids_json,
+        actor_user_id, occurred_at, created_at
+      ) VALUES (?, 99993, 'owner-alpha', 'wh-north', ?, NULL, 'RETURN_IN_POSTED', 'RETURN', 'RET-CONCURRENT-01', 'retl-1', 3, NULL, 'usr-owner-alpha', ?, ?)
+    `).run(ledgerIdReturn, nonSerialProductId, postSnapshotTimeReturn, postSnapshotTimeReturn);
+
+    // Simulasikan mutasi STOCK_ADJUSTMENT_POSTED negatif (-2)
+    const postSnapshotTimeAdj = new Date(Date.now() + 8000).toISOString();
+    const ledgerIdAdj = crypto.randomUUID();
+    db.prepare(`
+      INSERT INTO inventory_ledger (
+        id, sequence_number, owner_id, warehouse_id, product_id,
+        location_id, entry_type, source_doc_type, source_doc_id,
+        source_line_id, quantity_delta_base, serial_ids_json,
+        actor_user_id, occurred_at, created_at
+      ) VALUES (?, 99994, 'owner-alpha', 'wh-north', ?, NULL, 'STOCK_ADJUSTMENT_POSTED', 'STOCK_OPNAME_ADJUSTMENT', 'ADJ-CONCURRENT-01', 'adjl-1', -2, NULL, 'usr-owner-alpha', ?, ?)
+    `).run(ledgerIdAdj, nonSerialProductId, postSnapshotTimeAdj, postSnapshotTimeAdj);
+
+    // Total mutasi sekarang:
+    // Delta In: 15 (GI) + 3 (Retur) = 18
+    // Delta Out: 10 (GO) + 2 (Adj) = 12
+    // Net Delta = 18 - 12 = +6
+    // Dynamic Book Qty = snapshotQty + 6
+    const summary = repo.evaluateStockOpnameReconciliation(ownerAlphaContext, sessionId);
+    const item = summary.items.find((i) => i.productId === nonSerialProductId);
+
+    assert.ok(item);
+    assert.equal(item.deltaIn, 18, "Delta In harus mencakup Goods In (15) dan Retur (3)");
+    assert.equal(item.deltaOut, 12, "Delta Out harus mencakup Goods Out (10) dan Penyesuaian Keluar (2)");
+    assert.equal(item.netDelta, 6, "Net delta harus +6");
+    assert.equal(item.dynamicBookQty, snapshotQty + 6);
+    assert.equal(item.concurrentTransactions.length, 4, "Harus mencakup seluruh 4 transaksi ledger concurrent");
+  });
+
   await t.test("5.7 Drill-down Serial Number (Matched, Missing, dan Surplus/Asing)", () => {
     // Ambil snapshot serials untuk serialProductId yang memiliki konfigurasi satuan valid
     const snSnapshots = repo.getStockOpnameSerialSnapshots(ownerAlphaContext, sessionId, serialProductId);
@@ -491,12 +539,21 @@ test("PHASE 5: REKONSILIASI, INVESTIGASI SELISIH, DAN DELTA CONCURRENT", async (
     );
   });
 
-  await t.test("5.10 Imutabilitas Transaksi: Rekonsiliasi Phase 5 Dilarang Menulis atau Mengubah Ledger", () => {
-    // Jalankan ulang rekonsiliasi beberapa kali
-    repo.evaluateStockOpnameReconciliation(ownerAlphaContext, sessionId);
-    repo.evaluateStockOpnameReconciliation(ownerAlphaContext, sessionId);
+  await t.test("5.10 Imutabilitas Transaksi: Rekonsiliasi Phase 5 Dilarang Menulis atau Mengubah Ledger dan Terbukti Idempoten", () => {
+    // Jalankan ulang rekonsiliasi beberapa kali dan pastikan output 100% identik (Idempoten)
+    const run1 = repo.evaluateStockOpnameReconciliation(ownerAlphaContext, sessionId);
+    const run2 = repo.evaluateStockOpnameReconciliation(ownerAlphaContext, sessionId);
+    const run3 = repo.evaluateStockOpnameReconciliation(ownerAlphaContext, sessionId);
 
-    // Cek jumlah entri di inventory_ledger (hanya boleh bertambah 2 entri mock yang sengaja kita insert di test 5.5 dan 5.6)
+    assert.equal(run1.items.length, run2.items.length, "Jumlah item konsisten antar eksekusi");
+    assert.equal(run2.items.length, run3.items.length, "Jumlah item konsisten antar eksekusi");
+    assert.deepEqual(
+      run1.items.map((i) => ({ id: i.id, book: i.dynamicBookQty, counted: i.countedQty, var: i.varianceQty, st: i.reconciliationStatus })),
+      run3.items.map((i) => ({ id: i.id, book: i.dynamicBookQty, counted: i.countedQty, var: i.varianceQty, st: i.reconciliationStatus })),
+      "Hasil rekonsiliasi harus 100% idempoten antar pemanggilan"
+    );
+
+    // Cek jumlah entri di inventory_ledger (hanya boleh bertambah 4 entri mock yang sengaja di-insert di test 5.5, 5.6, dan 5.6b)
     const currentLedgerCountRow = db
       .prepare("SELECT COUNT(*) as count FROM inventory_ledger")
       .get() as { count: number };
@@ -504,20 +561,20 @@ test("PHASE 5: REKONSILIASI, INVESTIGASI SELISIH, DAN DELTA CONCURRENT", async (
 
     assert.equal(
       currentLedgerCount,
-      initialLedgerCount + 2,
+      initialLedgerCount + 4,
       "Rekonsiliasi Phase 5 dilarang menulis mutasi baru ke inventory_ledger"
     );
 
-    // Cek tidak ada entri ledger bertipe penyesuaian opname
-    const adjCountRow = db.prepare(`
+    // Cek tidak ada entri ledger yang mengacu pada session Stock Opname ini
+    const sessionLedgerEntries = db.prepare(`
       SELECT COUNT(*) as count FROM inventory_ledger
-      WHERE entry_type = 'STOCK_ADJUSTMENT_POSTED'
-    `).get() as { count: number };
+      WHERE source_doc_id = ?
+    `).get(sessionId) as { count: number };
 
     assert.equal(
-      Number(adjCountRow.count),
+      Number(sessionLedgerEntries.count),
       0,
-      "Tidak boleh ada STOCK_ADJUSTMENT_POSTED yang ditulis sebelum Phase 6"
+      "Tidak boleh ada entri ledger untuk sesi opname ini yang ditulis sebelum Phase 6"
     );
   });
 });

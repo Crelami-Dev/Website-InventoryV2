@@ -57,6 +57,11 @@ export const goodsOut = {
   'goodsOut.line.newProductSku': 'SKU (wajib)',
   'goodsOut.line.createProduct': 'Buat Produk',
   'goodsOut.line.remove': 'Hapus baris',
+  'goodsOut.line.unrecordedLabel': 'Barang Belum Terdata (Non-SN)',
+  'goodsOut.line.unrecordedShort': 'Non-SN',
+  'goodsOut.line.unrecordedBadge': 'Belum Terdata (Non-SN)',
+  'goodsOut.line.unrecordedWarning': 'Barang sementara belum masuk stok — Tidak memotong stok sistem',
+  'goodsOut.line.unrecordedPlaceholder': 'Tanpa SN (Sementara)',
 
   // Validation
   'goodsOut.error.noItems': 'Tambahkan setidaknya satu baris item',

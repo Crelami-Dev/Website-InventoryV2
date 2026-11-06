@@ -8,11 +8,74 @@ import { supabaseAdmin } from '../lib/supabase.js';
 import { httpError } from '../utils/httpError.js';
 import { writeActivityLog } from '../utils/activityLog.js';
 import { loadTenant } from '../middleware/loadTenant.js';
+import {
+  sendGoodsOutEmail,
+  sendGoodsInEmail,
+  sendReturnEmail,
+  resolveFinanceEmail,
+  isValidEmail,
+} from '../services/email.service.js';
+import {
+  buildDailyReportData,
+  generateDailyReportHtml,
+  sendDailyReportEmail,
+  dailyReportSettingsSchema,
+} from '../services/dailyReport.service.js';
+import {
+  createSerialGroup,
+  ungroupSerial,
+  getSerialCompositionHierarchy,
+  previewSerialGroup,
+  getSerialGroupingDetails,
+  listSerialGroupings,
+  getAvailableSerialsForGrouping,
+  verifyScanSerialForGrouping,
+  processMultiSerialGroups,
+  generateGroupSerialNumber,
+  createGroupingSession,
+  confirmGroupingSession,
+  cancelGroupingSession,
+  listGroupingSessions,
+  getGroupingSessionDetails,
+} from '../services/serialGroup.service.js';
 import { generateDocumentPdf } from '../services/pdf.service.js';
-import { sendGoodsOutEmail, sendGoodsInEmail, resolveFinanceEmail } from '../services/email.service.js';
 
 const router = Router();
 const SUPER_ADMIN_TENANT_ID = '00000000-0000-0000-0000-000000000000';
+
+function isMissingEmailLogColumn(error) {
+  const message = error?.message || '';
+  return (
+    error?.code === '42703' ||
+    error?.code === 'PGRST204' ||
+    /column .* does not exist/i.test(message) ||
+    /could not find the .*column/i.test(message)
+  );
+}
+
+/**
+ * Ambil log email dokumen terakhir, mengecualikan notifikasi retur.
+ * Fallback otomatis jika migration 020 belum dijalankan agar endpoint lama
+ * tetap berfungsi saat backend di-deploy lebih dulu.
+ */
+async function fetchLatestDocumentEmailLog(documentId, columns) {
+  const buildQuery = (withTypeFilter) => {
+    let query = supabaseAdmin
+      .from('email_logs')
+      .select(columns)
+      .eq('document_id', documentId);
+    if (withTypeFilter) {
+      query = query.or('email_type.is.null,email_type.eq.document');
+    }
+    return query.order('created_at', { ascending: false }).limit(1).maybeSingle();
+  };
+
+  const result = await buildQuery(true);
+  if (result.error && isMissingEmailLogColumn(result.error)) {
+    return buildQuery(false);
+  }
+  return result;
+}
 
 // ---------------------------------------------------------------------------
 // In-memory serial lookup cache — eliminates 2-3s Supabase round-trip on
@@ -503,9 +566,10 @@ function documentPayload(payload) {
 
 function documentItemPayload(documentId, item) {
   const isValidProductId = item.productId && typeof item.productId === 'string' && item.productId.trim() !== '' && item.productId !== '__new__';
+  const isUnrecorded = item.metadata?.isUnrecorded === true || item.metadata?.isUnrecordedStock === true;
   return {
     document_id: documentId,
-    product_id: isValidProductId ? item.productId.trim() : null,
+    product_id: isUnrecorded ? null : (isValidProductId ? item.productId.trim() : null),
     item_name: item.itemName,
     sku: item.sku ?? null,
     quantity: item.quantity,
@@ -514,7 +578,13 @@ function documentItemPayload(documentId, item) {
     discount_value: item.discountValue ?? 0,
     amount: item.amount ?? 0,
     sort_order: item.sortOrder ?? 0,
-    metadata: item.metadata ?? {},
+    metadata: {
+      ...(item.metadata ?? {}),
+      ...(isUnrecorded && isValidProductId ? { originalProductId: item.productId.trim() } : {}),
+      isUnrecorded: Boolean(isUnrecorded),
+      isUnrecordedStock: Boolean(isUnrecorded),
+      stockDeducted: false,
+    },
   };
 }
 
@@ -556,8 +626,13 @@ function crudRouter({ table, entityType, schema, toPayload, searchColumns, filte
     try {
       const params = pagingSchema.parse(req.query);
       let query = supabaseAdmin.from(table).select(selectFields, { count: 'exact' }).eq('owner_id', req.auth.ownerId).order('created_at', { ascending: false });
-      if ((table === 'product_serials' || table === 'documents' || table === 'contacts') && req.auth.warehouseId) {
-        query = query.eq('warehouse_id', req.auth.warehouseId);
+      const isOwnerOrSuperAdmin = req.auth.role === 'owner' || req.auth.role === 'super_admin';
+      const queryWhId = req.query.warehouse_id || req.query.warehouseId;
+      const targetWhId = isOwnerOrSuperAdmin
+        ? ((queryWhId && queryWhId !== 'all') ? queryWhId : req.auth.warehouseId)
+        : req.auth.warehouseId;
+      if ((table === 'product_serials' || table === 'documents' || table === 'contacts') && targetWhId) {
+        query = query.eq('warehouse_id', targetWhId);
       }
       if (table === 'contacts' && req.auth.role === 'sales_person') {
         query = query.eq('created_by', req.auth.user.id);
@@ -581,8 +656,8 @@ function crudRouter({ table, entityType, schema, toPayload, searchColumns, filte
         while (currentOffset < targetTotal) {
           const chunkSize = Math.min(1000, targetTotal - currentOffset);
           let chunkQuery = supabaseAdmin.from(table).select(selectFields).eq('owner_id', req.auth.ownerId).order('created_at', { ascending: false });
-          if ((table === 'product_serials' || table === 'documents' || table === 'contacts') && req.auth.warehouseId) {
-            chunkQuery = chunkQuery.eq('warehouse_id', req.auth.warehouseId);
+          if ((table === 'product_serials' || table === 'documents' || table === 'contacts') && targetWhId) {
+            chunkQuery = chunkQuery.eq('warehouse_id', targetWhId);
           }
           if (table === 'contacts' && req.auth.role === 'sales_person') {
             chunkQuery = chunkQuery.eq('created_by', req.auth.user.id);
@@ -1129,6 +1204,15 @@ router.get('/product-serial-lookup', async (req, res, next) => {
       if (!isAvailable) {
         throw httpError(400, `Nomor seri ${serial} tidak tersedia (status: ${data.status}).`);
       }
+      if (!allowAnyStatus && (data.metadata?.isGrouped || data.metadata?.parentGroupId)) {
+        throw httpError(400, `Nomor seri "${serial}" sedang berada di dalam group "${data.metadata?.parentGroupSerialNumber || 'Group'}". Group induk paling atas harus dibongkar (ungroup) terlebih dahulu sebelum dapat dikeluarkan.`);
+      }
+      if (!allowAnyStatus && data.metadata?.isDissolved) {
+        throw httpError(400, `Nomor seri "${serial}" adalah group yang sudah dibongkar (dissolved) dan tidak aktif lagi.`);
+      }
+      if (data.metadata?.isGroup && data.metadata?.resultProductName && product) {
+        product.name = data.metadata.resultProductName;
+      }
       return res.json({ data: { ...data, product } });
     }
 
@@ -1157,7 +1241,17 @@ router.get('/product-serial-lookup', async (req, res, next) => {
       throw httpError(400, `Nomor seri ${serial} tidak tersedia (status: ${foundSerial.status}).`);
     }
 
+    if (!allowAnyStatus && (foundSerial.metadata?.isGrouped || foundSerial.metadata?.parentGroupId)) {
+      throw httpError(400, `Nomor seri "${serial}" sedang berada di dalam group "${foundSerial.metadata?.parentGroupSerialNumber || 'Group'}". Group induk paling atas harus dibongkar (ungroup) terlebih dahulu sebelum dapat dikeluarkan.`);
+    }
+    if (!allowAnyStatus && foundSerial.metadata?.isDissolved) {
+      throw httpError(400, `Nomor seri "${serial}" adalah group yang sudah dibongkar (dissolved) dan tidak aktif lagi.`);
+    }
+
     const product = foundSerial.product || null;
+    if (foundSerial.metadata?.isGroup && foundSerial.metadata?.resultProductName && product) {
+      product.name = foundSerial.metadata.resultProductName;
+    }
     const serialData = { ...foundSerial };
     delete serialData.product;
 
@@ -1175,7 +1269,7 @@ router.get('/product-serial-index', async (req, res, next) => {
   try {
     const ownerId = req.auth.ownerId;
     const queryWarehouseId = req.query.warehouse_id || req.query.warehouseId || null;
-    const isAllWarehouses = queryWarehouseId === 'all' || (!queryWarehouseId && (req.query.purpose === 'stock_opname' || req.auth.role === 'owner' || req.auth.role === 'admin'));
+    const isAllWarehouses = queryWarehouseId === 'all';
     const warehouseId = isAllWarehouses ? null : (queryWarehouseId || req.auth.warehouseId || null);
     const allowAllStatus = req.query.allStatus === 'true' || req.query.purpose === 'stock_opname';
     const documentId = req.query.documentId ? String(req.query.documentId).trim() : null;
@@ -1221,19 +1315,28 @@ router.get('/product-serial-index', async (req, res, next) => {
       offset += CHUNK_SIZE;
     }
 
-    // Array-of-arrays keeps the payload small: [serial, productId, unit, status, warehouseId, goodsInDocId, createdAt]
-    const rows = allData.map((r) => [
+    // Filter out grouped serials and dissolved serials if not allowAllStatus (e.g. for Goods Out)
+    const eligibleData = allowAllStatus
+      ? allData
+      : allData.filter((r) => !r.metadata?.isGrouped && !r.metadata?.parentGroupId && !r.metadata?.isDissolved);
+
+    // Array-of-arrays keeps the payload small: [serial, productId, unit, status, warehouseId, goodsInDocId, createdAt, isGrouped, isGroup, isDissolved, targetQty]
+    const rows = eligibleData.map((r) => [
       r.serial_number,
       r.product_id,
-      r.metadata?.serialUnit || r.metadata?.unit || r.metadata?.qtyUnit || null,
+      r.metadata?.targetUnit || r.metadata?.serialUnit || r.metadata?.unit || r.metadata?.qtyUnit || null,
       r.status,
       r.warehouse_id || null,
       r.goods_in_document_id || null,
       r.created_at || null,
+      Boolean(r.metadata?.isGrouped || r.metadata?.parentGroupId),
+      Boolean(r.metadata?.isGroup),
+      Boolean(r.metadata?.isDissolved),
+      Number(r.metadata?.targetQty ?? r.metadata?.unitQty ?? 1),
     ]);
 
     // Pre-populate SERIAL_CACHE for instant subsequent single scans
-    for (const r of allData) {
+    for (const r of eligibleData) {
       if (r.serial_number) {
         const itemCacheKey = serialCacheKey(ownerId, warehouseId, r.serial_number);
         if (!SERIAL_CACHE.has(itemCacheKey)) {
@@ -1297,6 +1400,10 @@ router.post('/product-serial-lookup/batch', async (req, res, next) => {
     const result = foundSerials.map(s => ({
       ...s,
       product: productsMap[s.product_id] || null,
+      isGrouped: Boolean(s.metadata?.isGrouped || s.metadata?.parentGroupId),
+      parentGroupSerialNumber: s.metadata?.parentGroupSerialNumber || null,
+      isGroup: Boolean(s.metadata?.isGroup),
+      isDissolved: Boolean(s.metadata?.isDissolved),
     }));
 
     res.json({ data: result });
@@ -1369,14 +1476,474 @@ router.post('/product-serials/batch', async (req, res, next) => {
   }
 });
 
+// ── Serial Number Grouping Endpoints ──────────────────────────────
+const emptyToNullUuid = z.preprocess(
+  (v) => (v === '' || v === undefined ? null : v),
+  z.string().uuid().optional().nullable()
+);
+
+const groupMemberIdsSchema = z.array(z.string().uuid()).max(200, 'Maksimal 200 nomor seri per batch.').optional();
+const groupMemberSNsSchema = z.array(z.string().trim().min(1).max(200)).max(200, 'Maksimal 200 nomor seri per batch.').optional();
+
+const groupSerialSchema = z.object({
+  memberSerialIds: groupMemberIdsSchema,
+  memberSerialNumbers: groupMemberSNsSchema,
+  groupSerialNumber: z.string().trim().max(160).optional().nullable(),
+  resultProductName: z.string().trim().max(255).optional().nullable(),
+  resultProductSku: z.string().trim().max(120).optional().nullable(),
+  resultProductId: emptyToNullUuid,
+  targetUnit: z.string().trim().max(50).optional().nullable(),
+  createNewMasterProduct: z.boolean().optional().default(false),
+  warehouseId: emptyToNullUuid,
+  notes: z.string().trim().max(1000).optional().nullable(),
+  idempotencyKey: z.string().trim().max(200).optional().nullable(),
+});
+
+const multiGroupSerialSchema = z.object({
+  warehouseId: emptyToNullUuid,
+  batches: z.array(z.object({
+    batchId: z.string().trim().max(120).optional(),
+    name: z.string().trim().max(255).optional(),
+    memberSerialIds: groupMemberIdsSchema,
+    memberSerialNumbers: groupMemberSNsSchema,
+    groupSerialNumber: z.string().trim().max(160).optional().nullable(),
+    resultProductName: z.string().trim().max(255).optional().nullable(),
+    resultProductSku: z.string().trim().max(120).optional().nullable(),
+    resultProductId: emptyToNullUuid,
+    targetUnit: z.string().trim().max(50).optional().nullable(),
+    createNewMasterProduct: z.boolean().optional().default(false),
+    warehouseId: emptyToNullUuid,
+    notes: z.string().trim().max(1000).optional().nullable(),
+    idempotencyKey: z.string().trim().max(200).optional().nullable(),
+  })).min(1, 'Daftar batch grouping tidak boleh kosong.').max(50, 'Maksimal 50 batch per request.'),
+});
+
+const verifyScanSchema = z.object({
+  serialNumber: z.string().trim().min(1, 'Nomor seri wajib diisi.').max(200),
+  warehouseId: emptyToNullUuid,
+});
+
+router.post('/product-serials/group/verify-scan', async (req, res, next) => {
+  try {
+    const { serialNumber, warehouseId } = verifyScanSchema.parse(req.body || {});
+    const resolvedWarehouseId = warehouseId || req.auth.warehouseId || null;
+    const unitsCtx = await getWorkspaceUnits(req.auth.ownerId, resolvedWarehouseId);
+    const result = await verifyScanSerialForGrouping({
+      ownerId: req.auth.ownerId,
+      warehouseId: resolvedWarehouseId,
+      serialNumber,
+      customUnits: unitsCtx.units,
+      unitMultipliers: unitsCtx.multipliers,
+    });
+    res.json({ success: true, data: result });
+  } catch (error) {
+    if (!error.status) error.status = 400;
+    next(error);
+  }
+});
+
+router.post('/product-serials/group/multi', async (req, res, next) => {
+  try {
+    const role = (req.auth.role || '').toLowerCase();
+    if (role === 'sales_person') {
+      throw httpError(403, 'Akses ditolak: Sales person tidak diizinkan melakukan grouping serial number.');
+    }
+
+    const payload = multiGroupSerialSchema.parse(req.body);
+    const userName = req.auth.user?.user_metadata?.full_name || req.auth.user?.email || 'User';
+    const resolvedWarehouseId = payload.warehouseId || req.auth.warehouseId;
+    const unitsCtx = await getWorkspaceUnits(req.auth.ownerId, resolvedWarehouseId);
+
+    const result = await processMultiSerialGroups({
+      ownerId: req.auth.ownerId,
+      userId: req.auth.user.id,
+      userName,
+      warehouseId: resolvedWarehouseId,
+      batches: payload.batches,
+      customUnits: unitsCtx.units,
+      unitMultipliers: unitsCtx.multipliers,
+    });
+
+    writeActivityLog(req, {
+      action: 'created',
+      entityType: 'Serial Group Multi',
+      entityName: `${result.summary.succeeded}/${result.summary.total} Batches Processed`,
+      metadata: {
+        summary: result.summary,
+      },
+    });
+
+    invalidateWarehouseSerialIndex(req.auth.ownerId);
+
+    res.json({
+      success: result.summary.failed === 0,
+      status: result.summary.status,
+      partial: result.summary.partial,
+      data: result,
+    });
+  } catch (error) {
+    if (!error.status) error.status = 400;
+    next(error);
+  }
+});
+
+router.post('/product-serials/group/preview', async (req, res, next) => {
+  try {
+    const payload = groupSerialSchema.parse(req.body);
+    const resolvedWarehouseId = payload.warehouseId || req.auth.warehouseId;
+    const unitsCtx = await getWorkspaceUnits(req.auth.ownerId, resolvedWarehouseId);
+
+    const result = await previewSerialGroup({
+      ownerId: req.auth.ownerId,
+      memberSerialIds: payload.memberSerialIds,
+      memberSerialNumbers: payload.memberSerialNumbers,
+      groupSerialNumber: payload.groupSerialNumber,
+      resultProductName: payload.resultProductName,
+      resultProductSku: payload.resultProductSku,
+      resultProductId: payload.resultProductId,
+      createNewMasterProduct: payload.createNewMasterProduct,
+      targetUnit: payload.targetUnit,
+      warehouseId: resolvedWarehouseId,
+      customUnits: unitsCtx.units,
+      multipliers: unitsCtx.multipliers,
+    });
+
+    res.json({ success: true, data: result });
+  } catch (error) {
+    if (!error.status) {
+      error.status = 400;
+    }
+    next(error);
+  }
+});
+
+router.post('/product-serials/group', async (req, res, next) => {
+  try {
+    const role = (req.auth.role || '').toLowerCase();
+    if (role === 'sales_person') {
+      throw httpError(403, 'Akses ditolak: Sales person tidak diizinkan melakukan grouping serial number.');
+    }
+
+    const payload = groupSerialSchema.parse(req.body);
+    const userName = req.auth.user?.user_metadata?.full_name || req.auth.user?.email || 'User';
+    const resolvedWarehouseId = payload.warehouseId || req.auth.warehouseId;
+    const unitsCtx = await getWorkspaceUnits(req.auth.ownerId, resolvedWarehouseId);
+
+    const result = await createSerialGroup({
+      ownerId: req.auth.ownerId,
+      userId: req.auth.user.id,
+      userName,
+      memberSerialIds: payload.memberSerialIds,
+      memberSerialNumbers: payload.memberSerialNumbers,
+      groupSerialNumber: payload.groupSerialNumber,
+      resultProductName: payload.resultProductName,
+      resultProductSku: payload.resultProductSku,
+      resultProductId: payload.resultProductId,
+      targetUnit: payload.targetUnit,
+      createNewMasterProduct: payload.createNewMasterProduct,
+      warehouseId: resolvedWarehouseId,
+      notes: payload.notes,
+      idempotencyKey: payload.idempotencyKey,
+      customUnits: unitsCtx.units,
+      unitMultipliers: unitsCtx.multipliers,
+    });
+
+    writeActivityLog(req, {
+      action: 'created',
+      entityType: 'Serial Group',
+      entityId: result.group?.id,
+      entityName: result.group?.serial_number,
+      metadata: {
+        isCrossProduct: result.isCrossProduct,
+        resultProductName: result.resultProductName,
+        totalPcs: result.totalPcs,
+        directMemberCount: result.directMemberCount,
+        leafMemberCount: result.leafMemberCount,
+        unitBreakdown: result.unitBreakdown,
+        documentId: result.documentId,
+        documentNumber: result.documentNumber,
+        isReplay: result.isReplay,
+      },
+    });
+
+    invalidateWarehouseSerialIndex(req.auth.ownerId);
+
+    res.status(201).json({ success: true, data: result });
+  } catch (error) {
+    if (!error.status) {
+      const isBiz = error.code === 'UNIT_MISMATCH' ||
+        error.code === 'UNIT_CONVERSION_UNSUPPORTED' ||
+        error.code === 'DUPLICATE_MEMBERS' ||
+        (error.message && (
+          error.message.includes('Minimal') ||
+          error.message.includes('tidak dapat') ||
+          error.message.includes('sudah') ||
+          error.message.includes('tidak memiliki relasi') ||
+          error.message.includes('gudang yang sama')
+        ));
+      if (isBiz) error.status = 400;
+    }
+    next(error);
+  }
+});
+
+const ungroupSerialSchema = z.object({
+  groupId: z.string().uuid().optional().nullable(),
+  groupSerialNumber: z.string().trim().optional().nullable(),
+  notes: z.string().trim().optional().nullable(),
+});
+
+router.post('/product-serials/ungroup', async (req, res, next) => {
+  try {
+    const role = (req.auth.role || '').toLowerCase();
+    if (role === 'sales_person') {
+      throw httpError(403, 'Akses ditolak: Sales person tidak diizinkan membongkar group serial number.');
+    }
+
+    const payload = ungroupSerialSchema.parse(req.body);
+    const userName = req.auth.user?.user_metadata?.full_name || req.auth.user?.email || 'User';
+
+    const result = await ungroupSerial({
+      ownerId: req.auth.ownerId,
+      userId: req.auth.user.id,
+      userName,
+      groupId: payload.groupId,
+      groupSerialNumber: payload.groupSerialNumber,
+      notes: payload.notes,
+    });
+
+    writeActivityLog(req, {
+      action: 'deleted',
+      entityType: 'Serial Group',
+      entityId: result.unpackedGroup?.id,
+      entityName: result.unpackedGroup?.serial_number,
+      metadata: {
+        releasedCount: result.releasedCount,
+        releasedSerials: result.releasedSerials,
+        documentId: result.documentId,
+        documentNumber: result.documentNumber,
+      },
+    });
+
+    invalidateWarehouseSerialIndex(req.auth.ownerId);
+
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get('/product-serials/composition/:serialNumber', async (req, res, next) => {
+  try {
+    const serialNumber = req.params.serialNumber;
+    const result = await getSerialCompositionHierarchy({
+      ownerId: req.auth.ownerId,
+      serialNumber,
+    });
+
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get('/product-serials/groupings', async (req, res, next) => {
+  try {
+    const { status, limit, offset, warehouseId } = req.query;
+    const result = await listSerialGroupings({
+      ownerId: req.auth.ownerId,
+      warehouseId: warehouseId || null,
+      status: status || null,
+      limit: limit ? Number(limit) : 50,
+      offset: offset ? Number(offset) : 0,
+    });
+
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get('/product-serials/groupings/:id', async (req, res, next) => {
+  try {
+    const result = await getSerialGroupingDetails({
+      ownerId: req.auth.ownerId,
+      groupingId: req.params.id,
+    });
+
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// PHASE 7K — Grouping Sessions & Pending Confirmation Endpoints
+
+const createGroupingSessionSchema = z.object({
+  warehouseId: z.string().uuid().optional().nullable(),
+  sessionName: z.string().trim().optional().nullable(),
+  notes: z.string().trim().optional().nullable(),
+  isPending: z.boolean().default(true),
+  batches: z.array(z.object({
+    batchId: z.string().optional().nullable(),
+    name: z.string().optional().nullable(),
+    memberSerialIds: z.array(z.string().uuid()).optional(),
+    memberSerialNumbers: z.array(z.string().trim()).optional(),
+    serials: z.array(z.any()).optional(),
+    groupSerialNumber: z.string().trim().optional().nullable(),
+    targetProductName: z.string().trim().optional().nullable(),
+    targetProductSku: z.string().trim().optional().nullable(),
+    targetProductId: z.string().uuid().optional().nullable(),
+    resultProductName: z.string().trim().optional().nullable(),
+    resultProductSku: z.string().trim().optional().nullable(),
+    resultProductId: z.string().uuid().optional().nullable(),
+    createNewMasterProduct: z.boolean().optional(),
+    newProductName: z.string().trim().optional().nullable(),
+    newProductSku: z.string().trim().optional().nullable(),
+    targetUnit: z.string().trim().optional().nullable(),
+    targetQty: z.number().optional().nullable(),
+    notes: z.string().trim().optional().nullable(),
+    idempotencyKey: z.string().trim().optional().nullable(),
+  })).min(1, 'Sesi grouping memerlukan minimal 1 batch.'),
+});
+
+router.post('/product-serials/grouping-sessions', async (req, res, next) => {
+  try {
+    const role = (req.auth.role || '').toLowerCase();
+    if (role === 'sales_person') {
+      throw httpError(403, 'Akses ditolak: Sales person tidak diizinkan membuat sesi grouping.');
+    }
+
+    const payload = createGroupingSessionSchema.parse(req.body);
+    const userName = req.auth.user?.user_metadata?.full_name || req.auth.user?.email || 'User';
+    const resolvedWarehouseId = payload.warehouseId || req.auth.warehouseId;
+    const unitsCtx = await getWorkspaceUnits(req.auth.ownerId, resolvedWarehouseId);
+
+    const result = await createGroupingSession({
+      ownerId: req.auth.ownerId,
+      userId: req.auth.user.id,
+      userName,
+      warehouseId: resolvedWarehouseId,
+      sessionName: payload.sessionName,
+      notes: payload.notes,
+      batches: payload.batches,
+      isPending: payload.isPending !== false,
+      customUnits: unitsCtx.units,
+      unitMultipliers: unitsCtx.multipliers,
+    });
+
+    res.status(201).json({ success: true, data: result.data, isPending: result.isPending });
+  } catch (error) {
+    if (!error.status) error.status = 400;
+    next(error);
+  }
+});
+
+router.get('/product-serials/grouping-sessions', async (req, res, next) => {
+  try {
+    const { status, limit, offset, warehouseId } = req.query;
+    const result = await listGroupingSessions({
+      ownerId: req.auth.ownerId,
+      warehouseId: warehouseId || null,
+      status: status || null,
+      limit: limit ? Number(limit) : 50,
+      offset: offset ? Number(offset) : 0,
+    });
+
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get('/product-serials/grouping-sessions/:id', async (req, res, next) => {
+  try {
+    const result = await getGroupingSessionDetails({
+      ownerId: req.auth.ownerId,
+      sessionId: req.params.id,
+    });
+
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/product-serials/grouping-sessions/:id/confirm', async (req, res, next) => {
+  try {
+    const role = (req.auth.role || '').toLowerCase();
+    if (role === 'sales_person') {
+      throw httpError(403, 'Akses ditolak: Sales person tidak diizinkan mengonfirmasi grouping.');
+    }
+
+    const userName = req.auth.user?.user_metadata?.full_name || req.auth.user?.email || 'User';
+    const unitsCtx = await getWorkspaceUnits(req.auth.ownerId, req.auth.warehouseId);
+
+    const result = await confirmGroupingSession({
+      ownerId: req.auth.ownerId,
+      userId: req.auth.user.id,
+      userName,
+      sessionId: req.params.id,
+      customUnits: unitsCtx.units,
+      unitMultipliers: unitsCtx.multipliers,
+    });
+
+    invalidateWarehouseSerialIndex(req.auth.ownerId);
+
+    res.json({ success: true, data: result.session, summary: result.summary, results: result.results });
+  } catch (error) {
+    if (!error.status) error.status = 400;
+    next(error);
+  }
+});
+
+router.post('/product-serials/grouping-sessions/:id/cancel', async (req, res, next) => {
+  try {
+    const role = (req.auth.role || '').toLowerCase();
+    if (role === 'sales_person') {
+      throw httpError(403, 'Akses ditolak: Sales person tidak diizinkan membatalkan sesi grouping.');
+    }
+
+    const { notes } = req.body || {};
+    const result = await cancelGroupingSession({
+      ownerId: req.auth.ownerId,
+      userId: req.auth.user.id,
+      sessionId: req.params.id,
+      notes,
+    });
+
+    res.json({ success: true, data: result.data });
+  } catch (error) {
+    if (!error.status) error.status = 400;
+    next(error);
+  }
+});
+
+router.get('/product-serials/group/available', async (req, res, next) => {
+  try {
+    const { warehouseId, productId, search, limit } = req.query;
+    const result = await getAvailableSerialsForGrouping({
+      ownerId: req.auth.ownerId,
+      warehouseId: warehouseId || null,
+      productId: productId || null,
+      search: search || null,
+      limit: limit ? Number(limit) : 1000,
+    });
+
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+});
+
 router.use('/product-serials', crudRouter({
   table: 'product_serials',
   entityType: 'Product Serials',
   schema: productSerialSchema,
   toPayload: productSerialPayload,
   searchColumns: ['serial_number'],
-  filterColumns: ['status'],
-  selectFields: 'id, product_id, serial_number, status, goods_in_document_id, goods_in_item_id, goods_out_document_id, goods_out_item_id, metadata, created_at',
+  filterColumns: ['status', 'warehouse_id'],
+  selectFields: 'id, product_id, serial_number, status, warehouse_id, goods_in_document_id, goods_in_item_id, goods_out_document_id, goods_out_item_id, metadata, created_at, product:products(id, name, sku, category, unit_cost, selling_price, status, metadata)',
 }));
 
 // ── Contact Points & Loyalty Endpoints ─────────────────────────
@@ -1516,9 +2083,13 @@ router.get('/documents', async (req, res, next) => {
     let query = supabaseAdmin
       .from('documents')
       .select('id, document_type, document_number, contact_id, contact_name, status, issue_date, due_date, payment_terms, subtotal, discount, tax, total, notes, metadata, created_at, items:document_items(*)', { count: 'exact' })
-      .eq('owner_id', req.auth.ownerId);
-    if (req.auth.warehouseId) {
-      query = query.eq('warehouse_id', req.auth.warehouseId);
+    const isOwnerOrSuperAdmin = req.auth.role === 'owner' || req.auth.role === 'super_admin';
+    const queryWhId = req.query.warehouse_id || req.query.warehouseId;
+    const targetWhId = isOwnerOrSuperAdmin
+      ? ((queryWhId && queryWhId !== 'all') ? queryWhId : req.auth.warehouseId)
+      : req.auth.warehouseId;
+    if (targetWhId) {
+      query = query.eq('warehouse_id', targetWhId);
     }
     query = query.order('issue_date', { ascending: false, nullsFirst: false }).order('created_at', { ascending: false });
     if (params.status) query = query.eq('status', params.status);
@@ -1526,7 +2097,40 @@ router.get('/documents', async (req, res, next) => {
     if (params.search) query = query.or(`document_number.ilike.%${params.search}%,contact_name.ilike.%${params.search}%`);
     const { data, error, count } = await query.range(params.offset, params.offset + params.limit - 1);
     if (error) throw httpError(500, 'Failed to load documents', error.message);
-    res.json({ data, count });
+    let result = data;
+
+    // Supabase PostgREST hard-caps single requests to 1000 rows.
+    // If client requested limit > 1000 and total count exceeds 1000, paginate remaining chunks automatically.
+    if (params.limit > 1000 && count > 1000 && Array.isArray(data)) {
+      let allData = [...data];
+      let currentOffset = params.offset + allData.length;
+      const targetTotal = Math.min(count, params.offset + params.limit);
+
+      while (currentOffset < targetTotal) {
+        const chunkSize = Math.min(1000, targetTotal - currentOffset);
+        let chunkQuery = supabaseAdmin
+          .from('documents')
+          .select('id, document_type, document_number, contact_id, contact_name, status, issue_date, due_date, payment_terms, subtotal, discount, tax, total, notes, metadata, created_at, items:document_items(*)')
+          .eq('owner_id', req.auth.ownerId);
+
+        if (targetWhId) {
+          chunkQuery = chunkQuery.eq('warehouse_id', targetWhId);
+        }
+        chunkQuery = chunkQuery.order('issue_date', { ascending: false, nullsFirst: false }).order('created_at', { ascending: false });
+        if (params.status) chunkQuery = chunkQuery.eq('status', params.status);
+        if (params.type) chunkQuery = chunkQuery.eq('document_type', params.type);
+        if (params.search) chunkQuery = chunkQuery.or(`document_number.ilike.%${params.search}%,contact_name.ilike.%${params.search}%`);
+
+        const { data: chunkData, error: chunkErr } = await chunkQuery.range(currentOffset, currentOffset + chunkSize - 1);
+        if (chunkErr || !chunkData || chunkData.length === 0) break;
+        allData.push(...chunkData);
+        currentOffset += chunkData.length;
+        if (chunkData.length < chunkSize) break;
+      }
+      result = allData;
+    }
+
+    res.json({ data: result, count });
   } catch (error) {
     next(error);
   }
@@ -1580,7 +2184,8 @@ router.get('/documents/:id/pdf', async (req, res, next) => {
       } catch (_) {}
     }
 
-    const pdfBuffer = generateDocumentPdf(data, settings, contact);
+    const paperMode = req.query.paperMode === 'compact' ? 'compact' : 'a4';
+    const pdfBuffer = generateDocumentPdf(data, settings, contact, paperMode);
     const cleanNumber = (data.document_number || 'dokumen').replace(/[/\\?%*:|"<>]/g, '_');
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${cleanNumber}.pdf"`);
@@ -1602,13 +2207,10 @@ router.get('/documents/:id/email-status', async (req, res, next) => {
     // Pastikan dokumen ada & milik tenant ini.
     await getRow('documents', id, req.auth.ownerId, 'id');
 
-    const { data: log, error } = await supabaseAdmin
-      .from('email_logs')
-      .select('status, recipient_email, sent_at, error_message')
-      .eq('document_id', id)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const { data: log, error } = await fetchLatestDocumentEmailLog(
+      id,
+      'status, recipient_email, sent_at, error_message'
+    );
     if (error) throw httpError(500, 'Failed to load email status', error.message);
 
     res.json({
@@ -1907,13 +2509,10 @@ router.post('/documents/:id/send-email', async (req, res, next) => {
     }
 
     // Debounce: cek log email terakhir untuk dokumen ini (1 query ringan, index idx_email_logs_doc).
-    const { data: lastLog, error: lastLogError } = await supabaseAdmin
-      .from('email_logs')
-      .select('status, sent_at')
-      .eq('document_id', id)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const { data: lastLog, error: lastLogError } = await fetchLatestDocumentEmailLog(
+      id,
+      'status, sent_at'
+    );
     if (lastLogError) throw httpError(500, 'Failed to check last email status', lastLogError.message);
 
     const DEBOUNCE_MS = 30_000;
@@ -2034,7 +2633,12 @@ async function triggerGoodsOutEmailBackground({ doc, ownerId, userId, userEmail,
       },
     };
 
-    const pdfBuffer = generateDocumentPdf(docForPdf, companySettings, contactData);
+    let pdfBuffer = null;
+    try {
+      pdfBuffer = generateDocumentPdf(docForPdf, companySettings, contactData);
+    } catch (pdfErr) {
+      console.error('[GoodsOut bg email] PDF generation failed:', pdfErr?.message ?? pdfErr);
+    }
 
     const emailResult = await sendGoodsOutEmail({
       doc,
@@ -2171,6 +2775,165 @@ async function triggerGoodsInEmailBackground({ doc, ownerId, userId, userEmail, 
   }
 }
 
+// ---------------------------------------------------------------------------
+// Email notifikasi retur. Dipanggil setelah transaksi retur benar-benar
+// tersimpan (commit), tidak di dalam transaksi. Status pengiriman dicatat di
+// email_logs dengan email_type='return' + return_id unik agar retry tidak
+// mengirim ulang email yang sudah sukses.
+// ---------------------------------------------------------------------------
+async function resolveReturnActorIdentity({ returnedBy, fallbackUserId, fallbackEmail, fallbackMetadata }) {
+  const userId = returnedBy || fallbackUserId || null;
+  let email = fallbackEmail || null;
+  let name = fallbackMetadata?.full_name || null;
+
+  if (userId) {
+    try {
+      const { data: profile } = await supabaseAdmin
+        .from('profiles')
+        .select('full_name')
+        .eq('id', userId)
+        .maybeSingle();
+      if (!name && profile?.full_name) name = profile.full_name;
+    } catch (_) {}
+
+    if (!email) {
+      try {
+        const { data: authData, error } = await supabaseAdmin.auth.admin.getUserById(userId);
+        if (!error && authData?.user) {
+          email = authData.user.email || email;
+          name = name || authData.user.user_metadata?.full_name || null;
+        }
+      } catch (_) {}
+    }
+  }
+
+  return { email, name };
+}
+
+async function buildReturnEmailContext(doc, ownerId, actor) {
+  const targetWarehouseId = doc.warehouse_id || doc.metadata?.warehouseId || null;
+  const companySettings = await getCompanySettings(ownerId, targetWarehouseId);
+  const financeEmail = (await resolveFinanceEmail(ownerId)) || companySettings.companyEmail || null;
+
+  let warehouseName = doc.metadata?.warehouse || 'Gudang Utama';
+  if (targetWarehouseId) {
+    try {
+      const { data: wh } = await supabaseAdmin
+        .from('warehouses')
+        .select('id, name, code')
+        .eq('id', targetWarehouseId)
+        .maybeSingle();
+      if (wh) {
+        warehouseName = wh.code ? `${wh.name} (${wh.code})` : wh.name;
+      }
+    } catch (_) {}
+  }
+
+  let contactData = {};
+  if (doc.contact_id) {
+    try {
+      contactData = (await getRow('contacts', doc.contact_id, ownerId)) || {};
+    } catch (_) {}
+  }
+
+  return {
+    financeEmail,
+    creatorEmail: actor?.email || null,
+    creatorName: actor?.name || actor?.email || 'Petugas',
+    warehouseName,
+    companySettings,
+    contactData,
+  };
+}
+
+/**
+ * Kirim ulang / retry email retur memakai baris email_logs yang sama.
+ * Diekspor untuk dipakai cron retry worker.
+ */
+export async function resendReturnEmail(
+  doc,
+  returnRecord,
+  {
+    ownerId,
+    actorEmail = null,
+    actorMetadata = null,
+    existingLogId = null,
+    manualRetry = false,
+  } = {}
+) {
+  const actor = await resolveReturnActorIdentity({
+    returnedBy: returnRecord?.returnedBy,
+    fallbackUserId: null,
+    fallbackEmail: actorEmail,
+    fallbackMetadata: actorMetadata,
+  });
+  const ctx = await buildReturnEmailContext(doc, ownerId, actor);
+
+  return sendReturnEmail({
+    doc,
+    returnRecord,
+    returnNumber: returnRecord?.returnNumber || `RET-${doc.document_number || 'DOKUMEN'}`,
+    creatorEmail: ctx.creatorEmail,
+    creatorName: ctx.creatorName,
+    financeEmail: ctx.financeEmail,
+    accentColor: ctx.companySettings?.accentColor,
+    warehouseName: ctx.warehouseName,
+    companySettings: ctx.companySettings,
+    contactData: ctx.contactData,
+    existingLogId,
+    manualRetry,
+  });
+}
+
+async function triggerReturnEmailBackground({
+  doc,
+  returnRecord,
+  ownerId,
+  userId,
+  userEmail,
+  userMetadata,
+}) {
+  try {
+    const actor = await resolveReturnActorIdentity({
+      returnedBy: returnRecord?.returnedBy,
+      fallbackUserId: userId,
+      fallbackEmail: userEmail,
+      fallbackMetadata: userMetadata,
+    });
+    const ctx = await buildReturnEmailContext(doc, ownerId, actor);
+
+    if (!ctx.financeEmail && !ctx.creatorEmail) {
+      console.warn('[Return Email] No finance/actor email found for ownerId:', ownerId, '- email will not be sent.');
+    }
+
+    const result = await sendReturnEmail({
+      doc,
+      returnRecord,
+      returnNumber: returnRecord?.returnNumber || `RET-${doc.document_number || 'DOKUMEN'}`,
+      creatorEmail: ctx.creatorEmail,
+      creatorName: ctx.creatorName,
+      financeEmail: ctx.financeEmail,
+      accentColor: ctx.companySettings?.accentColor,
+      warehouseName: ctx.warehouseName,
+      companySettings: ctx.companySettings,
+      contactData: ctx.contactData,
+    });
+
+    console.log(
+      '[Return Email]',
+      result?.status,
+      'Return:',
+      returnRecord?.returnNumber || returnRecord?.id,
+      'To:',
+      ctx.financeEmail || ctx.creatorEmail,
+      'Warehouse:',
+      ctx.warehouseName
+    );
+  } catch (bgErr) {
+    console.error('[Return background email] error:', bgErr?.message ?? bgErr);
+  }
+}
+
 router.post('/documents', async (req, res, next) => {
   try {
     const payload = documentSchema.parse(req.body);
@@ -2191,13 +2954,19 @@ router.post('/documents', async (req, res, next) => {
           // Check DB for serial status
           const { data: foundSerial } = await supabaseAdmin
             .from('product_serials')
-            .select('id, status, serial_number')
+            .select('id, status, serial_number, metadata')
             .eq('owner_id', req.auth.ownerId)
             .in('serial_number', serialVariants(sn))
             .maybeSingle();
 
           if (!foundSerial) {
             throw httpError(400, `Nomor seri "${sn}" tidak ditemukan dalam sistem.`);
+          }
+          if (foundSerial.metadata?.isGrouped || foundSerial.metadata?.parentGroupId) {
+            throw httpError(400, `Nomor seri "${sn}" sedang berada di dalam group "${foundSerial.metadata?.parentGroupSerialNumber || 'Group'}". Group induk paling atas harus dibongkar (ungroup) terlebih dahulu sebelum dapat dikeluarkan.`);
+          }
+          if (foundSerial.metadata?.isDissolved) {
+            throw httpError(400, `Nomor seri "${sn}" adalah group yang sudah dibongkar (dissolved) dan tidak dapat dikeluarkan.`);
           }
           if (foundSerial.status !== 'available') {
             throw httpError(400, `Nomor seri "${sn}" tidak tersedia atau sudah pernah dikeluarkan (status: ${foundSerial.status}).`);
@@ -2218,19 +2987,93 @@ router.post('/documents', async (req, res, next) => {
       .select('*')
       .single();
 
-    // If duplicate document number, auto-increment sequence suffix and retry
+    // If duplicate document number, query max sequence for prefix and auto-increment
     if (insertResult.error && (insertResult.error.code === '23505' || String(insertResult.error.message).includes('unique'))) {
-      for (let attempt = 1; attempt <= 10; attempt++) {
-        const match = docNumber.match(/^(.*?)(\d+)$/);
-        if (match) {
-          const prefix = match[1];
-          const numStr = match[2];
-          const nextNum = String(parseInt(numStr, 10) + 1).padStart(numStr.length, '0');
-          docNumber = `${prefix}${nextNum}`;
-        } else {
-          docNumber = `${docNumber}-${attempt}`;
+      const match = docNumber.match(/^(.*?)(\d+)$/);
+      if (match) {
+        let prefix = match[1];
+        let numStr = match[2];
+        let padLen = numStr.length;
+
+        // If numStr is a combined Date+Seq (e.g. 202610200001 with 8-digit YYYYMMDD or 6-digit YYMMDD):
+        // split into actual prefix (including date) and trailing sequence (last 3-4 digits)
+        if (numStr.length > 5) {
+          if (/^20\d{6}/.test(numStr)) {
+            prefix = prefix + numStr.slice(0, 8);
+            numStr = numStr.slice(8);
+            padLen = numStr.length;
+          } else if (/^\d{6}/.test(numStr) && numStr.length <= 10) {
+            prefix = prefix + numStr.slice(0, 6);
+            numStr = numStr.slice(6);
+            padLen = numStr.length;
+          }
         }
 
+        // Query documents matching this prefix for the owner to find the true max sequence
+        const { data: existingRows } = await supabaseAdmin
+          .from('documents')
+          .select('document_number')
+          .eq('owner_id', req.auth.ownerId)
+          .ilike('document_number', `${prefix}%`)
+          .order('document_number', { ascending: false })
+          .limit(100);
+
+        let maxSeq = parseInt(numStr, 10) || 0;
+        if (maxSeq >= 100000) maxSeq = 0;
+
+        if (existingRows && existingRows.length > 0) {
+          for (const row of existingRows) {
+            const rowNum = String(row.document_number || '').trim();
+            if (!rowNum.startsWith(prefix) || rowNum.includes('e+') || rowNum.includes('NaN')) continue;
+            const suffix = rowNum.slice(prefix.length).trim();
+            const m = suffix.match(/^(\d+)/);
+            if (m) {
+              const val = parseInt(m[1], 10);
+              if (!isNaN(val) && val < 100000 && val > maxSeq) {
+                maxSeq = val;
+              }
+            }
+          }
+        }
+
+        for (let attempt = 1; attempt <= 30; attempt++) {
+          const nextSeq = maxSeq + attempt;
+          docNumber = `${prefix}${String(nextSeq).padStart(padLen, '0')}`;
+
+          insertResult = await supabaseAdmin
+            .from('documents')
+            .insert({
+              ...documentPayload({ ...payload, documentNumber: docNumber }),
+              created_by: req.auth.user.id,
+              owner_id: req.auth.ownerId,
+              warehouse_id: req.auth.warehouseId,
+            })
+            .select('*')
+            .single();
+
+          if (!insertResult.error) break;
+        }
+      } else {
+        for (let attempt = 1; attempt <= 10; attempt++) {
+          docNumber = `${payload.documentNumber}-${attempt}`;
+          insertResult = await supabaseAdmin
+            .from('documents')
+            .insert({
+              ...documentPayload({ ...payload, documentNumber: docNumber }),
+              created_by: req.auth.user.id,
+              owner_id: req.auth.ownerId,
+              warehouse_id: req.auth.warehouseId,
+            })
+            .select('*')
+            .single();
+
+          if (!insertResult.error) break;
+        }
+      }
+
+      // Final safety net if still unique collision
+      if (insertResult.error && (insertResult.error.code === '23505' || String(insertResult.error.message).includes('unique'))) {
+        docNumber = `${payload.documentNumber}-${Date.now().toString(36).toUpperCase()}`;
         insertResult = await supabaseAdmin
           .from('documents')
           .insert({
@@ -2241,8 +3084,6 @@ router.post('/documents', async (req, res, next) => {
           })
           .select('*')
           .single();
-
-        if (!insertResult.error) break;
       }
     }
 
@@ -2253,6 +3094,47 @@ router.post('/documents', async (req, res, next) => {
 
     let insertedItems = [];
     if (payload.items.length) {
+      // Reconcile grouped result serial quantities & units authoritatively from DB metadata for goods_out
+      if (payload.documentType === 'goods_out') {
+        const { multipliers: wsUnitsMultipliers } = await getWorkspaceUnits(req.auth.ownerId, payload.warehouse_id || payload.metadata?.warehouseId);
+        for (const item of payload.items) {
+          if (item.metadata?.isSerial === true && item.metadata?.serialNumber) {
+            const sn = String(item.metadata.serialNumber).trim();
+            const { data: sRec } = await supabaseAdmin
+              .from('product_serials')
+              .select('id, metadata')
+              .eq('owner_id', req.auth.ownerId)
+              .in('serial_number', serialVariants(sn))
+              .maybeSingle();
+
+            if (sRec?.metadata?.isGroup) {
+              const groupTargetQty = Number(sRec.metadata.targetQty ?? sRec.metadata.unitQty ?? 1);
+              const groupTargetUnit = sRec.metadata.targetUnit || item.metadata?.qtyUnit || 'pcs';
+              const groupMult = wsUnitsMultipliers[groupTargetUnit] || 1;
+              const groupTotalPcs = Number(sRec.metadata.totalPcs ?? (groupTargetQty * groupMult));
+
+              item.metadata = {
+                ...(item.metadata || {}),
+                isGroup: true,
+                targetQty: groupTargetQty,
+                targetUnit: groupTargetUnit,
+                totalPcs: groupTotalPcs,
+                qtyInput: item.metadata?.qtyInput && item.metadata.qtyInput > 1 ? item.metadata.qtyInput : groupTargetQty,
+                qtyUnit: item.metadata?.qtyUnit && item.metadata.qtyUnit !== 'pcs' ? item.metadata.qtyUnit : groupTargetUnit,
+                unitMultiplier: groupMult,
+                baseQuantity: item.quantity && item.quantity > 1 ? item.quantity : groupTotalPcs,
+                resultProductId: sRec.metadata?.resultProductId ?? item.metadata?.resultProductId ?? null,
+                resultProductName: sRec.metadata?.resultProductName ?? item.metadata?.resultProductName ?? null,
+                resultProductSku: sRec.metadata?.resultProductSku ?? item.metadata?.resultProductSku ?? null,
+              };
+              if (!item.quantity || item.quantity === 1) {
+                item.quantity = groupTotalPcs;
+              }
+            }
+          }
+        }
+      }
+
       const { data: createdItems, error: itemsError } = await supabaseAdmin
         .from('document_items')
         .insert(payload.items.map((item) => documentItemPayload(document.id, item)))
@@ -2269,7 +3151,7 @@ router.post('/documents', async (req, res, next) => {
           const isSerial = item.metadata?.isSerial === true;
           const sn = String(item.metadata?.serialNumber || '').trim();
           if (isSerial && sn) {
-            await supabaseAdmin
+            const { data: updatedSerials } = await supabaseAdmin
               .from('product_serials')
               .update({
                 status: 'out',
@@ -2277,7 +3159,31 @@ router.post('/documents', async (req, res, next) => {
                 goods_out_item_id: item.id,
               })
               .eq('owner_id', req.auth.ownerId)
-              .in('serial_number', serialVariants(sn));
+              .in('serial_number', serialVariants(sn))
+              .select('id, metadata');
+
+            // Jika serial yang dikeluarkan adalah group, perbarui seluruh leaf serials & direct members di dalamnya menjadi out
+            if (updatedSerials && updatedSerials.length > 0) {
+              for (const s of updatedSerials) {
+                if (s.metadata?.isGroup) {
+                  const memberIds = [
+                    ...(Array.isArray(s.metadata?.composition) ? s.metadata.composition.map((c) => c.serialId || c.id) : []),
+                    ...(Array.isArray(s.metadata?.directMembers) ? s.metadata.directMembers.map((m) => m.serialId || m.id) : []),
+                  ].filter(Boolean);
+                  if (memberIds.length > 0) {
+                    await supabaseAdmin
+                      .from('product_serials')
+                      .update({
+                        status: 'out',
+                        goods_out_document_id: document.id,
+                        goods_out_item_id: item.id,
+                      })
+                      .eq('owner_id', req.auth.ownerId)
+                      .in('id', memberIds);
+                  }
+                }
+              }
+            }
           }
         }
 
@@ -2285,7 +3191,8 @@ router.post('/documents', async (req, res, next) => {
         const { multipliers } = await getWorkspaceUnits(req.auth.ownerId, payload.warehouse_id || payload.metadata?.warehouseId);
 
         for (const item of payload.items || []) {
-          if (item.productId && item.metadata?.isSerial !== true) {
+          const isUnrec = item.metadata?.isUnrecorded === true || item.metadata?.isUnrecordedStock === true;
+          if (item.productId && item.metadata?.isSerial !== true && !isUnrec) {
             const unit = item.metadata?.qtyUnit || item.unit || 'pcs';
             const mult = multipliers[unit] || 1;
             const deductedQty = (item.metadata?.qtyInput ?? item.quantity ?? 1) * mult;
@@ -2398,27 +3305,34 @@ router.post('/documents', async (req, res, next) => {
       }
     }
 
-    // Fast HTTP response (< 200ms)
-    res.status(201).json({ data });
-
     // Hanya kirim email jika dokumen langsung berstatus 'completed' (tidak dikirim saat 'processing' / draft)
     if (payload.documentType === 'goods_out' && data.status === 'completed') {
-      triggerGoodsOutEmailBackground({
-        doc: data,
-        ownerId: req.auth.ownerId,
-        userId: req.auth.user.id,
-        userEmail: req.auth.user.email,
-        userMetadata: req.auth.user.user_metadata,
-      });
+      try {
+        await triggerGoodsOutEmailBackground({
+          doc: data,
+          ownerId: req.auth.ownerId,
+          userId: req.auth.user.id,
+          userEmail: req.auth.user.email,
+          userMetadata: req.auth.user.user_metadata,
+        });
+      } catch (emailErr) {
+        console.error('[GoodsOut POST /documents] Email trigger failed:', emailErr?.message ?? emailErr);
+      }
     } else if (payload.documentType === 'goods_in' && data.status === 'completed') {
-      triggerGoodsInEmailBackground({
-        doc: data,
-        ownerId: req.auth.ownerId,
-        userId: req.auth.user.id,
-        userEmail: req.auth.user.email,
-        userMetadata: req.auth.user.user_metadata,
-      });
+      try {
+        await triggerGoodsInEmailBackground({
+          doc: data,
+          ownerId: req.auth.ownerId,
+          userId: req.auth.user.id,
+          userEmail: req.auth.user.email,
+          userMetadata: req.auth.user.user_metadata,
+        });
+      } catch (emailErr) {
+        console.error('[GoodsIn POST /documents] Email trigger failed:', emailErr?.message ?? emailErr);
+      }
     }
+
+    res.status(201).json({ data });
   } catch (error) {
     next(error);
   }
@@ -2538,16 +3452,36 @@ async function revertDocumentStockAndSerials(doc, ownerId) {
       .map((it) => String(it.metadata.serialNumber).trim());
 
     if (serialNumbers.length > 0) {
-      await supabaseAdmin
+      const { data: matchedSerials } = await supabaseAdmin
         .from('product_serials')
-        .update({
-          status: 'available',
-          goods_out_document_id: null,
-          goods_out_item_id: null,
-        })
+        .select('id, metadata')
         .in('serial_number', serialNumbers)
         .eq('owner_id', ownerId)
         .eq('status', 'out');
+
+      const allIdsToRestore = new Set((matchedSerials || []).map((s) => s.id));
+      for (const s of matchedSerials || []) {
+        if (s.metadata?.isGroup) {
+          const memberIds = [
+            ...(Array.isArray(s.metadata?.composition) ? s.metadata.composition.map((c) => c.serialId || c.id) : []),
+            ...(Array.isArray(s.metadata?.directMembers) ? s.metadata.directMembers.map((m) => m.serialId || m.id) : []),
+          ].filter(Boolean);
+          memberIds.forEach((mId) => allIdsToRestore.add(mId));
+        }
+      }
+
+      if (allIdsToRestore.size > 0) {
+        await supabaseAdmin
+          .from('product_serials')
+          .update({
+            status: 'available',
+            goods_out_document_id: null,
+            goods_out_item_id: null,
+          })
+          .in('id', Array.from(allIdsToRestore))
+          .eq('owner_id', ownerId)
+          .eq('status', 'out');
+      }
     }
 
     // Invalidate in-memory serial lookup cache
@@ -2623,6 +3557,23 @@ router.patch('/documents/:id', async (req, res, next) => {
       });
 
       if (serialsToRelease.length > 0) {
+        const { data: relSerials } = await supabaseAdmin
+          .from('product_serials')
+          .select('id, metadata')
+          .in('id', serialsToRelease)
+          .eq('owner_id', req.auth.ownerId);
+
+        const allIdsToRelease = new Set(serialsToRelease);
+        for (const s of relSerials || []) {
+          if (s.metadata?.isGroup) {
+            const memberIds = [
+              ...(Array.isArray(s.metadata?.composition) ? s.metadata.composition.map((c) => c.serialId || c.id) : []),
+              ...(Array.isArray(s.metadata?.directMembers) ? s.metadata.directMembers.map((m) => m.serialId || m.id) : []),
+            ].filter(Boolean);
+            memberIds.forEach((mId) => allIdsToRelease.add(mId));
+          }
+        }
+
         await supabaseAdmin
           .from('product_serials')
           .update({
@@ -2630,7 +3581,7 @@ router.patch('/documents/:id', async (req, res, next) => {
             goods_out_document_id: null,
             goods_out_item_id: null,
           })
-          .in('id', serialsToRelease)
+          .in('id', Array.from(allIdsToRelease))
           .eq('owner_id', req.auth.ownerId);
       }
 
@@ -2639,13 +3590,19 @@ router.patch('/documents/:id', async (req, res, next) => {
         if (!currentLinkedMap.has(snKey)) {
           const { data: foundSerial } = await supabaseAdmin
             .from('product_serials')
-            .select('id, status, serial_number, goods_out_document_id')
+            .select('id, status, serial_number, goods_out_document_id, metadata')
             .eq('owner_id', req.auth.ownerId)
             .in('serial_number', serialVariants(snKey))
             .maybeSingle();
 
           if (!foundSerial) {
             throw httpError(400, `Nomor seri "${snKey}" tidak ditemukan dalam sistem.`);
+          }
+          if (foundSerial.metadata?.isGrouped || foundSerial.metadata?.parentGroupId) {
+            throw httpError(400, `Nomor seri "${snKey}" sedang berada di dalam group "${foundSerial.metadata?.parentGroupSerialNumber || 'Group'}". Group induk paling atas harus dibongkar (ungroup) terlebih dahulu sebelum dapat dikeluarkan.`);
+          }
+          if (foundSerial.metadata?.isDissolved) {
+            throw httpError(400, `Nomor seri "${snKey}" adalah group yang sudah dibongkar (dissolved) dan tidak dapat dikeluarkan.`);
           }
           if (foundSerial.status !== 'available' && foundSerial.goods_out_document_id !== id) {
             throw httpError(400, `Nomor seri "${snKey}" tidak tersedia atau sudah pernah dikeluarkan (status: ${foundSerial.status}).`);
@@ -2659,6 +3616,23 @@ router.patch('/documents/:id', async (req, res, next) => {
             })
             .eq('id', foundSerial.id)
             .eq('owner_id', req.auth.ownerId);
+
+          if (foundSerial.metadata?.isGroup) {
+            const memberIds = [
+              ...(Array.isArray(foundSerial.metadata?.composition) ? foundSerial.metadata.composition.map((c) => c.serialId || c.id) : []),
+              ...(Array.isArray(foundSerial.metadata?.directMembers) ? foundSerial.metadata.directMembers.map((m) => m.serialId || m.id) : []),
+            ].filter(Boolean);
+            if (memberIds.length > 0) {
+              await supabaseAdmin
+                .from('product_serials')
+                .update({
+                  status: 'out',
+                  goods_out_document_id: id,
+                })
+                .eq('owner_id', req.auth.ownerId)
+                .in('id', memberIds);
+            }
+          }
         }
       }
 
@@ -2740,6 +3714,47 @@ router.patch('/documents/:id', async (req, res, next) => {
     if (error) throw httpError(500, 'Failed to update document', error.message);
 
     if (payload.items) {
+      // Reconcile grouped result serial quantities & units authoritatively from DB metadata for goods_out
+      if (beforeData.document_type === 'goods_out') {
+        const { multipliers: wsUnitsMultipliers } = await getWorkspaceUnits(req.auth.ownerId, beforeData.warehouse_id || beforeData.metadata?.warehouseId);
+        for (const item of payload.items) {
+          if (item.metadata?.isSerial === true && item.metadata?.serialNumber) {
+            const sn = String(item.metadata.serialNumber).trim();
+            const { data: sRec } = await supabaseAdmin
+              .from('product_serials')
+              .select('id, metadata')
+              .eq('owner_id', req.auth.ownerId)
+              .in('serial_number', serialVariants(sn))
+              .maybeSingle();
+
+            if (sRec?.metadata?.isGroup) {
+              const groupTargetQty = Number(sRec.metadata.targetQty ?? sRec.metadata.unitQty ?? 1);
+              const groupTargetUnit = sRec.metadata.targetUnit || item.metadata?.qtyUnit || 'pcs';
+              const groupMult = wsUnitsMultipliers[groupTargetUnit] || 1;
+              const groupTotalPcs = Number(sRec.metadata.totalPcs ?? (groupTargetQty * groupMult));
+
+              item.metadata = {
+                ...(item.metadata || {}),
+                isGroup: true,
+                targetQty: groupTargetQty,
+                targetUnit: groupTargetUnit,
+                totalPcs: groupTotalPcs,
+                qtyInput: item.metadata?.qtyInput && item.metadata.qtyInput > 1 ? item.metadata.qtyInput : groupTargetQty,
+                qtyUnit: item.metadata?.qtyUnit && item.metadata.qtyUnit !== 'pcs' ? item.metadata.qtyUnit : groupTargetUnit,
+                unitMultiplier: groupMult,
+                baseQuantity: item.quantity && item.quantity > 1 ? item.quantity : groupTotalPcs,
+                resultProductId: sRec.metadata?.resultProductId ?? item.metadata?.resultProductId ?? null,
+                resultProductName: sRec.metadata?.resultProductName ?? item.metadata?.resultProductName ?? null,
+                resultProductSku: sRec.metadata?.resultProductSku ?? item.metadata?.resultProductSku ?? null,
+              };
+              if (!item.quantity || item.quantity === 1) {
+                item.quantity = groupTotalPcs;
+              }
+            }
+          }
+        }
+      }
+
       const { error: deleteError } = await supabaseAdmin.from('document_items').delete().eq('document_id', id);
       if (deleteError) throw httpError(500, 'Failed to replace document items', deleteError.message);
       if (payload.items.length) {
@@ -2754,7 +3769,7 @@ router.patch('/documents/:id', async (req, res, next) => {
           for (const item of insertedItems || []) {
             if (item.metadata?.isSerial === true && item.metadata?.serialNumber) {
               const sn = String(item.metadata.serialNumber).trim();
-              await supabaseAdmin
+              const { data: updatedSerials } = await supabaseAdmin
                 .from('product_serials')
                 .update({
                   status: 'out',
@@ -2762,7 +3777,30 @@ router.patch('/documents/:id', async (req, res, next) => {
                   goods_out_item_id: item.id,
                 })
                 .eq('owner_id', req.auth.ownerId)
-                .in('serial_number', serialVariants(sn));
+                .in('serial_number', serialVariants(sn))
+                .select('id, metadata');
+
+              if (updatedSerials && updatedSerials.length > 0) {
+                for (const s of updatedSerials) {
+                  if (s.metadata?.isGroup) {
+                    const memberIds = [
+                      ...(Array.isArray(s.metadata?.composition) ? s.metadata.composition.map((c) => c.serialId || c.id) : []),
+                      ...(Array.isArray(s.metadata?.directMembers) ? s.metadata.directMembers.map((m) => m.serialId || m.id) : []),
+                    ].filter(Boolean);
+                    if (memberIds.length > 0) {
+                      await supabaseAdmin
+                        .from('product_serials')
+                        .update({
+                          status: 'out',
+                          goods_out_document_id: id,
+                          goods_out_item_id: item.id,
+                        })
+                        .eq('owner_id', req.auth.ownerId)
+                        .in('id', memberIds);
+                    }
+                  }
+                }
+              }
             }
           }
         }
@@ -2864,24 +3902,32 @@ router.patch('/documents/:id', async (req, res, next) => {
       }
 
       // Kirim email saat status Barang Keluar diubah menjadi 'completed' (saat klik "Selesaikan Pengeluaran")
-      triggerGoodsOutEmailBackground({
-        doc: data,
-        ownerId: req.auth.ownerId,
-        userId: req.auth.user.id,
-        userEmail: req.auth.user.email,
-        userMetadata: req.auth.user.user_metadata,
-      });
+      try {
+        await triggerGoodsOutEmailBackground({
+          doc: data,
+          ownerId: req.auth.ownerId,
+          userId: req.auth.user.id,
+          userEmail: req.auth.user.email,
+          userMetadata: req.auth.user.user_metadata,
+        });
+      } catch (emailErr) {
+        console.error('[GoodsOut PATCH /documents/:id] Email trigger failed:', emailErr?.message ?? emailErr);
+      }
     }
 
     // Kirim email saat status Barang Masuk diubah menjadi 'completed' (saat klik "Selesaikan Penerimaan")
     if (data.document_type === 'goods_in' && data.status === 'completed' && beforeData.status !== 'completed') {
-      triggerGoodsInEmailBackground({
-        doc: data,
-        ownerId: req.auth.ownerId,
-        userId: req.auth.user.id,
-        userEmail: req.auth.user.email,
-        userMetadata: req.auth.user.user_metadata,
-      });
+      try {
+        await triggerGoodsInEmailBackground({
+          doc: data,
+          ownerId: req.auth.ownerId,
+          userId: req.auth.user.id,
+          userEmail: req.auth.user.email,
+          userMetadata: req.auth.user.user_metadata,
+        });
+      } catch (emailErr) {
+        console.error('[GoodsIn PATCH /documents/:id] Email trigger failed:', emailErr?.message ?? emailErr);
+      }
     }
 
     // Revert PO status back to 'approved' if a completed Goods Out is cancelled
@@ -2992,24 +4038,32 @@ router.post('/documents/:id/complete', async (req, res, next) => {
       }
 
       // Kirim email saat status Barang Keluar diubah menjadi 'completed'
-      triggerGoodsOutEmailBackground({
-        doc: data,
-        ownerId: req.auth.ownerId,
-        userId: req.auth.user.id,
-        userEmail: req.auth.user.email,
-        userMetadata: req.auth.user.user_metadata,
-      });
+      try {
+        await triggerGoodsOutEmailBackground({
+          doc: data,
+          ownerId: req.auth.ownerId,
+          userId: req.auth.user.id,
+          userEmail: req.auth.user.email,
+          userMetadata: req.auth.user.user_metadata,
+        });
+      } catch (emailErr) {
+        console.error('[GoodsOut POST /documents/:id/complete] Email trigger failed:', emailErr?.message ?? emailErr);
+      }
     }
 
     // Kirim email saat status Barang Masuk diubah menjadi 'completed'
     if (data.document_type === 'goods_in') {
-      triggerGoodsInEmailBackground({
-        doc: data,
-        ownerId: req.auth.ownerId,
-        userId: req.auth.user.id,
-        userEmail: req.auth.user.email,
-        userMetadata: req.auth.user.user_metadata,
-      });
+      try {
+        await triggerGoodsInEmailBackground({
+          doc: data,
+          ownerId: req.auth.ownerId,
+          userId: req.auth.user.id,
+          userEmail: req.auth.user.email,
+          userMetadata: req.auth.user.user_metadata,
+        });
+      } catch (emailErr) {
+        console.error('[GoodsIn POST /documents/:id/complete] Email trigger failed:', emailErr?.message ?? emailErr);
+      }
     }
 
     res.json({ data });
@@ -3180,13 +4234,244 @@ router.delete('/documents/:id', async (req, res, next) => {
   }
 });
 
+// ── Error Mapping Helper for Atomic Return & Restore RPCs ─────────
+function mapReturnRpcError(rpcError) {
+  const msg = rpcError?.message || '';
+  if (rpcError?.code === 'P0002' || msg.includes('DOCUMENT_NOT_FOUND')) {
+    throw httpError(404, 'Dokumen tidak ditemukan atau bukan milik workspace ini');
+  }
+  if (msg.includes('RETURN_RECORD_NOT_FOUND')) {
+    throw httpError(404, 'Data retur tidak ditemukan');
+  }
+  if (msg.includes('RETURN_ALREADY_RESTORED')) {
+    throw httpError(400, 'Transaksi retur ini sudah pernah dibatalkan sebelumnya');
+  }
+  if (msg.includes('DOCUMENT_NOT_COMPLETED')) {
+    throw httpError(400, 'Hanya dokumen berstatus completed yang dapat diretur');
+  }
+  if (msg.includes('INVALID_DOC_TYPE')) {
+    throw httpError(400, 'Hanya dokumen surat jalan (Goods Out) yang dapat diretur melalui fungsi ini');
+  }
+  if (msg.includes('EMPTY_RETURN_ITEMS')) {
+    throw httpError(400, 'Daftar barang yang diretur tidak boleh kosong');
+  }
+  if (msg.includes('REASON_REQUIRED')) {
+    throw httpError(400, 'Alasan retur wajib diisi');
+  }
+  if (msg.includes('NOTES_REQUIRED_FOR_REASON_LAINNYA')) {
+    throw httpError(400, 'Catatan wajib diisi minimal 3 karakter saat alasan memilih "Lainnya"');
+  }
+  if (msg.includes('INVALID_TARGET_STATUS') || msg.includes('INVALID_ITEM_CONDITION')) {
+    throw httpError(400, 'Kondisi barang harus bernilai "available" (tersedia) atau "damaged" (rusak/cacat)');
+  }
+  if (msg.includes('SERIAL_NUMBER_REQUIRED')) {
+    throw httpError(400, 'Baris barang bertipe serial wajib menyertakan nomor seri yang valid');
+  }
+  if (msg.includes('DUPLICATE_SERIAL_IN_PAYLOAD')) {
+    const sn = msg.split(':')[1] || '';
+    throw httpError(400, `Nomor seri "${sn.trim()}" diinput berulang kali dalam pengajuan ini`);
+  }
+  if (msg.includes('SERIAL_ALREADY_RETURNED')) {
+    const sn = msg.split(':')[1] || '';
+    throw httpError(400, `Nomor seri "${sn.trim()}" sudah pernah diretur sebelumnya pada surat jalan ini`);
+  }
+  if (msg.includes('SERIAL_NOT_FOUND')) {
+    const sn = msg.split(':')[1] || '';
+    throw httpError(400, `Nomor seri "${sn.trim()}" tidak ditemukan dalam sistem inventory`);
+  }
+  if (msg.includes('SERIAL_NOT_DISPATCHED_IN_THIS_DOC')) {
+    const sn = msg.split(':')[1] || '';
+    throw httpError(400, `Nomor seri "${sn.trim()}" tidak dikeluarkan oleh surat jalan ini`);
+  }
+  if (msg.includes('SERIAL_INVALID_STATUS')) {
+    const sn = msg.split(':')[1] || '';
+    throw httpError(400, `Status nomor seri "${sn.trim()}" saat ini tidak valid untuk diretur (bukan berstatus "out")`);
+  }
+  if (msg.includes('SERIAL_WAREHOUSE_MISMATCH')) {
+    throw httpError(400, 'Gudang penyimpanan nomor seri tidak sesuai dengan gudang surat jalan ini');
+  }
+  if (msg.includes('CANNOT_IDENTIFY_SOURCE_DOCUMENT_ITEM_FOR_SERIAL')) {
+    const sn = msg.split(':')[1] || '';
+    throw httpError(400, `Barang sumber tidak dapat diidentifikasi untuk nomor seri "${sn.trim()}". Silakan pilih item dokumen secara manual.`);
+  }
+  if (msg.includes('ITEM_IS_SERIAL_USE_SERIAL_RETURN')) {
+    throw httpError(400, 'Barang ini memiliki nomor seri, wajib diretur melalui pemindaian nomor seri');
+  }
+  if (msg.includes('RETURN_QTY_EXCEEDS_REMAINING')) {
+    throw httpError(400, 'Kuantitas retur melebihi sisa barang yang dapat diretur pada surat jalan ini');
+  }
+  if (msg.includes('HISTORICAL_RETURN_EXCEEDS_ORIGINAL_QTY')) {
+    throw httpError(400, 'Inkonsistensi riwayat retur terdeteksi melebihi kuantitas pengiriman asal. Diperlukan rekonsiliasi manual.');
+  }
+  if (msg.includes('FRACTIONAL_BASE_PCS_NOT_ALLOWED')) {
+    throw httpError(400, 'Kuantitas retur dalam satuan dasar pcs menghasilkan nilai pecahan. Gudang hanya menerima satuan utuh.');
+  }
+  if (msg.includes('STOCK_INTEGER_OVERFLOW')) {
+    throw httpError(400, 'Penambahan stok melebihi kapasitas maksimum penyimpanan database');
+  }
+  if (msg.includes('INSUFFICIENT_STOCK_FOR_RESTORE')) {
+    throw httpError(400, 'Stok produk di gudang tidak mencukupi untuk membatalkan retur ini');
+  }
+  if (msg.includes('INSUFFICIENT_SERIAL_STOCK_FOR_RESTORE')) {
+    throw httpError(400, 'Stok nomor seri tersedia di gudang tidak mencukupi untuk membatalkan retur ini');
+  }
+  if (msg.includes('INSUFFICIENT_DAMAGED_STOCK_FOR_RESTORE')) {
+    throw httpError(400, 'Stok barang rusak tidak mencukupi untuk membatalkan retur ini');
+  }
+  if (msg.includes('SERIAL_STATUS_CONFLICT_FOR_RESTORE')) {
+    throw httpError(400, 'Status nomor seri saat ini tidak sesuai untuk dibatalkan (mungkin telah dipindahkan atau diubah)');
+  }
+  if (msg.includes('SERIAL_ALREADY_ATTACHED_TO_ANOTHER_DOC')) {
+    throw httpError(400, 'Nomor seri telah dikeluarkan oleh surat jalan lain dan tidak dapat dipulihkan otomatis');
+  }
+  if (msg.includes('CORRUPTED_PRODUCT_METADATA') || msg.includes('CORRUPTED_RETURNS_METADATA')) {
+    throw httpError(500, 'Inkonsistensi integritas metadata terdeteksi di database. Hubungi administrator.');
+  }
+  throw httpError(400, msg || 'Gagal memproses transaksi retur');
+}
+
+// ── GET /api/workspace/returns ─────────────────────────────────────
+router.get('/returns', async (req, res, next) => {
+  try {
+    const allowedRoles = ['owner', 'super_admin', 'staff'];
+    if (!allowedRoles.includes(req.auth.role)) {
+      throw httpError(403, 'Akses ditolak. Anda tidak memiliki izin untuk melihat daftar retur.');
+    }
+
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const offset = (page - 1) * limit;
+    const search = (req.query.search || '').trim().toLowerCase();
+    const type = req.query.type; // 'goods_out', 'goods_in', or 'all'
+    const status = req.query.status; // 'active', 'restored', or 'all'
+    const reason = req.query.reason;
+    const startDate = req.query.startDate;
+    const endDate = req.query.endDate;
+
+    let query = supabaseAdmin
+      .from('documents')
+      .select('id, document_type, document_number, contact_id, contact_name, warehouse_id, metadata, created_at, items:document_items(*)')
+      .eq('owner_id', req.auth.ownerId)
+      .not('metadata->returns', 'is', null);
+
+    if (req.auth.warehouseId) {
+      query = query.eq('warehouse_id', req.auth.warehouseId);
+    } else if (req.query.warehouseId) {
+      query = query.eq('warehouse_id', req.query.warehouseId);
+    }
+
+    if (type && type !== 'all') {
+      query = query.eq('document_type', type);
+    } else {
+      query = query.in('document_type', ['goods_out', 'goods_in']);
+    }
+
+    const { data: docs, error } = await query;
+    if (error) throw httpError(500, 'Gagal mengambil data retur', error.message);
+
+    // Flatten returns across all documents
+    let allReturns = [];
+    for (const doc of docs || []) {
+      const returns = Array.isArray(doc.metadata?.returns) ? doc.metadata.returns : [];
+      for (const ret of returns) {
+        if (!ret || typeof ret !== 'object') continue;
+        allReturns.push({
+          id: ret.id,
+          returnNumber: ret.returnNumber || `RET-${doc.document_number}`,
+          documentId: doc.id,
+          documentNumber: doc.document_number,
+          documentType: doc.document_type,
+          contactId: doc.contact_id || null,
+          contactName: doc.contact_name,
+          warehouseId: doc.warehouse_id,
+          returnedAt: ret.returnedAt || ret.date || doc.created_at,
+          returnedBy: ret.returnedBy,
+          reason: ret.reason,
+          notes: ret.notes,
+          status: ret.status || 'active',
+          condition: ret.condition || (ret.items?.some((i) => i.condition === 'damaged' || i.targetStatus === 'damaged') ? 'damaged' : 'available'),
+          restoredAt: ret.restoredAt,
+          restoredBy: ret.restoredBy,
+          restoreNotes: ret.restoreNotes,
+          items: (ret.items || []).map((item) => {
+            const matchedDocItem = (doc.items || []).find((di) => di.id === item.itemId);
+            const isGroup = item.isGroup === true || matchedDocItem?.metadata?.isGroup === true;
+            const targetQty = isGroup
+              ? Number(matchedDocItem?.metadata?.targetQty ?? item.targetQty ?? item.returnedQty ?? 1)
+              : Number(item.returnedQty ?? 1);
+            const targetUnit = isGroup
+              ? (matchedDocItem?.metadata?.targetUnit ?? item.targetUnit ?? item.qtyUnit ?? matchedDocItem?.metadata?.qtyUnit ?? 'pcs')
+              : (item.qtyUnit || matchedDocItem?.metadata?.qtyUnit || 'pcs');
+
+            return {
+              ...item,
+              isGroup,
+              returnedQty: targetQty,
+              targetQty,
+              qtyUnit: targetUnit,
+              targetUnit,
+              productName: item.productName || matchedDocItem?.item_name || 'Barang',
+              sku: item.sku || matchedDocItem?.sku || '',
+            };
+          }),
+        });
+      }
+    }
+
+    // Apply filters in memory
+    if (status && status !== 'all') {
+      allReturns = allReturns.filter((r) => r.status === status);
+    }
+    if (reason) {
+      allReturns = allReturns.filter((r) => r.reason === reason);
+    }
+    if (startDate) {
+      allReturns = allReturns.filter((r) => (r.returnedAt || '').slice(0, 10) >= startDate);
+    }
+    if (endDate) {
+      allReturns = allReturns.filter((r) => (r.returnedAt || '').slice(0, 10) <= endDate);
+    }
+    if (search) {
+      allReturns = allReturns.filter((r) => {
+        const retNum = (r.returnNumber || '').toLowerCase();
+        const docNum = (r.documentNumber || '').toLowerCase();
+        const contact = (r.contactName || '').toLowerCase();
+        const itemsMatch = (r.items || []).some((i) =>
+          (i.productName || '').toLowerCase().includes(search) ||
+          (i.sku || '').toLowerCase().includes(search) ||
+          (i.serialNumber || '').toLowerCase().includes(search)
+        );
+        return retNum.includes(search) || docNum.includes(search) || contact.includes(search) || itemsMatch;
+      });
+    }
+
+    // Sort by returnedAt descending
+    allReturns.sort((a, b) => new Date(b.returnedAt || 0) - new Date(a.returnedAt || 0));
+
+    const totalCount = allReturns.length;
+    const paginated = allReturns.slice(offset, offset + limit);
+
+    res.json({
+      data: paginated,
+      meta: {
+        total: totalCount,
+        page,
+        limit,
+        totalPages: Math.ceil(totalCount / limit) || 1,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // ── Document Return (Goods Out & Goods In) ──────────────────────
 const returnItemSchema = z.object({
   productId: z.string().trim().optional().nullable().transform((val) => (val && val.length > 0 ? val : null)),
   itemId: z.string().trim().optional().nullable().transform((val) => (val && val.length > 0 ? val : null)),
   isSerial: z.boolean().default(false),
   serialNumber: z.string().trim().optional().nullable().transform((val) => (val && val.length > 0 ? val : null)),
-  returnedQty: z.coerce.number().int().positive().default(1),
+  returnedQty: z.coerce.number().positive().default(1),
   qtyUnit: z.string().trim().max(50).default('pcs'),
   targetStatus: z.enum(['available', 'damaged']).optional().default('available'),
 });
@@ -3203,6 +4488,11 @@ router.post('/documents/:id/return', async (req, res, next) => {
   try {
     const id = idSchema.parse(req.params.id);
     const doc = await getRow('documents', id, req.auth.ownerId, '*, items:document_items(*)');
+
+    // Warehouse isolation check
+    if (req.auth.warehouseId && doc.warehouse_id && doc.warehouse_id !== req.auth.warehouseId) {
+      throw httpError(403, 'Akses ditolak. Anda tidak berwenang memproses retur untuk dokumen gudang lain.');
+    }
 
     // Only completed goods_out or goods_in documents can be returned
     if (doc.document_type !== 'goods_out' && doc.document_type !== 'goods_in') {
@@ -3430,205 +4720,116 @@ router.post('/documents/:id/return', async (req, res, next) => {
         })
       );
     } else {
-      // ── GOODS OUT RETURN ──
-      const stockAdditionByProduct = {};
-      const nonSerialAdditionByProduct = {};
-      const serialAdditionByProduct = {};
+      // ── GOODS OUT RETURN VIA ATOMIC DATABASE RPC ──
+      const allowedRoles = ['owner', 'super_admin', 'staff'];
+      if (!allowedRoles.includes(req.auth.role)) {
+        throw httpError(403, 'Akses ditolak. Hanya owner, super_admin, dan staff yang diizinkan melakukan retur Barang Keluar.');
+      }
 
-      for (const returnItem of payload.items) {
-        if (returnItem.isSerial && returnItem.serialNumber) {
-          const cleanSN = String(returnItem.serialNumber).trim();
+      let rpcResult = null;
+      let rpcError = null;
+      const maxRetries = 3;
 
-          // Check if serial was already returned in previous return batches
-          const alreadyReturned = existingReturns.some((r) =>
-            (r.items ?? []).some(
-              (ri) => ri.isSerial && String(ri.serialNumber || '').trim().toLowerCase() === cleanSN.toLowerCase()
-            )
-          );
-          if (alreadyReturned) {
-            throw httpError(400, `Nomor seri "${cleanSN}" sudah pernah diretur sebelumnya`);
-          }
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        const { data, error } = await supabaseAdmin.rpc('process_goods_out_return', {
+          p_document_id: id,
+          p_payload: payload,
+          p_owner_id: req.auth.ownerId,
+          p_actor_id: req.auth.user.id,
+        });
 
-          const matchedDocItem = (doc.items ?? []).find(
-            (di) => di.metadata?.isSerial === true && String(di.metadata?.serialNumber || '').trim().toLowerCase() === cleanSN.toLowerCase()
-          );
-          const serialProductId = returnItem.productId || matchedDocItem?.product_id || null;
+        if (!error) {
+          rpcResult = data;
+          rpcError = null;
+          break;
+        }
 
-          let query = supabaseAdmin
-            .from('product_serials')
-            .select('*')
-            .eq('owner_id', req.auth.ownerId)
-            .in('serial_number', serialVariants(cleanSN));
+        rpcError = error;
+        // Retry only on deadlock (40P01) or serialization failure (40001)
+        if ((error.code === '40P01' || error.code === '40001') && attempt < maxRetries) {
+          const delay = Math.floor(Math.random() * 100) + attempt * 50;
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          continue;
+        }
+        break;
+      }
 
-          if (serialProductId) {
-            query = query.eq('product_id', serialProductId);
-          }
+      if (rpcError) {
+        console.error('[GoodsOut Return] RPC error:', rpcError);
+        mapReturnRpcError(rpcError);
+      }
 
-          const { data: serials, error: serErr } = await query.limit(1);
-          if (serErr) throw httpError(500, 'Gagal mencari nomor seri di database', serErr.message);
-          const serial = serials?.[0];
+      SERIAL_CACHE.clear();
 
-          // Determine status: default to available so serial number returns to active system,
-          // unless explicitly specified as 'damaged' or marked as damaged by operator
-          const newStatus = returnItem.targetStatus || payload.targetStatus || (payload.reason === 'cacat_produk' && payload.markAsDamaged ? 'damaged' : 'available');
-
-          if (serial) {
-            const updatePayload = {
-              status: newStatus,
-              goods_out_document_id: null,
-              goods_out_item_id: null,
-              warehouse_id: doc.warehouse_id || serial.warehouse_id || null,
-            };
-
-            const serialMeta = serial.metadata || {};
-            updatePayload.metadata = {
-              ...serialMeta,
-              returnedAt: new Date().toISOString(),
-              returnedFrom: doc.document_number,
-              returnedFromDocId: doc.id,
-              returnReason: payload.reason,
-            };
-
-            const { error: updateErr } = await supabaseAdmin
+      // Cascade restore leaf serials if any of the returned items is a Group Serial
+      if (rpcResult && Array.isArray(payload.items)) {
+        for (const it of payload.items) {
+          if (it.serialNumber) {
+            const snClean = String(it.serialNumber).trim();
+            const { data: retGroup } = await supabaseAdmin
               .from('product_serials')
-              .update(updatePayload)
-              .eq('id', serial.id);
-            if (updateErr) throw httpError(500, 'Gagal memperbarui status nomor seri', updateErr.message);
-          } else if (serialProductId) {
-            const { error: insertErr } = await supabaseAdmin
-              .from('product_serials')
-              .insert({
-                owner_id: req.auth.ownerId,
-                warehouse_id: doc.warehouse_id || null,
-                product_id: serialProductId,
-                serial_number: cleanSN,
-                status: newStatus,
-                goods_out_document_id: null,
-                goods_out_item_id: null,
-                metadata: {
-                  returnedAt: new Date().toISOString(),
-                  returnedFrom: doc.document_number,
-                  returnedFromDocId: doc.id,
-                  returnReason: payload.reason,
-                  manuallyCreated: true,
-                },
-              });
-            if (insertErr) throw httpError(500, 'Gagal membuat data nomor seri baru', insertErr.message);
+              .select('id, metadata')
+              .eq('owner_id', req.auth.ownerId)
+              .in('serial_number', serialVariants(snClean))
+              .maybeSingle();
+
+            if (retGroup?.metadata?.isGroup) {
+              const memberIds = [
+                ...(Array.isArray(retGroup.metadata?.composition) ? retGroup.metadata.composition.map((c) => c.serialId || c.id) : []),
+                ...(Array.isArray(retGroup.metadata?.directMembers) ? retGroup.metadata.directMembers.map((m) => m.serialId || m.id) : []),
+              ].filter(Boolean);
+              if (memberIds.length > 0) {
+                const targetCond = it.targetStatus || (it.markAsDamaged ? 'damaged' : 'available');
+                await supabaseAdmin
+                  .from('product_serials')
+                  .update({
+                    status: targetCond,
+                    goods_out_document_id: null,
+                    goods_out_item_id: null,
+                  })
+                  .eq('owner_id', req.auth.ownerId)
+                  .in('id', memberIds);
+              }
+            }
           }
-
-          const targetProdId = serialProductId || serial?.product_id;
-          const sUnit = parseUnitFromSn(cleanSN) || serial?.metadata?.serialUnit || returnItem.qtyUnit || matchedDocItem?.metadata?.qtyUnit || matchedDocItem?.unit || 'pcs';
-          const sMultiplier = multipliers[sUnit] || multipliers[returnItem.qtyUnit] || 1;
-
-          if (targetProdId) {
-            stockAdditionByProduct[targetProdId] = (stockAdditionByProduct[targetProdId] || 0) + sMultiplier;
-            serialAdditionByProduct[targetProdId] = (serialAdditionByProduct[targetProdId] || 0) + sMultiplier;
-          }
-
-          returnItemsToRecord.push({
-            itemId: returnItem.itemId || matchedDocItem?.id || null,
-            productId: targetProdId || null,
-            isSerial: true,
-            serialNumber: cleanSN,
-            returnedQty: 1,
-            qtyUnit: sUnit,
-          });
-        } else {
-          // Non-Serial Goods Out
-          const unit = returnItem.qtyUnit || 'pcs';
-          const multiplier = multipliers[unit] || 1;
-          const returnedQty = Number(returnItem.returnedQty || 1);
-          const stockDelta = returnedQty * multiplier;
-
-          const docItem = (doc.items ?? []).find((di) => {
-            if (returnItem.itemId && di.id === returnItem.itemId) return true;
-            if (returnItem.productId && (di.product_id ?? di.productId) === returnItem.productId) return true;
-            return false;
-          }) ?? (doc.items ?? [])[0];
-
-          if (!docItem) throw httpError(400, `Barang tidak ditemukan dalam dokumen ini`);
-
-          const targetProdId = returnItem.productId ?? docItem.product_id ?? docItem.productId;
-          const targetItemId = returnItem.itemId ?? docItem.id;
-
-          // Double return check for non-serial
-          const alreadyReturnedQty = existingReturns.reduce((sum, r) => {
-            const matching = (r.items ?? []).filter((ri) => !ri.isSerial && (
-              (targetItemId && ri.itemId === targetItemId) ||
-              (targetProdId && ri.productId === targetProdId)
-            ));
-            return sum + matching.reduce((mSum, mi) => mSum + Number(mi.returnedQty || 0), 0);
-          }, 0);
-
-          const origQty = Number(docItem.quantity ?? docItem.metadata?.qtyInput ?? 0);
-          if (origQty > 0 && alreadyReturnedQty + returnedQty > origQty) {
-            throw httpError(400, `Kuantitas retur melebihi sisa barang yang dapat diretur (Sisa: ${origQty - alreadyReturnedQty} ${unit})`);
-          }
-
-          if (targetProdId) {
-            stockAdditionByProduct[targetProdId] = (stockAdditionByProduct[targetProdId] || 0) + stockDelta;
-            nonSerialAdditionByProduct[targetProdId] = (nonSerialAdditionByProduct[targetProdId] || 0) + stockDelta;
-          }
-
-          returnItemsToRecord.push({
-            itemId: targetItemId || null,
-            productId: targetProdId || null,
-            isSerial: false,
-            serialNumber: null,
-            returnedQty: returnedQty,
-            qtyUnit: unit,
-          });
         }
       }
 
-      // Apply product stock additions in database
-      await Promise.all(
-        Object.entries(stockAdditionByProduct).map(async ([prodId, addTotal]) => {
-          const { data: prodData } = await supabaseAdmin
-            .from('products')
-            .select('stock, metadata')
-            .eq('id', prodId)
-            .eq('owner_id', req.auth.ownerId)
-            .maybeSingle();
+      const updatedDoc = await getRow('documents', id, req.auth.ownerId, '*, items:document_items(*)');
+      const latestReturn = (updatedDoc?.metadata?.returns || []).find((r) => r.id === rpcResult?.returnId) || rpcResult;
 
-          if (prodData) {
-            const currentTotal = Number(prodData.stock || 0);
-            const currentNonSerial = Number(prodData.metadata?.stockNonSerial ?? prodData.stock ?? 0);
-            const currentSerials = Number(prodData.metadata?.stockSerials ?? 0);
-            const addNonSerial = nonSerialAdditionByProduct[prodId] || 0;
-            const addSerials = serialAdditionByProduct[prodId] || 0;
+      if (latestReturn?.id) {
+        try {
+          await triggerReturnEmailBackground({
+            doc: updatedDoc,
+            returnRecord: latestReturn,
+            ownerId: req.auth.ownerId,
+            userId: req.auth.user.id,
+            userEmail: req.auth.user.email,
+            userMetadata: req.auth.user.user_metadata,
+          });
+        } catch (emailErr) {
+          console.error('[Return POST /documents/:id/return] Email trigger failed:', emailErr?.message ?? emailErr);
+        }
+      }
 
-            const updatedMeta = { ...(prodData.metadata || {}) };
-            if (addNonSerial > 0) {
-              updatedMeta.stockNonSerial = currentNonSerial + addNonSerial;
-            }
-            if (addSerials > 0) {
-              updatedMeta.stockSerials = currentSerials + addSerials;
-            }
-
-            await supabaseAdmin
-              .from('products')
-              .update({
-                stock: currentTotal + addTotal,
-                metadata: updatedMeta,
-              })
-              .eq('id', prodId)
-              .eq('owner_id', req.auth.ownerId);
-          }
-        })
-      );
+      return res.json({ data: updatedDoc, returnRecord: latestReturn });
     }
 
     // Invalidate in-memory serial lookup cache so new scans reflect returned serials immediately
     SERIAL_CACHE.clear();
 
     // Save return record to document metadata
+    const returnSequence = existingReturns.length + 1;
     const returnRecord = {
       id: crypto.randomUUID(),
+      returnNumber: `RET-${doc.document_number}-R${String(returnSequence).padStart(2, '0')}`,
+      returnedAt: new Date().toISOString(),
       date: new Date().toISOString(),
       reason: payload.reason,
       notes: payload.notes || null,
       returnedBy: req.auth.user.id,
+      status: 'active',
       items: returnItemsToRecord,
     };
 
@@ -3659,6 +4860,19 @@ router.post('/documents/:id/return', async (req, res, next) => {
       afterData: updatedDoc,
     });
 
+    try {
+      await triggerReturnEmailBackground({
+        doc: updatedDoc,
+        returnRecord,
+        ownerId: req.auth.ownerId,
+        userId: req.auth.user.id,
+        userEmail: req.auth.user.email,
+        userMetadata: req.auth.user.user_metadata,
+      });
+    } catch (emailErr) {
+      console.error('[Return POST /documents/:id/return legacy] Email trigger failed:', emailErr?.message ?? emailErr);
+    }
+
     res.json({ data: updatedDoc, returnRecord });
   } catch (error) {
     next(error);
@@ -3666,11 +4880,65 @@ router.post('/documents/:id/return', async (req, res, next) => {
 });
 
 // ── Undo / Restore Return Endpoint ─────────────────────────
+// POST /documents/:id/returns/:returnId/send-email
+// Kirim ulang email retur secara manual. Wajib manual karena log `uncertain`
+// tidak boleh dikirim ulang otomatis (SMTP tidak punya idempotency key).
+router.post('/documents/:id/returns/:returnId/send-email', async (req, res, next) => {
+  try {
+    const id = idSchema.parse(req.params.id);
+    const returnId = req.params.returnId;
+    const doc = await getRow('documents', id, req.auth.ownerId, '*, items:document_items(*)');
+
+    if (req.auth.warehouseId && doc.warehouse_id && doc.warehouse_id !== req.auth.warehouseId) {
+      throw httpError(403, 'Akses ditolak. Anda tidak berwenang mengirim email retur untuk dokumen gudang lain.');
+    }
+
+    const returnRecord = (doc.metadata?.returns || []).find((ret) => ret?.id === returnId);
+    if (!returnRecord) {
+      throw httpError(404, 'Data retur tidak ditemukan. Retur mungkin sudah dibatalkan/dipulihkan.');
+    }
+    if (returnRecord.status && returnRecord.status !== 'active') {
+      throw httpError(400, 'Email hanya dapat dikirim untuk retur yang masih aktif.');
+    }
+
+    const result = await resendReturnEmail(doc, returnRecord, {
+      ownerId: req.auth.ownerId,
+      actorEmail: req.auth.user.email,
+      actorMetadata: req.auth.user.user_metadata,
+      manualRetry: true,
+    });
+
+    if (result.status === 'skipped') {
+      return res.status(409).json({
+        success: false,
+        error: 'Email retur tidak dikirim karena sudah terkirim, sedang diproses, atau menunggu konfirmasi manual.',
+        reason: result.reason || null,
+      });
+    }
+    if (result.status === 'failed') {
+      return res.status(502).json({
+        success: false,
+        error: result.error || 'Gagal mengirim email retur.',
+        data: result,
+      });
+    }
+
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+});
+
 router.post('/documents/:id/returns/:returnId/restore', async (req, res, next) => {
   try {
     const { id, returnId } = req.params;
     const doc = await getRow('documents', id, req.auth.ownerId, '*, items:document_items(*)');
     if (!doc) throw httpError(404, 'Dokumen tidak ditemukan');
+
+    // Warehouse isolation check
+    if (req.auth.warehouseId && doc.warehouse_id && doc.warehouse_id !== req.auth.warehouseId) {
+      throw httpError(403, 'Akses ditolak. Anda tidak berwenang membatalkan retur untuk dokumen gudang lain.');
+    }
 
     const existingReturns = doc.metadata?.returns ?? [];
     const returnRecord = existingReturns.find((r) => r.id === returnId);
@@ -3920,57 +5188,54 @@ router.post('/documents/:id/returns/:returnId/restore', async (req, res, next) =
         }
       }
     } else {
-      // ── GOODS OUT RETURN REVERSAL ──
-      // In Goods Out, return put goods back to available. Reversing it marks them 'out' again and deducts stock.
-      for (const item of returnItems) {
-        if (item.isSerial && item.serialNumber) {
-          const cleanSN = String(item.serialNumber).trim();
-          await supabaseAdmin
-            .from('product_serials')
-            .update({
-              status: 'out',
-              goods_out_document_id: doc.id,
-              goods_out_item_id: item.itemId || null,
-            })
-            .eq('owner_id', req.auth.ownerId)
-            .in('serial_number', serialVariants(cleanSN));
-        }
-
-        const unit = item.qtyUnit || 'pcs';
-        const mult = multipliers[unit] || 1;
-        const qtyToDeduct = (Number(item.returnedQty) || 1) * mult;
-
-        if (item.productId) {
-          const { data: prod } = await supabaseAdmin
-            .from('products')
-            .select('stock, metadata')
-            .eq('id', item.productId)
-            .eq('owner_id', req.auth.ownerId)
-            .maybeSingle();
-
-          if (prod) {
-            const currentStock = Number(prod.stock || 0);
-            const currentSerials = Number(prod.metadata?.stockSerials ?? 0);
-            const currentNonSerial = Number(prod.metadata?.stockNonSerial ?? prod.stock ?? 0);
-            const newStock = Math.max(0, currentStock - qtyToDeduct);
-            const newNonSerial = !item.isSerial ? Math.max(0, currentNonSerial - qtyToDeduct) : currentNonSerial;
-            const newSerials = item.isSerial ? Math.max(0, currentSerials - qtyToDeduct) : currentSerials;
-
-            await supabaseAdmin
-              .from('products')
-              .update({
-                stock: newStock,
-                metadata: {
-                  ...(prod.metadata || {}),
-                  stockNonSerial: newNonSerial,
-                  stockSerials: newSerials,
-                },
-              })
-              .eq('id', item.productId)
-              .eq('owner_id', req.auth.ownerId);
-          }
-        }
+      // ── GOODS OUT RESTORE VIA ATOMIC DATABASE RPC ──
+      const allowedRoles = ['owner', 'super_admin', 'staff'];
+      if (!allowedRoles.includes(req.auth.role)) {
+        throw httpError(403, 'Akses ditolak. Hanya owner, super_admin, dan staff yang diizinkan membatalkan retur Barang Keluar.');
       }
+
+      let rpcResult = null;
+      let rpcError = null;
+      const maxRetries = 3;
+
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        const { data, error } = await supabaseAdmin.rpc('restore_goods_out_return', {
+          p_document_id: id,
+          p_return_id: returnId,
+          p_owner_id: req.auth.ownerId,
+          p_actor_id: req.auth.user.id,
+          p_notes: req.body?.notes || null,
+        });
+
+        if (!error) {
+          rpcResult = data;
+          rpcError = null;
+          break;
+        }
+
+        rpcError = error;
+        // Retry only on deadlock (40P01) or serialization failure (40001)
+        if ((error.code === '40P01' || error.code === '40001') && attempt < maxRetries) {
+          const delay = Math.floor(Math.random() * 100) + attempt * 50;
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          continue;
+        }
+        break;
+      }
+
+      if (rpcError) {
+        console.error('[GoodsOut Restore] RPC error:', rpcError);
+        mapReturnRpcError(rpcError);
+      }
+
+      SERIAL_CACHE.clear();
+
+      const updatedDoc = await getRow('documents', id, req.auth.ownerId, '*, items:document_items(*)');
+      return res.json({
+        data: updatedDoc,
+        restoredReturnId: returnId,
+        message: 'Retur Surat Jalan berhasil dibatalkan dan status serial/stok berhasil dipulihkan',
+      });
     }
 
     // Invalidate in-memory serial lookup cache
@@ -4615,18 +5880,19 @@ router.get('/inventory/stock-opname/sessions/:id', async (req, res, next) => {
     // Jika sesi belum difinalisasi, sinkronkan totalSystemQty dengan pergerakan stok live gudang terkini
     if (session.status !== 'finalized') {
       try {
+        const activeWhId = session.warehouseId || req.query.warehouse_id || warehouseId;
         let docQuery = supabaseAdmin
           .from('documents')
           .select('id, document_type, status, items:document_items(product_id, quantity, metadata)')
           .eq('owner_id', ownerId)
           .eq('status', 'completed')
           .in('document_type', ['goods_in', 'goods_out']);
-        if (warehouseId) {
-          docQuery = docQuery.eq('warehouse_id', warehouseId);
+        if (activeWhId) {
+          docQuery = docQuery.eq('warehouse_id', activeWhId);
         }
         const { data: liveDocs } = await docQuery;
 
-        const { multipliers } = await getWorkspaceUnits(ownerId, warehouseId);
+        const { multipliers } = await getWorkspaceUnits(ownerId, activeWhId);
         const liveStockByProductId = new Map();
 
         if (Array.isArray(liveDocs)) {
@@ -4651,8 +5917,8 @@ router.get('/inventory/stock-opname/sessions/:id', async (req, res, next) => {
           .select('product_id, metadata, warehouse_id')
           .eq('owner_id', ownerId)
           .eq('status', 'available');
-        if (warehouseId) {
-          serialQuery = serialQuery.or(`warehouse_id.eq.${warehouseId},warehouse_id.is.null`);
+        if (activeWhId) {
+          serialQuery = serialQuery.eq('warehouse_id', activeWhId);
         }
         const { data: dbAvailableSerials } = await serialQuery;
         const serialStockByProductId = new Map();
@@ -4693,7 +5959,7 @@ router.get('/inventory/stock-opname/sessions/:id', async (req, res, next) => {
             } else if (dp.id && liveStockByProductId.has(dp.id)) {
               liveStock = Math.max(0, liveStockByProductId.get(dp.id));
             } else if (dp.stock !== undefined && dp.stock !== null) {
-              liveStock = Math.max(0, Number(dp.stock));
+              liveStock = activeWhId ? 0 : Math.max(0, Number(dp.stock));
             }
           }
 
@@ -4712,7 +5978,7 @@ router.get('/inventory/stock-opname/sessions/:id', async (req, res, next) => {
             } else if (liveStockByProductId.has(dp.id)) {
               liveStock = Math.max(0, liveStockByProductId.get(dp.id));
             } else {
-              liveStock = Math.max(0, Number(dp.stock) || 0);
+              liveStock = activeWhId ? 0 : Math.max(0, Number(dp.stock) || 0);
             }
 
             productMap.set(skuKey, {
@@ -4917,6 +6183,7 @@ router.put('/inventory/stock-opname/sessions/:id/area-count', async (req, res, n
           isUnlisted: Boolean(it.isUnlisted),
           notes: String(it.notes || '').trim(),
           scannedSerials: phys !== null && Array.isArray(it.scannedSerials) ? it.scannedSerials : [],
+          serialUnits: phys !== null && it.serialUnits ? it.serialUnits : {},
           manualQty: phys !== null && it.manualQty !== undefined && it.manualQty !== null ? it.manualQty : null,
           manualUnit: it.manualUnit || 'pcs',
           manualEntries: phys !== null && Array.isArray(it.manualEntries) ? it.manualEntries : [],
@@ -4979,6 +6246,9 @@ router.put('/inventory/stock-opname/sessions/:id/area-count', async (req, res, n
             scannedSerials: phys !== null && Array.isArray(input.scannedSerials)
               ? input.scannedSerials
               : (phys !== null ? (existingItem.scannedSerials || []) : []),
+            serialUnits: phys !== null && input.serialUnits
+              ? input.serialUnits
+              : (phys !== null ? (existingItem.serialUnits || {}) : {}),
             manualQty: phys !== null && input.manualQty !== undefined && input.manualQty !== null
               ? input.manualQty
               : (phys !== null ? (existingItem.manualQty ?? null) : null),
@@ -5019,6 +6289,7 @@ router.put('/inventory/stock-opname/sessions/:id/area-count', async (req, res, n
           isUnlisted: Boolean(it.isUnlisted),
           notes: String(it.notes || '').trim(),
           scannedSerials: phys !== null && Array.isArray(it.scannedSerials) ? it.scannedSerials : [],
+          serialUnits: phys !== null && it.serialUnits ? it.serialUnits : {},
           manualQty: phys !== null && it.manualQty !== undefined && it.manualQty !== null ? it.manualQty : null,
           manualUnit: it.manualUnit || 'pcs',
           manualEntries: phys !== null && Array.isArray(it.manualEntries) ? it.manualEntries : [],
@@ -6015,6 +7286,9 @@ router.patch('/settings/:key', async (req, res, next) => {
     if (key === 'modules' && req.auth.role !== 'super_admin') {
       throw httpError(403, 'Access denied: Only Super Admin can modify module settings.');
     }
+    if (key === 'daily_report_settings' && req.auth.role !== 'super_admin') {
+      throw httpError(403, 'Akses ditolak: Pengaturan laporan harian hanya dapat diubah oleh Super Admin.');
+    }
     if (key === 'custom_units' && req.auth.role !== 'owner' && req.auth.role !== 'super_admin' && req.auth.role !== 'staff') {
       throw httpError(403, 'Access denied: Only Owner, Super Admin, or Staff can modify units settings.');
     }
@@ -6071,7 +7345,11 @@ router.patch('/settings/:key', async (req, res, next) => {
       valueToSave = cleanUnits;
     }
 
-    const ownerId = key === 'modules' ? SUPER_ADMIN_TENANT_ID : req.auth.ownerId;
+    if (key === 'daily_report_settings' && valueToSave && typeof valueToSave === 'object') {
+      valueToSave = { ...valueToSave, scheduleTime: '19:00' };
+    }
+
+    const ownerId = (key === 'modules' || key === 'daily_report_settings') ? SUPER_ADMIN_TENANT_ID : req.auth.ownerId;
     const warehouseId = req.auth.warehouseId;
     const dbKey = (warehouseId && (key === 'company' || key === 'custom_units')) ? `${key}_${warehouseId}` : key;
 
@@ -6081,10 +7359,603 @@ router.patch('/settings/:key', async (req, res, next) => {
       .select('key, value')
       .single();
     if (error) throw httpError(500, 'Failed to save setting', error.message);
+
+    // Sync company and app.company bidirectionally so they never drift
+    if (!warehouseId && key === 'app' && valueToSave?.company && typeof valueToSave.company === 'object') {
+      try {
+        await supabaseAdmin
+          .from('workspace_settings')
+          .upsert({
+            owner_id: ownerId,
+            key: 'company',
+            value: valueToSave.company,
+            updated_by: req.auth.user.id,
+          }, { onConflict: 'owner_id,key' });
+      } catch (_) {}
+    } else if (!warehouseId && key === 'company' && valueToSave && typeof valueToSave === 'object') {
+      try {
+        const { data: currentApp } = await supabaseAdmin
+          .from('workspace_settings')
+          .select('value')
+          .eq('owner_id', ownerId)
+          .eq('key', 'app')
+          .maybeSingle();
+        if (currentApp?.value) {
+          await supabaseAdmin
+            .from('workspace_settings')
+            .update({
+              value: { ...currentApp.value, company: valueToSave },
+              updated_by: req.auth.user.id,
+            })
+            .eq('owner_id', ownerId)
+            .eq('key', 'app');
+        }
+      } catch (_) {}
+    }
+
     await writeActivityLog(req, { action: 'updated', entityType: 'Settings', entityName: key, afterData: data });
     res.json({ data: { key, value: valueToSave } });
   } catch (error) {
     next(error);
+  }
+});
+
+// ── SUPER ADMIN & OWNER DAILY REPORT ROUTES ──────────────────────────────────
+
+router.get('/daily-report/settings', async (req, res, next) => {
+  try {
+    if (req.auth.role !== 'super_admin' && req.auth.role !== 'owner') {
+      throw httpError(403, 'Akses ditolak: Hanya Super Admin dan Owner yang dapat mengakses pengaturan laporan harian.');
+    }
+
+    const isOwner = req.auth.role === 'owner';
+    const targetTenantId = isOwner ? req.auth.ownerId : SUPER_ADMIN_TENANT_ID;
+
+    const { data: legacySuperAdminSettingRow } = await supabaseAdmin
+      .from('workspace_settings')
+      .select('value')
+      .eq('owner_id', SUPER_ADMIN_TENANT_ID)
+      .eq('key', 'daily_report_settings')
+      .maybeSingle();
+    const legacySetting = legacySuperAdminSettingRow?.value || null;
+
+    if (isOwner) {
+      // Ambil informasi perusahaan milik owner ini saja
+      const { data: compSettings } = await supabaseAdmin
+        .from('workspace_settings')
+        .select('key, value')
+        .eq('owner_id', req.auth.ownerId)
+        .in('key', ['company', 'app']);
+
+      let companyName = null;
+      let companyEmail = null;
+      for (const s of compSettings || []) {
+        const val = s.value || {};
+        if (s.key === 'company') {
+          companyName = val.companyName || val.name || companyName;
+          companyEmail = val.companyEmail || val.email || val.company?.companyEmail || val.company?.email || companyEmail;
+        } else if (s.key === 'app') {
+          companyName = companyName || val.company?.companyName || val.company?.name || val.companyName || val.name;
+          companyEmail = companyEmail || val.company?.companyEmail || val.company?.email || val.companyEmail || val.email;
+        }
+      }
+
+      // Ambil setting khusus owner ini dari database
+      const { data: ownerDbSetting } = await supabaseAdmin
+        .from('workspace_settings')
+        .select('value')
+        .eq('owner_id', req.auth.ownerId)
+        .eq('key', 'daily_report_settings')
+        .maybeSingle();
+
+      const ownerVal = ownerDbSetting?.value || (legacySetting && legacySetting.authorizedOwnerId === req.auth.ownerId ? legacySetting : null);
+      const isSuperAdminEnabled = Boolean(ownerVal?.enabled);
+
+      const defaultSettings = {
+        enabled: isSuperAdminEnabled,
+        scheduleTime: '19:00',
+        timeZone: 'Asia/Jakarta',
+        includeGoodsIn: ownerVal?.includeGoodsIn !== false,
+        includeGoodsOut: ownerVal?.includeGoodsOut !== false,
+        includeReturns: ownerVal?.includeReturns !== false,
+        reportType: 'both',
+        authorizedOwnerId: req.auth.ownerId,
+        useCompanyEmail: ownerVal?.useCompanyEmail !== false,
+        customRecipients: ownerVal?.customRecipients || '',
+      };
+
+      return res.json({
+        settings: defaultSettings,
+        rawSettings: ownerVal || defaultSettings,
+        owners: [
+          {
+            id: req.auth.ownerId,
+            name: req.auth.user?.full_name || 'Owner',
+            role: 'owner',
+            companyName: companyName || req.auth.user?.full_name || 'Perusahaan Anda',
+            companyEmail: companyEmail || null,
+            enabled: isSuperAdminEnabled,
+          },
+        ],
+        companyEmail,
+        companyName,
+        isOwner: true,
+        isSuperAdmin: false,
+        canToggleEnabled: false,
+        statusMessage: isSuperAdminEnabled
+          ? 'Laporan harian aktif dan dijadwalkan otomatis setiap pukul 19.00 WIB oleh Super Admin.'
+          : 'Laporan harian dinonaktifkan oleh Super Admin. Hubungi Super Admin untuk mengaktifkannya.',
+      });
+    }
+
+    // Role Super Admin: dapat mengelola dan memilih semua tenant
+    const { data: rawProfiles } = await supabaseAdmin
+      .from('profiles')
+      .select('id, full_name, role, status, owner_id')
+      .in('role', ['owner', 'super_admin'])
+      .neq('status', 'disabled')
+      .order('full_name');
+
+    // Deduplikasi berdasarkan owner_id (kecualikan placeholder super_admin)
+    const owners = [];
+    const seenOwnerIds = new Set();
+    for (const p of rawProfiles || []) {
+      if (p.owner_id && !seenOwnerIds.has(p.owner_id) && p.owner_id !== SUPER_ADMIN_TENANT_ID) {
+        seenOwnerIds.add(p.owner_id);
+        owners.push(p);
+      }
+    }
+
+    // Batch fetch settings daily report untuk seluruh owner aktif
+    const ownerIds = owners.map((o) => o.owner_id).filter(Boolean);
+    const { data: allReportSettings } = await supabaseAdmin
+      .from('workspace_settings')
+      .select('owner_id, key, value')
+      .in('owner_id', ownerIds)
+      .eq('key', 'daily_report_settings');
+
+    const reportSettingsMap = new Map((allReportSettings || []).map((s) => [s.owner_id, s.value]));
+
+    // Batch fetch company settings for all active owners
+    const { data: allCompSettings } = await supabaseAdmin
+      .from('workspace_settings')
+      .select('owner_id, key, value, updated_at')
+      .in('owner_id', ownerIds)
+      .in('key', ['company', 'app']);
+
+    const ownerCompanyMap = new Map();
+    for (const s of allCompSettings || []) {
+      const existing = ownerCompanyMap.get(s.owner_id) || { appUpdated: 0, compUpdated: 0 };
+      const val = s.value || {};
+      const updatedTime = s.updated_at ? new Date(s.updated_at).getTime() : 0;
+
+      if (s.key === 'app') {
+        const name = val.company?.companyName || val.company?.name || val.companyName || val.name || null;
+        const email = val.company?.companyEmail || val.company?.email || val.companyEmail || val.email || null;
+        existing.appName = name;
+        existing.appEmail = email;
+        existing.appUpdated = updatedTime;
+      }
+      if (s.key === 'company') {
+        const name = val.companyName || val.name || val.company?.companyName || val.company?.name || null;
+        const email = val.companyEmail || val.email || val.company?.companyEmail || val.company?.email || null;
+        existing.compName = name;
+        existing.compEmail = email;
+        existing.compUpdated = updatedTime;
+      }
+      ownerCompanyMap.set(s.owner_id, existing);
+    }
+
+    const ownersWithSettings = owners.map((o) => {
+      const compInfo = ownerCompanyMap.get(o.owner_id) || {};
+      let cName = null;
+      let cEmail = null;
+
+      if (compInfo.appEmail && compInfo.compEmail) {
+        if (compInfo.appUpdated >= compInfo.compUpdated) {
+          cEmail = compInfo.appEmail;
+          cName = compInfo.appName || compInfo.compName;
+        } else {
+          cEmail = compInfo.compEmail;
+          cName = compInfo.compName || compInfo.appName;
+        }
+      } else if (compInfo.appEmail) {
+        cEmail = compInfo.appEmail;
+        cName = compInfo.appName || compInfo.compName;
+      } else if (compInfo.compEmail) {
+        cEmail = compInfo.compEmail;
+        cName = compInfo.compName || compInfo.appName;
+      } else {
+        cName = compInfo.appName || compInfo.compName;
+      }
+
+      const ownerSetting = reportSettingsMap.get(o.owner_id) || (legacySetting && legacySetting.authorizedOwnerId === o.owner_id ? legacySetting : null);
+      const isEnabled = Boolean(ownerSetting?.enabled);
+
+      return {
+        id: o.owner_id,
+        name: o.full_name || 'Owner',
+        role: o.role,
+        companyName: cName || o.full_name || 'DocuFlow Workspace',
+        companyEmail: cEmail || null,
+        enabled: isEnabled,
+        settings: {
+          enabled: isEnabled,
+          scheduleTime: '19:00',
+          timeZone: 'Asia/Jakarta',
+          includeGoodsIn: ownerSetting?.includeGoodsIn !== false,
+          includeGoodsOut: ownerSetting?.includeGoodsOut !== false,
+          includeReturns: ownerSetting?.includeReturns !== false,
+          reportType: 'both',
+          authorizedOwnerId: o.owner_id,
+          useCompanyEmail: ownerSetting?.useCompanyEmail !== false,
+          customRecipients: ownerSetting?.customRecipients || '',
+        },
+      };
+    });
+
+    const selectedOwnerId = req.query.ownerId || (legacySetting?.authorizedOwnerId) || ownersWithSettings[0]?.id || null;
+    const activeOwnerData = ownersWithSettings.find((o) => o.id === selectedOwnerId) || ownersWithSettings[0] || null;
+
+    const defaultSelectedSettings = activeOwnerData?.settings || {
+      enabled: false,
+      scheduleTime: '19:00',
+      timeZone: 'Asia/Jakarta',
+      includeGoodsIn: true,
+      includeGoodsOut: true,
+      includeReturns: true,
+      reportType: 'both',
+      authorizedOwnerId: selectedOwnerId,
+      useCompanyEmail: true,
+      customRecipients: '',
+    };
+
+    res.json({
+      settings: defaultSelectedSettings,
+      selectedOwnerId,
+      owners: ownersWithSettings,
+      companyEmail: activeOwnerData?.companyEmail || null,
+      companyName: activeOwnerData?.companyName || null,
+      isOwner: false,
+      isSuperAdmin: true,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch('/daily-report/settings', async (req, res, next) => {
+  try {
+    if (req.auth.role !== 'super_admin' && req.auth.role !== 'owner') {
+      throw httpError(403, 'Akses ditolak: Hanya Super Admin dan Owner yang dapat mengubah pengaturan laporan harian.');
+    }
+
+    const isOwner = req.auth.role === 'owner';
+    const isSuperAdmin = req.auth.role === 'super_admin';
+
+    // Tentukan target owner
+    let targetOwnerId = isOwner ? req.auth.ownerId : (req.body.ownerId || req.body.authorizedOwnerId);
+
+    if (!targetOwnerId) {
+      throw httpError(400, 'Pilih owner / workspace yang ingin diatur.');
+    }
+
+    // Owner tidak boleh mengubah pengaturan milik owner lain (Strict Isolation)
+    if (isOwner && targetOwnerId !== req.auth.ownerId) {
+      throw httpError(403, 'Akses ditolak: Anda tidak memiliki izin untuk mengubah pengaturan tenant lain.');
+    }
+
+    // Verifikasi targetOwnerId benar-benar ada dan aktif
+    const { data: ownerProfile, error: ownerErr } = await supabaseAdmin
+      .from('profiles')
+      .select('id, owner_id, status, role')
+      .eq('owner_id', targetOwnerId)
+      .in('role', ['owner', 'super_admin'])
+      .maybeSingle();
+
+    if (ownerErr || !ownerProfile || ownerProfile.status === 'disabled') {
+      throw httpError(400, 'Owner tenant yang dipilih tidak valid atau akun dinonaktifkan.');
+    }
+
+    // Ambil setting yang tersimpan saat ini untuk target owner
+    const { data: currentOwnerSettingRow } = await supabaseAdmin
+      .from('workspace_settings')
+      .select('value')
+      .eq('owner_id', targetOwnerId)
+      .eq('key', 'daily_report_settings')
+      .maybeSingle();
+
+    const isCurrentlyEnabled = Boolean(currentOwnerSettingRow?.value?.enabled);
+
+    // Aturan Otorisasi: Owner tidak boleh mengaktifkan sendiri laporan yang dinonaktifkan oleh Super Admin
+    if (isOwner && !isCurrentlyEnabled && (req.body.enabled === true || req.body.enabled === 'true')) {
+      throw httpError(403, 'Akses ditolak: Fitur laporan harian untuk akun Owner hanya dapat diaktifkan oleh Super Admin.');
+    }
+
+    // Tentukan status enabled final
+    const finalEnabled = isSuperAdmin
+      ? Boolean(req.body.enabled)
+      : (isCurrentlyEnabled ? Boolean(req.body.enabled) : false);
+
+    const existingVal = currentOwnerSettingRow?.value || {};
+    const validatedPayload = dailyReportSettingsSchema.parse({
+      ...existingVal,
+      ...req.body,
+      enabled: finalEnabled,
+      scheduleTime: '19:00',
+      timeZone: 'Asia/Jakarta',
+      authorizedOwnerId: targetOwnerId,
+    });
+
+    const { data, error } = await supabaseAdmin
+      .from('workspace_settings')
+      .upsert({
+        owner_id: targetOwnerId,
+        key: 'daily_report_settings',
+        value: validatedPayload,
+        updated_by: req.auth.user.id,
+      }, { onConflict: 'owner_id,key' })
+      .select('key, value')
+      .single();
+
+    if (error) throw httpError(500, 'Gagal menyimpan pengaturan laporan harian', error.message);
+
+    await writeActivityLog(req, {
+      action: 'updated',
+      entityType: 'Settings',
+      entityName: 'daily_report_settings',
+      afterData: data,
+    });
+
+    res.json({ success: true, settings: data.value, targetOwnerId });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/daily-report/preview', async (req, res, next) => {
+  try {
+    if (req.auth.role !== 'super_admin' && req.auth.role !== 'owner') {
+      throw httpError(403, 'Akses ditolak: Hanya Super Admin dan Owner yang dapat melihat pratinjau laporan.');
+    }
+
+    const isOwner = req.auth.role === 'owner';
+    const ownerId = isOwner ? req.auth.ownerId : (req.query.ownerId || req.auth.ownerId);
+
+    if (!ownerId) {
+      throw httpError(400, 'Belum ada owner / workspace yang dipilih untuk membuat laporan.');
+    }
+
+    // Ambil setting khusus owner ini, dengan fallback ke legacy setting
+    const { data: dbSetting } = await supabaseAdmin
+      .from('workspace_settings')
+      .select('value')
+      .eq('owner_id', ownerId)
+      .eq('key', 'daily_report_settings')
+      .maybeSingle();
+
+    let settings = dbSetting?.value;
+    if (!settings) {
+      const { data: legacyRow } = await supabaseAdmin
+        .from('workspace_settings')
+        .select('value')
+        .eq('owner_id', SUPER_ADMIN_TENANT_ID)
+        .eq('key', 'daily_report_settings')
+        .maybeSingle();
+      if (legacyRow?.value?.authorizedOwnerId === ownerId) {
+        settings = legacyRow.value;
+      }
+    }
+    settings = settings || {};
+
+    // Validasi isolasi tenant: pastikan ownerId adalah owner aktif yang sah
+    const { data: previewOwnerProfile, error: previewOwnerErr } = await supabaseAdmin
+      .from('profiles')
+      .select('id, owner_id, status, role')
+      .eq('owner_id', ownerId)
+      .in('role', ['owner', 'super_admin'])
+      .maybeSingle();
+
+    if (previewOwnerErr || !previewOwnerProfile || previewOwnerProfile.status === 'disabled') {
+      throw httpError(400, 'Tenant yang dipilih tidak valid atau akun dinonaktifkan.');
+    }
+
+    const dateStr = req.query.date || null;
+    const includeGoodsIn = req.query.includeGoodsIn !== 'false' && (settings.includeGoodsIn !== false);
+    const includeGoodsOut = req.query.includeGoodsOut !== 'false' && (settings.includeGoodsOut !== false);
+    const includeReturns = req.query.includeReturns !== 'false' && (settings.includeReturns !== false);
+
+    const reportData = await buildDailyReportData({
+      ownerId,
+      dateStr,
+      includeGoodsIn,
+      includeGoodsOut,
+      includeReturns,
+    });
+
+    const html = generateDailyReportHtml(reportData);
+
+    res.json({
+      success: true,
+      report: reportData,
+      html,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/daily-report/send', async (req, res, next) => {
+  try {
+    if (req.auth.role !== 'super_admin' && req.auth.role !== 'owner') {
+      throw httpError(403, 'Akses ditolak: Hanya Super Admin dan Owner yang dapat memicu pengiriman laporan.');
+    }
+
+    const isOwner = req.auth.role === 'owner';
+
+    const {
+      isTest = false,
+      testRecipient = null,
+      dateStr = null,
+      force = false,
+      dryRun = false,
+      ownerId: customOwnerId = null,
+      useCompanyEmail: customUseCompanyEmail = null,
+      customRecipients: customRecipientsOverride = null,
+    } = req.body || {};
+
+    // Pembatasan Sementara: Owner biasa tidak diizinkan mengirim email laporan nyata (manual send maupun test send)
+    if (isOwner && !dryRun) {
+      throw httpError(403, 'Akses ditolak: Pengiriman email laporan harian dinonaktifkan sementara untuk akun Owner.');
+    }
+
+    const ownerId = isOwner ? req.auth.ownerId : (customOwnerId || req.auth.ownerId);
+
+    if (!ownerId) {
+      throw httpError(400, 'Belum ada owner / workspace yang diotorisasi untuk laporan harian.');
+    }
+
+    const { data: dbSetting } = await supabaseAdmin
+      .from('workspace_settings')
+      .select('value')
+      .eq('owner_id', ownerId)
+      .eq('key', 'daily_report_settings')
+      .maybeSingle();
+
+    let settings = dbSetting?.value;
+    if (!settings) {
+      const { data: legacyRow } = await supabaseAdmin
+        .from('workspace_settings')
+        .select('value')
+        .eq('owner_id', SUPER_ADMIN_TENANT_ID)
+        .eq('key', 'daily_report_settings')
+        .maybeSingle();
+      if (legacyRow?.value?.authorizedOwnerId === ownerId) {
+        settings = legacyRow.value;
+      }
+    }
+    settings = settings || {};
+
+    // Validasi isolasi tenant: pastikan ownerId adalah owner aktif yang sah
+    const { data: sendOwnerProfile, error: sendOwnerErr } = await supabaseAdmin
+      .from('profiles')
+      .select('id, owner_id, status, role')
+      .eq('owner_id', ownerId)
+      .in('role', ['owner', 'super_admin'])
+      .maybeSingle();
+
+    if (sendOwnerErr || !sendOwnerProfile || sendOwnerProfile.status === 'disabled') {
+      throw httpError(400, 'Tenant yang dipilih tidak valid atau akun dinonaktifkan.');
+    }
+
+    // Keamanan Phase 1: Pengiriman manual resmi hanya boleh diproses jika tenant berstatus ON
+    if (!isTest && !dryRun && !Boolean(settings.enabled)) {
+      throw httpError(400, 'Laporan harian untuk tenant ini sedang dinonaktifkan (OFF). Pengiriman resmi dibatalkan demi keamanan. Aktifkan terlebih dahulu status laporan tenant di pengaturan.');
+    }
+
+    const includeGoodsIn = settings.includeGoodsIn !== false;
+    const includeGoodsOut = settings.includeGoodsOut !== false;
+    const includeReturns = settings.includeReturns !== false;
+    const useCompanyEmail = customUseCompanyEmail !== null ? Boolean(customUseCompanyEmail) : (settings.useCompanyEmail !== false);
+
+    let recipients = null;
+    if (isTest) {
+      if (!testRecipient || !isValidEmail(testRecipient)) {
+        throw httpError(400, 'Alamat email uji coba wajib diisi dan harus berupa email yang valid.');
+      }
+      recipients = [testRecipient];
+    } else {
+      recipients = customRecipientsOverride !== null ? customRecipientsOverride : (settings.customRecipients || null);
+    }
+
+    const sendResult = await sendDailyReportEmail({
+      ownerId,
+      dateStr,
+      recipients,
+      useCompanyEmail,
+      includeGoodsIn,
+      includeGoodsOut,
+      includeReturns,
+      isTest: Boolean(isTest),
+      force: Boolean(force),
+      dryRun: Boolean(dryRun),
+      triggerSource: isTest ? 'test' : 'manual',
+    });
+
+    if (!dryRun) {
+      await writeActivityLog(req, {
+        action: isTest ? 'daily_report_test_sent' : 'daily_report_manual_sent',
+        entityType: 'DailyReport',
+        entityName: sendResult.subject || 'Daily Report',
+        afterData: { status: sendResult.status, recipient: sendResult.primaryRecipient },
+      });
+    }
+
+    res.json({
+      success: sendResult.status === 'sent' || sendResult.status === 'skipped' || sendResult.status === 'simulated',
+      result: sendResult,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/daily-report/history', async (req, res, next) => {
+  try {
+    if (req.auth.role !== 'super_admin' && req.auth.role !== 'owner') {
+      throw httpError(403, 'Akses ditolak: Hanya Super Admin dan Owner yang dapat melihat riwayat laporan.');
+    }
+
+    const isOwner = req.auth.role === 'owner';
+
+    // Phase 2A: Ambil riwayat dengan identitas terstruktur jika ada
+    let query = supabaseAdmin
+      .from('email_logs')
+      .select('id, owner_id, report_date, trigger_source, sender_email, recipient_email, cc_email, subject, status, sent_at, error_message, created_at')
+      .or('email_type.eq.daily_report,subject.ilike.%Laporan Harian Gudang%,subject.ilike.%[Daily Report]%')
+      .order('created_at', { ascending: false })
+      .limit(30);
+
+    if (isOwner) {
+      // Prioritas 1: Filter langsung by owner_id (Phase 2A)
+      // Fallback: Jika baris log lama belum memiliki owner_id, filter by companyName
+      const { data: compSettings } = await supabaseAdmin
+        .from('workspace_settings')
+        .select('key, value')
+        .eq('owner_id', req.auth.ownerId)
+        .in('key', ['company', 'app']);
+
+      let compName = '';
+      let compEmail = '';
+      for (const s of compSettings || []) {
+        const v = s.value || {};
+        if (s.key === 'company') {
+          compName = v.companyName || v.name || compName;
+          compEmail = v.companyEmail || v.email || compEmail;
+        } else if (s.key === 'app') {
+          compName = compName || v.company?.companyName || v.company?.name || v.companyName || v.name;
+          compEmail = compEmail || v.company?.companyEmail || v.company?.email || v.companyEmail || v.email;
+        }
+      }
+
+      if (compName) {
+        query = query.or(`owner_id.eq.${req.auth.ownerId},and(owner_id.is.null,subject.ilike.%${compName}%)`);
+      } else if (compEmail) {
+        query = query.or(`owner_id.eq.${req.auth.ownerId},and(owner_id.is.null,or(recipient_email.eq.${compEmail},cc_email.ilike.%${compEmail}%))`);
+      } else {
+        query = query.eq('owner_id', req.auth.ownerId);
+      }
+    }
+
+    const { data: logs, error } = await query;
+
+    if (error) throw httpError(500, 'Gagal memuat riwayat pengiriman email', error.message);
+
+    res.json({
+      logs: logs || [],
+    });
+  } catch (err) {
+    next(err);
   }
 });
 
@@ -6425,7 +8296,11 @@ router.get('/sales-dashboard/stats', async (req, res, next) => {
 router.get('/dashboard/stats', async (req, res, next) => {
   try {
     const ownerId = req.auth.ownerId;
-    const warehouseId = req.auth.warehouseId;
+    const isOwnerOrSuperAdmin = req.auth.role === 'owner' || req.auth.role === 'super_admin';
+    const queryWarehouseId = req.query.warehouse_id || req.query.warehouseId;
+    const targetWhId = isOwnerOrSuperAdmin
+      ? ((queryWarehouseId && queryWarehouseId !== 'all') ? queryWarehouseId : null)
+      : (queryWarehouseId || req.auth.warehouseId || null);
 
     // Fetch invoices to aggregate paid & unpaid income
     let docQuery = supabaseAdmin
@@ -6434,8 +8309,8 @@ router.get('/dashboard/stats', async (req, res, next) => {
       .eq('owner_id', ownerId)
       .neq('status', 'cancelled');
 
-    if (warehouseId) {
-      docQuery = docQuery.eq('warehouse_id', warehouseId);
+    if (targetWhId) {
+      docQuery = docQuery.eq('warehouse_id', targetWhId);
     }
 
     // Fetch products across owner catalog
@@ -6485,6 +8360,10 @@ router.get('/dashboard/stats', async (req, res, next) => {
         unpaidCount: unpaidDocs.length,
         totalRevenue: paidAmount + unpaidAmount,
         totalInvoices: valuedDocs.length,
+        totalProducts: (prods || []).length,
+        totalStock,
+        lowStockCount,
+        outOfStockCount,
       },
     });
   } catch (error) {

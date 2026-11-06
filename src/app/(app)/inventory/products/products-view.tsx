@@ -240,6 +240,11 @@ export function ProductsView({ initialProducts }: { initialProducts?: Product[] 
             >
               {p.stock} {p.unit}
             </span>
+            {(p as any).groupedStock > 0 && (
+              <span className="text-[10px] text-info">
+                ({(p as any).availableStandaloneStock ?? p.stock} mandiri + {(p as any).groupedStock} group)
+              </span>
+            )}
             {isOutOfStock ? (
               <span className="text-[11px] font-medium text-danger">Stok Habis (0)</span>
             ) : isLowStock ? (
@@ -269,9 +274,16 @@ export function ProductsView({ initialProducts }: { initialProducts?: Product[] 
         title="Katalog Produk"
         description="Kelola master produk, SKU unik, satuan dasar, dan pelacakan unit di gudang aktif."
         actions={
-          <Button variant="primary" onClick={() => setCreateModalOpen(true)}>
-            + Tambah Produk Baru
-          </Button>
+          <div className="flex items-center gap-2">
+            <Link href="/inventory/grouping">
+              <Button variant="secondary">
+                Kelola Grouping SN
+              </Button>
+            </Link>
+            <Button variant="primary" onClick={() => setCreateModalOpen(true)}>
+              + Tambah Produk Baru
+            </Button>
+          </div>
         }
       />
 

@@ -61,6 +61,14 @@ export function evaluateCrossWarehouseSerialGuard(
     };
   }
 
+  // SN biasa dilarang diawali "G-" (reserved untuk group number)
+  if (candidateNormalized.startsWith('G-')) {
+    return {
+      isAllowed: false,
+      errorMessage: "Serial Number biasa dilarang diawali dengan prefix 'G-'. Prefix tersebut khusus untuk Group Serial Number.",
+    };
+  }
+
   // Cari apakah ada SN yang cocok pada Owner yang sama dengan status aktif/hidup
   const conflicting = existingRegistry.find((record) => {
     return (

@@ -279,9 +279,10 @@ export function ProductDetailView({
                   {isSerial ? "Pelacakan per Serial Number individual" : "Pelacakan berbasis kuantitas satuan"}
                 </p>
                 {isSerial && (
-                  <p className="mt-1 text-xs text-text-secondary">
-                    Tersedia {snStats.available} unit dari {snStats.total} SN terdaftar
-                  </p>
+                  <div className="mt-1 space-y-0.5 text-xs text-text-secondary">
+                    <p>Tersedia Mandiri: {(currentProduct as any).availableStandaloneStock ?? snStats.available} unit</p>
+                    <p>Tergabung di Group: {(currentProduct as any).groupedStock ?? 0} unit</p>
+                  </div>
                 )}
               </div>
             </div>
@@ -318,6 +319,7 @@ export function ProductDetailView({
                       options={[
                         { value: "", label: "Semua Status Unit" },
                         { value: "AVAILABLE", label: "Tersedia (AVAILABLE)" },
+                        { value: "GROUPED", label: "Tergabung (GROUPED)" },
                         { value: "RESERVED", label: "Direservasi (RESERVED)" },
                         { value: "QUARANTINE", label: "Karantina (QUARANTINE)" },
                         { value: "CONSUMED_OUT", label: "Keluar (CONSUMED_OUT)" },
@@ -355,13 +357,22 @@ export function ProductDetailView({
                         {filteredSerials.map((sn) => (
                           <tr key={sn.id} className="border-b border-border hover:bg-surface-muted">
                             <td className="px-3 py-2.5 font-mono text-xs font-semibold text-text-primary">
-                              {sn.serialNumber}
+                              <div className="flex items-center gap-1.5">
+                                <span>{sn.serialNumber}</span>
+                                {sn.serialNumber.startsWith("G-") && (
+                                  <span className="inline-flex items-center px-1.5 py-0.2 rounded text-[10px] font-bold bg-primary text-text-inverse">
+                                    G
+                                  </span>
+                                )}
+                              </div>
                             </td>
                             <td className="px-3 py-2.5">
                               <StatusBadge
                                 tone={
                                   sn.status === "AVAILABLE"
                                     ? "success"
+                                    : sn.status === "GROUPED"
+                                    ? "info"
                                     : sn.status === "RESERVED"
                                     ? "warning"
                                     : sn.status === "QUARANTINE"

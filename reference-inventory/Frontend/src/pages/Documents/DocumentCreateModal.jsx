@@ -5,7 +5,7 @@ import { useNavigate } from 'react-router-dom';
 import { X, Plus, AlertCircle, Check, Search, ChevronDown, User, FileText, StickyNote, Receipt } from 'lucide-react';
 import { useApp } from '../../context/AppContext.jsx';
 import { useUnits } from '../../hooks/useUnits.js';
-import { api, buildDocumentNumber, getWorkspaceSettings, isWorkspaceModuleEnabled } from '../../utils/api.js';
+import { api, buildDocumentNumber, countDocsForSeqReset, DEFAULT_RULES, getWorkspaceSettings, isWorkspaceModuleEnabled } from '../../utils/api.js';
 import IndoDateInput from '../../components/IndoDateInput/IndoDateInput.jsx';
 import './DocumentCreateModal.css';
 
@@ -31,13 +31,15 @@ function makeEmptyItem() {
   };
 }
 
-function generateInvoiceNumber() {
+function generateInvoiceNumber(settings, docType = 'invoice', dateStr = todayIso()) {
+  if (settings) {
+    return buildDocumentNumber(docType, dateStr, 0, settings);
+  }
   const now = new Date();
-  const y = String(now.getFullYear()).slice(2);
-  const m = String(now.getMonth() + 1).padStart(2, '0');
-  const d = String(now.getDate()).padStart(2, '0');
-  const seq = String(Math.floor(Math.random() * 900) + 100);
-  return `NOTA No: ${y}${m}${d}${seq}`;
+  const yyyy = String(now.getFullYear());
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  return `NOTA No: ${yyyy}${mm}${dd}0001`;
 }
 
 function todayIso() {
@@ -128,25 +130,21 @@ export default function DocumentCreateModal({ onClose, onSuccess }) {
   const dueDateRef = useRef(null);
 
   const countThisMonth = useCallback((type, dateStr) => {
-    if (!documents) return 0;
-    const targetDate = dateStr ? new Date(dateStr) : new Date();
-    const y = targetDate.getFullYear();
-    const m = targetDate.getMonth();
-    return documents.filter((d) => {
-      if (d.document_type !== type) return false;
-      if (!d.issue_date) return false;
-      const dDate = new Date(d.issue_date);
-      return dDate.getFullYear() === y && dDate.getMonth() === m;
-    }).length;
-  }, [documents]);
+    if (!documents || !Array.isArray(documents)) return 0;
+    const rules = settings?.numbering?.rules || (Array.isArray(settings?.numbering) ? settings.numbering : null);
+    const rule = rules?.find((r) => r.type === type) || DEFAULT_RULES.find((r) => r.type === type) || { type, seqReset: 'monthly' };
+    return countDocsForSeqReset(documents, rule, dateStr);
+  }, [documents, settings]);
 
   useEffect(() => {
     if (settings && documents) {
       const count = countThisMonth(docType, date);
       const num = buildDocumentNumber(docType, date, count, settings);
       setInvoiceNumber(num);
+    } else if (settings) {
+      setInvoiceNumber(buildDocumentNumber(docType, date, 0, settings));
     } else {
-      setInvoiceNumber(generateInvoiceNumber());
+      setInvoiceNumber(generateInvoiceNumber(null, docType, date));
     }
   }, [settings, documents, docType, date, countThisMonth]);
   const [notes, setNotes] = useState('');

@@ -9,6 +9,7 @@ import ProductsPage from './pages/Products/ProductsPage.jsx';
 import ProductDetailPage from './pages/Products/ProductDetailPage.jsx';
 import GoodsInPage from './pages/GoodsIn/GoodsInPage.jsx';
 import GoodsOutPage from './pages/GoodsOut/GoodsOutPage.jsx';
+import ReturnsPage from './pages/Returns/ReturnsPage.jsx';
 import ReportsPage from './pages/Reports/ReportsPage.jsx';
 import CustomersPage from './pages/Customers/CustomersPage.jsx';
 import SuppliersPage from './pages/Suppliers/SuppliersPage.jsx';
@@ -19,6 +20,7 @@ import DashboardPage from './pages/Dashboard/DashboardPage.jsx';
 import AuditLogPage from './pages/AuditLog/AuditLogPage.jsx';
 import PurchaseOrdersPage from './pages/PurchaseOrders/PurchaseOrdersPage.jsx';
 import WarehouseSwitchOverlay from './components/WarehouseSwitchOverlay/WarehouseSwitchOverlay.jsx';
+import SerialGroupingPage from './pages/SerialGrouping/SerialGroupingPage.jsx';
 
 /**
  * Placeholder page for routes that are not yet implemented.
@@ -123,8 +125,11 @@ export default function App() {
           {/* Inventory */}
           <Route path="/inventory/products" element={<ModuleRoute moduleKey="products"><ProductsPage /></ModuleRoute>} />
           <Route path="/inventory/products/:sku" element={<ModuleRoute moduleKey="products"><ProductDetailPage /></ModuleRoute>} />
+          <Route path="/inventory/serial-grouping" element={<ModuleRoute moduleKey="products"><SerialGroupingPage /></ModuleRoute>} />
+          <Route path="/grouping-serial" element={<Navigate to="/inventory/serial-grouping" replace />} />
           <Route path="/inventory/goods-in" element={<ModuleRoute moduleKey="goods_in"><GoodsInPage /></ModuleRoute>} />
           <Route path="/inventory/goods-out" element={<ModuleRoute moduleKey="goods_out"><GoodsOutPage /></ModuleRoute>} />
+          <Route path="/inventory/returns" element={<ModuleRoute moduleKey="goods_out"><ReturnsPage /></ModuleRoute>} />
           <Route path="/inventory/reports" element={<ModuleRoute moduleKey="reports"><ReportsPage /></ModuleRoute>} />
 
           {/* Mitra */}

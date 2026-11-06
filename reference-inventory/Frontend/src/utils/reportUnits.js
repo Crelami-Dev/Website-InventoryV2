@@ -166,9 +166,27 @@ export function buildSerialStockIndex({ serials = [], documents = [], multiplier
 
     if (!linkedDoc || docType !== 'goods_in' || linkedDoc.status === 'cancelled') return;
 
-    const unitKey = detectSerialUnitKey(serial, { multipliers, customUnits });
-    const multiplier = resolveMultiplier(unitKey, multipliers, customUnits);
-    const described = describeUnitQty(unitKey, { multipliers, customUnits });
+    const meta = serial?.metadata ?? {};
+    const isGroup = meta.isGroup === true;
+    let unitKey;
+    let multiplier;
+    let described;
+
+    if (isGroup) {
+      unitKey = normalizeUnitKey(meta.targetUnit || meta.serialUnit || meta.unit) || 'pcs';
+      const targetQty = Number(meta.targetQty ?? meta.unitQty);
+      const unitMultiplier = resolveMultiplier(unitKey, multipliers, customUnits);
+      const totalPcs = Number(meta.totalPcs ?? meta.totalBaseQtyPcs);
+      multiplier = Number.isFinite(totalPcs) && totalPcs > 0
+        ? totalPcs
+        : (Number.isFinite(targetQty) && targetQty > 0 ? targetQty * unitMultiplier : unitMultiplier);
+      const displayQty = Number.isFinite(targetQty) && targetQty > 0 ? targetQty : multiplier;
+      described = { unit: unitKey, qty: displayQty, text: `${formatUnitNumber(displayQty)} ${unitKey}` };
+    } else {
+      unitKey = detectSerialUnitKey(serial, { multipliers, customUnits });
+      multiplier = resolveMultiplier(unitKey, multipliers, customUnits);
+      described = describeUnitQty(unitKey, { multipliers, customUnits });
+    }
 
     const bucket = index.get(productId) ?? { totalPcs: 0, lines: [] };
     bucket.totalPcs += multiplier;

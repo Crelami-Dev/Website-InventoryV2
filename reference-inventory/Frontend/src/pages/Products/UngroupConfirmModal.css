@@ -1,0 +1,263 @@
+/* UngroupConfirmModal.css */
+
+.ungroup-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background-color: rgba(15, 23, 42, 0.48);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1100;
+  padding: var(--space-4, 16px);
+  animation: fadeIn 0.15s ease-out;
+}
+
+.ungroup-modal {
+  width: 100%;
+  max-width: 520px;
+  background-color: var(--color-surface, #ffffff);
+  border: 1px solid var(--color-border, #e2e8f0);
+  border-radius: var(--radius-lg, 12px);
+  box-shadow: var(--shadow-xl, 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: scaleIn 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.ungroup-modal__header {
+  padding: var(--space-4, 16px) var(--space-5, 20px);
+  border-bottom: 1px solid var(--color-border-subtle, #f1f5f9);
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3, 12px);
+}
+
+.ungroup-modal__title-group {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3, 12px);
+}
+
+.ungroup-modal__icon-badge {
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-md, 8px);
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.12), rgba(220, 38, 38, 0.2));
+  color: #DC2626;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.ungroup-modal__title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--color-text-primary, #0f172a);
+  line-height: 1.3;
+}
+
+.ungroup-modal__subtitle {
+  margin: 2px 0 0 0;
+  font-size: 12.5px;
+  color: var(--color-text-muted, #64748b);
+}
+
+.ungroup-modal__close-btn {
+  background: transparent;
+  border: none;
+  color: var(--color-text-muted, #64748b);
+  cursor: pointer;
+  padding: var(--space-1-5, 6px);
+  border-radius: var(--radius-sm, 6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease-in-out;
+  flex-shrink: 0;
+}
+
+.ungroup-modal__close-btn:hover {
+  background-color: var(--color-surface-hover, #f8fafc);
+  color: var(--color-text-primary, #0f172a);
+}
+
+.ungroup-modal__form {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
+
+.ungroup-modal__body {
+  padding: var(--space-5, 20px);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4, 16px);
+  background-color: var(--color-bg, #f8fafc);
+  max-height: 65vh;
+  overflow-y: auto;
+}
+
+/* Target Group Card */
+.ungroup-target-card {
+  background-color: var(--color-surface, #ffffff);
+  border: 1px solid var(--color-border, #e2e8f0);
+  border-radius: var(--radius-md, 8px);
+  padding: var(--space-3-5, 14px) var(--space-4, 16px);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  box-shadow: var(--shadow-sm, 0 1px 2px 0 rgba(0, 0, 0, 0.05));
+}
+
+.ungroup-target-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.ungroup-target-card__sn-badge {
+  font-family: var(--font-mono, monospace);
+  font-weight: 700;
+  font-size: 13.5px;
+  color: var(--color-primary, #4F46E5);
+  background-color: rgba(99, 102, 241, 0.08);
+  padding: 3px 8px;
+  border-radius: var(--radius-xs, 4px);
+  border: 1px solid rgba(99, 102, 241, 0.2);
+}
+
+.ungroup-target-card__qty-badge {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--color-text-secondary, #475569);
+  background-color: var(--color-surface-hover, #f1f5f9);
+  padding: 2px 8px;
+  border-radius: var(--radius-xs, 4px);
+}
+
+.ungroup-target-card__prod-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text-primary, #0f172a);
+}
+
+.ungroup-target-card__meta {
+  font-size: 12px;
+  color: var(--color-text-muted, #64748b);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Alerts */
+.ungroup-modal__alert {
+  padding: var(--space-3-5, 14px);
+  border-radius: var(--radius-md, 8px);
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3, 12px);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.ungroup-modal__alert--warning {
+  background-color: rgba(245, 158, 11, 0.08);
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  color: #92400E;
+}
+
+.ungroup-modal__alert--warning .ungroup-modal__alert-icon {
+  color: #D97706;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.ungroup-modal__alert--error {
+  background-color: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.28);
+  color: #B91C1C;
+}
+
+.ungroup-modal__alert--error .ungroup-modal__alert-icon {
+  color: #DC2626;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.ungroup-modal__alert-content {
+  flex: 1;
+}
+
+.ungroup-modal__alert-content p {
+  margin: 4px 0 0 0;
+}
+
+.ungroup-modal__impact-list {
+  margin: 6px 0 0 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ungroup-modal__impact-list code {
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  background-color: rgba(245, 158, 11, 0.15);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+/* Footer */
+.ungroup-modal__footer {
+  padding: var(--space-3-5, 14px) var(--space-5, 20px);
+  border-top: 1px solid var(--color-border-subtle, #f1f5f9);
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2-5, 10px);
+  background-color: var(--color-surface, #ffffff);
+}
+
+.ungroup-modal__confirm-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Responsiveness for Tablet and Smartphone */
+@media (max-width: 640px) {
+  .ungroup-modal-overlay {
+    padding: var(--space-2, 8px);
+    align-items: flex-end;
+  }
+
+  .ungroup-modal {
+    max-width: 100%;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+    animation: slideUpIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .ungroup-modal__body {
+    padding: var(--space-4, 16px);
+    max-height: 70vh;
+  }
+
+  .ungroup-modal__footer {
+    flex-direction: column-reverse;
+    gap: var(--space-2, 8px);
+    padding: var(--space-3, 12px) var(--space-4, 16px);
+  }
+
+  .ungroup-modal__footer button {
+    width: 100%;
+    justify-content: center;
+    min-height: 44px; /* Touch friendly */
+  }
+}

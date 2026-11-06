@@ -30,6 +30,11 @@
   --color-primary-surface:   var(--color-interactive-light);
   --color-primary-light:     var(--color-interactive-light);
   --color-primary-ring:      var(--color-interactive-ring);
+  --primary-color:           var(--color-interactive);
+  --primary-hover:           var(--color-interactive-hover);
+  --primary-surface:         var(--color-interactive-light);
+  --primary-light:           var(--color-interactive-light);
+  --primary-ring:            var(--color-interactive-ring);
 
   /* Brand accent (Genesis logo / homepage callout only) */
   --color-brand-accent: #1A9A06;
@@ -243,6 +248,18 @@
   --color-interactive-hover: #6366F1;
   --color-interactive-light: rgba(129, 140, 248, 0.10);
   --color-interactive-ring:  rgba(129, 140, 248, 0.18);
+
+  /* Primary aliases (maps directly to active theme palette in dark mode) */
+  --color-primary:           var(--color-interactive);
+  --color-primary-hover:     var(--color-interactive-hover);
+  --color-primary-surface:   var(--color-interactive-light);
+  --color-primary-light:     var(--color-interactive-light);
+  --color-primary-ring:      var(--color-interactive-ring);
+  --primary-color:           var(--color-interactive);
+  --primary-hover:           var(--color-interactive-hover);
+  --primary-surface:         var(--color-interactive-light);
+  --primary-light:           var(--color-interactive-light);
+  --primary-ring:            var(--color-interactive-ring);
 
   /* Brand accent */
   --color-brand-accent: #22C55E;

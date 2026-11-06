@@ -47,73 +47,79 @@
 }
 
 /* ── Worksheet / Table ───────────────────────────────────── */
+.go-detail-modal .go-modal__worksheet {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  flex: none;
+  width: 100%;
+}
+
 @media (min-width: 768px) {
-  .go-modal__table-desktop {
-    display: flex;
-    flex-direction: column;
-    flex: 1;
-    min-height: 0;
+  .go-detail-modal .go-modal__table-desktop {
+    display: block;
+    width: 100%;
+    flex: none;
   }
 }
 
-.go-modal__table-wrapper {
+.go-detail-modal .go-modal__table-wrapper {
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
   overflow-x: auto;
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-height: 240px;
+  overflow-y: visible;
+  width: 100%;
+  flex: none;
+  min-height: auto;
+  background: var(--color-surface);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
 }
 
-.go-modal__table {
+.go-detail-modal .go-modal__table {
   width: 100%;
   border-collapse: collapse;
   text-align: left;
   font-size: var(--text-small);
   table-layout: fixed;
-  min-width: 660px;
+  min-width: 750px;
 }
 
-.go-modal__table thead tr {
+.go-detail-modal .go-modal__table thead tr {
   background: var(--color-surface-alt);
-  border-bottom: 1px solid var(--color-border);
+  border-bottom: 2px solid var(--color-border);
 }
 
-.go-modal__table th {
-  font-size: 10px;
+.go-detail-modal .go-modal__table th {
+  font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: var(--tracking-overline);
+  letter-spacing: 0.04em;
   color: var(--color-text-muted);
-  padding: var(--space-2-5) var(--space-3);
+  padding: 10px 12px;
   text-align: left;
-  position: sticky;
-  top: 0;
   background: var(--color-surface-alt);
-  z-index: 10;
 }
 
-.go-modal__table tbody {
+.go-detail-modal .go-modal__table tbody {
   background: var(--color-surface);
 }
 
-.go-modal__table tbody tr {
+.go-detail-modal .go-modal__table tbody tr {
   border-bottom: 1px solid var(--color-border-subtle);
   transition: background var(--duration-fast) var(--ease-inout);
 }
 
-.go-modal__table tbody tr:last-child {
+.go-detail-modal .go-modal__table tbody tr:last-child {
   border-bottom: none;
 }
 
-.go-modal__table tbody tr:hover {
-  background: var(--color-surface-alt);
+.go-detail-modal .go-modal__table tbody tr:hover {
+  background: var(--color-surface-alt) !important;
 }
 
-.go-modal__table td {
-  padding: var(--space-3);
-  vertical-align: top;
+.go-detail-modal .go-modal__table td {
+  padding: 12px;
+  vertical-align: middle;
 }
 
 /* ── Mobile Cards View ───────────────────────────────────── */

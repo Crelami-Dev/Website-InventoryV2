@@ -6,7 +6,7 @@ import { useCameraScanner } from '../../hooks/useCameraScanner.js';
 import { useDesktopScanShortcut } from '../../hooks/useDesktopScanShortcut.js';
 import { useApp } from '../../context/AppContext.jsx';
 import { useUnits } from '../../hooks/useUnits.js';
-import { api, buildDocumentNumber, getWorkspaceSettings } from '../../utils/api.js';
+import { api, buildDocumentNumber, getWorkspaceSettings, countDocsForSeqReset, DEFAULT_RULES } from '../../utils/api.js';
 import GoodsOutLineItem from './GoodsOutLineItem.jsx';
 import QuickProductModal from './QuickProductModal.jsx';
 import './GoodsOutCreateModal.css';
@@ -86,7 +86,17 @@ function makeEmptyLine() {
   };
 }
 
-export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, products, customers, suppliers, contactsEnabled = true, existingDocsThisMonth }) {
+export default function GoodsOutCreateModal({
+  sourcePo,
+  onClose,
+  onSuccess,
+  products,
+  customers,
+  suppliers,
+  contactsEnabled = true,
+  existingDocsThisMonth,
+  docs = [],
+}) {
   const { t, lang } = useApp();
   const { units, multipliers, getMultiplier, formatUnitOption } = useUnits();
   const queryClient = useQueryClient();
@@ -138,9 +148,18 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
   }, [sourcePo, getMultiplier]);
 
   const [date, setDate] = useState(todayIso());
+  const effectiveDocsCount = useMemo(() => {
+    if (docs && docs.length > 0) {
+      const rules = settings?.numbering?.rules || (Array.isArray(settings?.numbering) ? settings.numbering : null);
+      const rule = rules?.find((r) => r.type === 'goods_out') || DEFAULT_RULES.find((r) => r.type === 'goods_out');
+      return countDocsForSeqReset(docs, rule, date);
+    }
+    return existingDocsThisMonth ?? 0;
+  }, [docs, settings, date, existingDocsThisMonth]);
+
   const refNumber = useMemo(
-    () => buildDocumentNumber('goods_out', date, existingDocsThisMonth ?? 0, settings),
-    [settings, date, existingDocsThisMonth]
+    () => buildDocumentNumber('goods_out', date, effectiveDocsCount, settings),
+    [settings, date, effectiveDocsCount]
   );
   const [source, setSource] = useState(sourcePo?.vendor_name || '');
   const [contactId, setContactId] = useState(null);
@@ -185,7 +204,7 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
       const rawQty = Number(l.qty) || 1;
       const unitClean = String(l.qtyUnit || 'pcs').toLowerCase();
       const mult = getMultiplier(unitClean) || multipliers[unitClean] || 1;
-      return l.isSerial ? mult : rawQty * mult;
+      return rawQty * mult;
     };
 
     const catalogTargets = poTargetItems.filter((t) => t.sku && t.sku.toLowerCase() !== 'non-sku');
@@ -290,7 +309,7 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
       playBeep('warning');
       setScanFeedback({
         type: 'warning',
-        message: `⚠️ Nomor seri "${cleanCode}" SUDAH pernah dipindai!`,
+        message: `Nomor seri "${cleanCode}" SUDAH pernah dipindai!`,
       });
       return;
     }
@@ -307,12 +326,12 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
         if (lookupRes.status === 404) {
           setScanFeedback({
             type: 'error',
-            message: `❌ Nomor seri "${cleanCode}" tidak ditemukan di sistem!`,
+            message: `Nomor seri "${cleanCode}" tidak ditemukan di sistem!`,
           });
         } else if (rawMsg.toLowerCase().includes('tidak tersedia') || rawMsg.toLowerCase().includes('status:')) {
           setScanFeedback({
             type: 'error',
-            message: `⚠️ Nomor seri "${cleanCode}" sudah keluar sebelumnya atau tidak tersedia!`,
+            message: `Nomor seri "${cleanCode}" sudah keluar sebelumnya atau tidak tersedia!`,
           });
         } else {
           setScanFeedback({
@@ -328,7 +347,7 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
         playBeep('error');
         setScanFeedback({
           type: 'error',
-          message: `❌ Nomor seri "${cleanCode}" tidak ditemukan.`,
+          message: `Nomor seri "${cleanCode}" tidak ditemukan.`,
         });
         return;
       }
@@ -405,11 +424,17 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
         }
       }
 
+      const isGroup = Boolean(matched.metadata?.isGroup || matched.isGroup);
+      const rawGroupQty = Number(matched.metadata?.targetQty ?? matched.metadata?.unitQty ?? matched.targetQty);
+      const qty = isGroup && Number.isFinite(rawGroupQty) && rawGroupQty > 0 ? rawGroupQty : 1;
+
       // Define unit mapper
       const unitMap = { piece: 'pcs', pcs: 'pcs', dozen: 'lusin', lusin: 'lusin', pack: 'pack', pack3: 'pack3', pack6: 'pack6', bal5: 'bal5', bal10: 'bal10', bal15: 'bal15', bal20: 'bal20', bal25: 'bal25', bal: 'bal' };
 
       const snLower = String(matched.serialNumber ?? matched.serial_number ?? '').toLowerCase();
       const metaUnit =
+        matched.metadata?.targetUnit ||
+        matched.targetUnit ||
         matched.metadata?.serialUnit ||
         matched.metadata?.unit ||
         matched.metadata?.qtyUnit ||
@@ -446,9 +471,13 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
         productName: product.name,
         sku: product.sku || '',
         isSerial: true,
+        isGroup,
         serialNumber: matched.serialNumber ?? matched.serial_number,
-        qty: 1,
+        qty,
         qtyUnit: qtyUnit,
+        targetQty: isGroup ? qty : undefined,
+        targetUnit: isGroup ? qtyUnit : undefined,
+        totalPcs: isGroup ? qty * (multipliers[qtyUnit] || 1) : undefined,
       };
 
       // Atomic deduplication inside functional state update
@@ -462,7 +491,7 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
       playBeep('success');
       setScanFeedback({
         type: 'success',
-        message: `✅ Berhasil dipindai: ${cleanCode} (${product.name})`,
+        message: `Berhasil dipindai: ${cleanCode} (${product.name})`,
       });
     } catch (err) {
       console.error('Scan error:', err);
@@ -487,8 +516,17 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
         const json = await res.json().catch(() => ({}));
         const rows = Array.isArray(json.data) ? json.data : [];
         const map = new Map();
-        rows.forEach(([serial, productId, unit, status]) => {
-          if (serial) map.set(String(serial).toLowerCase(), { serial, productId, unit, status });
+        rows.forEach(([serial, productId, unit, status, warehouseId, goodsInDocId, createdAt, isGrouped, isGroup, isDissolved, targetQty]) => {
+          if (serial) {
+            map.set(String(serial).toLowerCase(), {
+              serial,
+              productId,
+              unit,
+              status,
+              isGroup: Boolean(isGroup),
+              targetQty: Number(targetQty) || 1,
+            });
+          }
         });
         serialIndexRef.current = map;
         setSerialIndexReady(true);
@@ -592,6 +630,9 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
     return lines.some((line) => {
       if (!line.productId) return true;
       if (line.productId === '__new__' && !line.sku?.trim()) return true;
+      if (line.isUnrecorded) {
+        return !line.qty || line.qty < 1;
+      }
       if (line.isSerial) {
         if (!line.serialNumber?.trim()) return true;
       } else {
@@ -683,17 +724,47 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
       const startIdx = next.findIndex((l) => l.id === fromLineId);
       const baseIdx = startIdx === -1 ? next.length - 1 : startIdx;
 
+      // Check if any pasted serial is grouped or dissolved
+      const blockedSerials = [];
+      serials.forEach((serialVal) => {
+        const rawMatch = foundMap.get(serialVal.toLowerCase());
+        const isGrouped = Boolean(rawMatch?.metadata?.isGrouped || rawMatch?.metadata?.parentGroupId || rawMatch?.isGrouped);
+        const isDissolved = Boolean(rawMatch?.metadata?.isDissolved || rawMatch?.isDissolved);
+        if (isGrouped) {
+          const parentSn = rawMatch?.metadata?.parentGroupSerialNumber || rawMatch?.parentGroupSerialNumber || 'Group';
+          blockedSerials.push(`"${serialVal}" (di dalam ${parentSn})`);
+        } else if (isDissolved) {
+          blockedSerials.push(`"${serialVal}" (group sudah dibongkar)`);
+        }
+      });
+
+      if (blockedSerials.length > 0) {
+        playBeep('error');
+        setScanFeedback({
+          type: 'error',
+          message: `Nomor seri anak tidak dapat dikeluarkan: ${blockedSerials.slice(0, 3).join(', ')}${blockedSerials.length > 3 ? '...' : ''}. Bongkar group induk terlebih dahulu!`,
+        });
+      }
+
       serials.forEach((serialVal, i) => {
         const targetIdx = baseIdx + i;
         const rawMatch = foundMap.get(serialVal.toLowerCase());
-        const matched = rawMatch && rawMatch.status === 'available' ? rawMatch : null;
+        const isGrouped = Boolean(rawMatch?.metadata?.isGrouped || rawMatch?.metadata?.parentGroupId || rawMatch?.isGrouped);
+        const isDissolved = Boolean(rawMatch?.metadata?.isDissolved || rawMatch?.isDissolved);
+        const matched = rawMatch && rawMatch.status === 'available' && !isGrouped && !isDissolved ? rawMatch : null;
         const matchedProductId = matched?.product_id ?? matched?.productId ?? null;
         const product = matched?.product || (matchedProductId ? products.find((p) => p.id === matchedProductId) : null);
 
         let resolvedFields;
         if (matched && product) {
           const snLower = String(matched.serial_number ?? matched.serialNumber ?? '').toLowerCase();
+          const isGroup = Boolean(matched.metadata?.isGroup || matched.isGroup);
+          const rawGroupQty = Number(matched.metadata?.targetQty ?? matched.metadata?.unitQty ?? matched.targetQty);
+          const qty = isGroup && Number.isFinite(rawGroupQty) && rawGroupQty > 0 ? rawGroupQty : 1;
+
           const metaUnit =
+            matched.metadata?.targetUnit ||
+            matched.targetUnit ||
             matched.metadata?.serialUnit ||
             matched.metadata?.unit ||
             matched.metadata?.qtyUnit ||
@@ -727,7 +798,7 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
             sku: product.sku || '',
             isSerial: true,
             serialNumber: matched.serial_number ?? matched.serialNumber ?? serialVal,
-            qty: 1,
+            qty,
             qtyUnit: qtyUnit,
           };
         } else {
@@ -807,7 +878,10 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
       const multiplier = multipliers[unit] || 1;
       const requestedQty = line.isSerial ? multiplier : line.qty * multiplier;
 
-      if (!line.isSerial) {
+      if (line.isUnrecorded) {
+        if (!line.qty || line.qty < 1) return t('goodsOut.error.qtyRequired');
+        // Unrecorded item: skip stock deduction check and serial validation
+      } else if (!line.isSerial) {
         if (!line.qty || line.qty < 1) return t('goodsOut.error.qtyRequired');
         if (line.productId !== '__new__' && requestedQty > availableStock) {
           return t('goodsOut.error.qtyExceedsStock', { stock: availableStock });
@@ -821,7 +895,6 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
           return `Nomor seri "${sn}" duplikat! Tidak boleh mengeluarkan nomor seri yang sama lebih dari satu kali (baris ${i + 1}).`;
         }
         seenSerials.add(snKey);
-
       }
     }
     return null;
@@ -957,7 +1030,7 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
       const items = resolvedLines.map((line, idx) => {
         const unit = line.qtyUnit || 'pcs';
         const multiplier = multipliers[unit] || 1;
-        const totalQty = line.isSerial ? multiplier : line.qty * multiplier;
+        const totalQty = (Number(line.qty) || 1) * multiplier;
 
         return {
           productId: line.productId && line.productId !== '__new__' ? line.productId : null,
@@ -969,17 +1042,39 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
           discountValue: 0,
           amount: 0,
           sortOrder: idx,
-          metadata: line.isSerial
+          metadata: line.isUnrecorded
             ? {
-                isSerial: true, serialNumber: line.serialNumber.trim(), qtyUnit: unit,
+                isSerial: false,
+                isUnrecorded: true,
+                isUnrecordedStock: true,
+                unrecordedNote: line.unrecordedNote || '',
+                qtyUnit: unit,
                 unitName: units.find((candidate) => candidate.key === unit)?.name || unit,
-                unitMultiplier: multiplier, qtyInput: line.qty, baseQuantity: totalQty,
+                unitMultiplier: multiplier,
+                qtyInput: line.qty,
+                baseQuantity: totalQty,
+                stockDeducted: false,
               }
-            : {
-                isSerial: false, qtyUnit: unit,
-                unitName: units.find((candidate) => candidate.key === unit)?.name || unit,
-                unitMultiplier: multiplier, qtyInput: line.qty, baseQuantity: totalQty,
-              },
+            : line.isSerial
+              ? {
+                  isSerial: true, serialNumber: line.serialNumber.trim(), qtyUnit: unit,
+                  unitName: units.find((candidate) => candidate.key === unit)?.name || unit,
+                  unitMultiplier: multiplier, qtyInput: line.qty, baseQuantity: totalQty,
+                  ...(line.isGroup ? {
+                    isGroup: true,
+                    targetQty: line.qty,
+                    targetUnit: unit,
+                    totalPcs: totalQty,
+                    resultProductId: line.productId && line.productId !== '__new__' ? line.productId : null,
+                    resultProductName: line.productName,
+                    resultProductSku: line.sku || '',
+                  } : {}),
+                }
+              : {
+                  isSerial: false, qtyUnit: unit,
+                  unitName: units.find((candidate) => candidate.key === unit)?.name || unit,
+                  unitMultiplier: multiplier, qtyInput: line.qty, baseQuantity: totalQty,
+                },
         };
       });
 
@@ -1034,6 +1129,9 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
 
   // Auto-save as draft when clicking outside backdrop or closing
   const handleSaveDraftAndClose = async () => {
+    // Never auto-save/close while a sub-modal (QuickProductModal or Camera Scanner) is open
+    if (quickProduct?.open || scannerOpen) return;
+
     // Only save draft if user actually added/selected at least one item or serial
     const validLines = lines.filter(
       (l) =>
@@ -1067,7 +1165,7 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
 
       const items = validLines.map((line) => {
         const isSerial = Boolean(line.isSerial);
-        const qtyNum = isSerial ? 1 : Number(line.qty) || 1;
+        const qtyNum = Number(line.qty) || 1;
         const qtyUnit = line.qtyUnit || 'pcs';
         const mult = multipliers[qtyUnit] || 1;
 
@@ -1131,7 +1229,14 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
   }, [lines]);
 
   return (
-    <div className="go-modal-overlay" onClick={handleSaveDraftAndClose}>
+    <div
+      className="go-modal-overlay"
+      onClick={(e) => {
+        if (e.target !== e.currentTarget) return;
+        if (quickProduct?.open || scannerOpen) return;
+        handleSaveDraftAndClose();
+      }}
+    >
       <section
         className="go-modal"
         role="dialog"
@@ -1482,6 +1587,7 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
                           rowIndex={idx}
                           item={line}
                           layout="table"
+                          allowUnrecorded={settings?.allow_unrecorded_goods_out !== false}
                           onChange={(fields) => handleLineChange(line.id, fields)}
                           onRemove={() => handleRemoveRow(line.id)}
                           onAddRow={() => handleLineEnter(line.id)}
@@ -1509,6 +1615,7 @@ export default function GoodsOutCreateModal({ sourcePo, onClose, onSuccess, prod
                     key={line.id}
                     item={line}
                     layout="card"
+                    allowUnrecorded={settings?.allow_unrecorded_goods_out !== false}
                     onChange={(fields) => handleLineChange(line.id, fields)}
                     onRemove={() => handleRemoveRow(line.id)}
                     onAddRow={() => handleLineEnter(line.id)}

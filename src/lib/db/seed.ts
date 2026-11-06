@@ -256,18 +256,16 @@ export function seedSyntheticData(db: DatabaseClient): SeedResult {
     // ==========================================
     // 8. SALDO AWAL VIA LEDGER ATOMIK RESMI
     // ==========================================
-    const ledgerCheck = db.prepare("SELECT COUNT(*) AS count FROM inventory_ledger").get() as { count: number };
-    if (ledgerCheck.count === 0) {
-      const insertLedger = db.prepare(`
-        INSERT INTO inventory_ledger (
-          id, sequence_number, owner_id, warehouse_id, product_id, location_id,
-          entry_type, source_doc_type, source_doc_id, source_line_id,
-          quantity_delta_base, serial_ids_json, actor_user_id, occurred_at, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
+    const insertLedger = db.prepare(`
+      INSERT OR IGNORE INTO inventory_ledger (
+        id, sequence_number, owner_id, warehouse_id, product_id, location_id,
+        entry_type, source_doc_type, source_doc_id, source_line_id,
+        quantity_delta_base, serial_ids_json, actor_user_id, occurred_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
 
-      // 1. Saldo 50 roll kabel UTP Cat6
-      insertLedger.run(
+    // 1. Saldo 50 roll kabel UTP Cat6
+    insertLedger.run(
         "led-init-01",
         1,
         "owner-alpha",
@@ -322,7 +320,6 @@ export function seedSyntheticData(db: DatabaseClient): SeedResult {
         now,
         now
       );
-    }
 
     // 10. Seed Purchase Orders Awal (Idempotent)
     const insertPo = db.prepare(`

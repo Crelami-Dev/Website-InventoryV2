@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useApp } from '../../context/AppContext.jsx';
 import { getWorkspaceSettings, canExportProducts } from '../../utils/api.js';
-import { Settings, User, Building2, ToggleLeft, Users, Hash, Database, Layers, Warehouse, Barcode } from 'lucide-react';
+import { Settings, User, Building2, ToggleLeft, Users, Hash, Database, Layers, Warehouse, Barcode, Clock } from 'lucide-react';
 import ProfileSetting from './ProfileSetting.jsx';
 import CompanySetting from './CompanySetting.jsx';
 import DocumentNumberingSetting from './DocumentNumberingSetting.jsx';
@@ -12,6 +12,7 @@ import UsersSetting from './UsersSetting.jsx';
 import ExportImportSetting from './ExportImportSetting.jsx';
 import UnitsSetting from './UnitsSetting.jsx';
 import WarehousesSetting from './WarehousesSetting.jsx';
+import DailyReportSetting from './DailyReportSetting.jsx';
 import './SettingsPage.css';
 
 
@@ -85,6 +86,11 @@ export default function SettingsPage() {
       list.push({ key: 'export-import', labelKey: 'settings.tab.exportImport', defaultLabel: 'Ekspor / Impor', icon: Database });
     }
 
+    // 9. Daily Report (Owner and Super Admin)
+    if (role === 'owner' || role === 'super_admin') {
+      list.push({ key: 'daily-report', labelKey: 'settings.tab.dailyReport', defaultLabel: 'Laporan Harian', icon: Clock });
+    }
+
     return list;
   }, [user, settings]);
 
@@ -124,6 +130,7 @@ export default function SettingsPage() {
           {activeTab === 'modules' && <ModulesSetting />}
           {activeTab === 'users' && <UsersSetting />}
           {activeTab === 'export-import' && <ExportImportSetting />}
+          {activeTab === 'daily-report' && <DailyReportSetting />}
         </div>
       </div>
     </div>

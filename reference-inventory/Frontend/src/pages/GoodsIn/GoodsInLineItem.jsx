@@ -191,7 +191,7 @@ export default function GoodsInLineItem({
           />
           {item.productId === '__new__' && (
             <span className="gi-line-item__new-badge" title="Produk baru akan dibuat otomatis saat disimpan">
-              Buat Baru
+              + Buat Baru
             </span>
           )}
           <ChevronDown size={13} className="gi-line-item__search-chevron" aria-hidden="true" />

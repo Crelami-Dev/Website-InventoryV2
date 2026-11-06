@@ -252,7 +252,12 @@ export function ReportsView({
                           </Badge>
                         </td>
                         <td className="p-3 text-right font-mono font-bold text-text-primary">
-                          {p.stock} {p.unit}
+                          <div>{p.stock} {p.unit}</div>
+                          {(p as any).groupedStock > 0 && (
+                            <div className="text-[10px] text-info font-normal">
+                              {(p as any).availableStandaloneStock ?? p.stock} mandiri / {(p as any).groupedStock} group
+                            </div>
+                          )}
                         </td>
 
                         <td className="p-3 text-right font-mono text-text-muted">

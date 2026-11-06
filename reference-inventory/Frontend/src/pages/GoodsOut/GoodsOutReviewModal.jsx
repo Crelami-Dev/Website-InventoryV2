@@ -85,17 +85,21 @@ export default function GoodsOutReviewModal({ doc, onClose, onComplete, onCancel
   // Derive rows for the table/cards
   const displayRows = useMemo(() => {
     return items.map((item, idx) => {
-      const isSerial = item.metadata?.isSerial === true;
-      const serialNumber = item.metadata?.serialNumber || '';
+      const isUnrecorded = item.metadata?.isUnrecorded === true || item.metadata?.isUnrecordedStock === true;
+      const isSerial = !isUnrecorded && item.metadata?.isSerial === true;
+      const isGroup = item.metadata?.isGroup === true || item.metadata?.targetQty != null;
+      const serialNumber = isUnrecorded ? '' : (item.metadata?.serialNumber || '');
       const snLower = String(serialNumber).toLowerCase().trim();
-      let qtyUnit = item.metadata?.qtyUnit || 'pcs';
+      let qtyUnit = item.metadata?.targetUnit || item.metadata?.qtyUnit || 'pcs';
 
-      if (isSerial && snLower) {
+      if (isSerial && !isGroup && snLower) {
         // 1. Check if the serial exists in product_serials and has an authentic serialUnit recorded from Goods In
         const matchedSerial = allSerials.find(
           (s) => String(s.serialNumber ?? s.serial_number ?? '').toLowerCase().trim() === snLower
         );
         const metaUnit =
+          matchedSerial?.metadata?.targetUnit ||
+          matchedSerial?.targetUnit ||
           matchedSerial?.metadata?.serialUnit ||
           matchedSerial?.metadata?.unit ||
           matchedSerial?.metadata?.qtyUnit ||
@@ -137,15 +141,19 @@ export default function GoodsOutReviewModal({ doc, onClose, onComplete, onCancel
         }
       }
 
-      const qty = isSerial ? 1 : Number(item.metadata?.qtyInput ?? item.quantity ?? 1);
+      const qty = Number(item.metadata?.qtyInput ?? (item.metadata?.targetQty ? item.metadata.targetQty : (isSerial ? 1 : item.quantity ?? 1))) || 1;
 
       return {
         rowId: `item-${idx}-${item.id}`,
-        type: isSerial ? 'serial' : 'parent',
+        type: isUnrecorded ? 'unrecorded' : isSerial ? 'serial' : 'parent',
+        isSerial,
+        isGroup,
+        isUnrecorded,
+        unrecordedNote: item.metadata?.unrecordedNote || '',
         productName: item.item_name || item.itemName,
         sku: item.sku,
-        tracking: isSerial ? 'Serial' : 'Normal',
-        serialNumber: isSerial ? serialNumber : '—',
+        tracking: isUnrecorded ? 'Belum Terdata' : isSerial ? 'Serial' : 'Normal',
+        serialNumber: isUnrecorded ? 'Tanpa SN (Sementara)' : isSerial ? serialNumber : '—',
         qty,
         qtyUnit,
       };
@@ -164,6 +172,7 @@ export default function GoodsOutReviewModal({ doc, onClose, onComplete, onCancel
           sku: row.sku || '-',
           serials: [],
           nonSerialQty: 0,
+          unrecordedQty: 0,
           unitCounts: {},
           totalPcs: 0,
         });
@@ -179,7 +188,9 @@ export default function GoodsOutReviewModal({ doc, onClose, onComplete, onCancel
       const unitLabel = unitObj?.name || row.qtyUnit;
       g.unitCounts[unitLabel] = (g.unitCounts[unitLabel] || 0) + count;
 
-      if (row.tracking === 'Serial' && row.serialNumber && row.serialNumber !== '—') {
+      if (row.isUnrecorded) {
+        g.unrecordedQty = (g.unrecordedQty || 0) + count;
+      } else if (row.tracking === 'Serial' && row.serialNumber && row.serialNumber !== '—') {
         g.serials.push({
           sn: row.serialNumber,
           unit: unitLabel,
@@ -371,7 +382,15 @@ export default function GoodsOutReviewModal({ doc, onClose, onComplete, onCancel
                         </td>
                         <td className="go-detail__td-sku">{row.sku || '—'}</td>
                         <td>
-                          {row.type === 'serial' ? (
+                          {row.type === 'unrecorded' ? (
+                            <span
+                              className="chip chip-warning chip-sm"
+                              style={{ fontWeight: 600, fontSize: '11px', whiteSpace: 'nowrap' }}
+                              title="Barang Belum Terdata (Non-SN) — Tidak memotong stok sistem"
+                            >
+                              Belum Terdata
+                            </span>
+                          ) : row.type === 'serial' ? (
                             <span className="chip chip-success chip-sm">{t('goodsOut.detail.trackingSerial')}</span>
                           ) : (
                             <span className="chip chip-sm">{t('goodsOut.detail.trackingNormal')}</span>
@@ -382,7 +401,9 @@ export default function GoodsOutReviewModal({ doc, onClose, onComplete, onCancel
                             <span className="go-line-item__sku-disabled go-detail__serial-cell">
                               {row.serialNumber}
                             </span>
-                          ) : '—'}
+                          ) : (
+                            <span style={{ color: 'var(--color-text-muted)' }}>—</span>
+                          )}
                         </td>
                         <td className="go-detail__td-qty">
                           {row.qty} {row.qtyUnit}
@@ -397,7 +418,7 @@ export default function GoodsOutReviewModal({ doc, onClose, onComplete, onCancel
             {/* Mobile items cards */}
             <div className="go-modal__cards-mobile">
               {displayRows.map((row, idx) => (
-                <div key={row.rowId} className={`go-line-item-card ${row.type === 'serial' ? 'go-detail__card--serial' : 'go-detail__card--normal'}`}>
+                <div key={row.rowId} className={`go-line-item-card ${row.type === 'unrecorded' ? 'go-detail__card--unrecorded' : row.type === 'serial' ? 'go-detail__card--serial' : 'go-detail__card--normal'}`}>
                   <div className="go-line-item-card__field">
                     <label className="go-line-item-card__label">{t('goodsOut.detail.colNo')} / {t('goodsOut.detail.colProduct')}</label>
                     <div className="go-detail__card-product">
@@ -411,7 +432,13 @@ export default function GoodsOutReviewModal({ doc, onClose, onComplete, onCancel
                     </div>
                     <div>
                       <label className="go-line-item-card__label">{t('goodsOut.detail.colTracking')}</label>
-                      <div>{row.tracking}</div>
+                      <div>
+                        {row.type === 'unrecorded' ? (
+                          <span className="chip chip-warning chip-sm" style={{ fontWeight: 600 }}>Belum Terdata</span>
+                        ) : (
+                          row.tracking
+                        )}
+                      </div>
                     </div>
                   </div>
                   {row.type === 'serial' && (
@@ -753,6 +780,11 @@ export default function GoodsOutReviewModal({ doc, onClose, onComplete, onCancel
                                       </span>
                                     ))}
                                   </div>
+                                </div>
+                              ) : g.unrecordedQty > 0 ? (
+                                <div style={{ marginTop: '4px', fontSize: '11px', color: 'var(--color-warning)', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                  <AlertTriangle size={12} />
+                                  <span>Belum Terdata (Non-SN) — Tidak memotong stok sistem</span>
                                 </div>
                               ) : (
                                 <div style={{ marginTop: '4px', fontSize: '11px', color: 'var(--color-text-muted)', fontStyle: 'italic' }}>

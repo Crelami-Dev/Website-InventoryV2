@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
+    "test": "node --import ./tests/bootstrap-env.mjs --test",
     "auth:delete-user": "node scripts/delete-auth-user.js",
     "verify:inventory": "node scripts/verify-inventory-migrations.js"
   },

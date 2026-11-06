@@ -33,7 +33,8 @@ export default function ReportsPage() {
   const { data: rawSerials = [], isLoading: loadingSerials } = useQuery({
     queryKey: ['product-serials', activeWarehouseId],
     queryFn: async () => {
-      const res = await api.get('/api/workspace/product-serials?limit=10000');
+      const whParam = activeWarehouseId ? `?warehouse_id=${encodeURIComponent(activeWarehouseId)}&limit=10000` : '?limit=10000';
+      const res = await api.get(`/api/workspace/product-serials${whParam}`);
       if (!res.ok) throw new Error('Failed to load serials');
       const json = await res.json();
       return json.data ?? [];
@@ -45,7 +46,8 @@ export default function ReportsPage() {
   const { data: rawDocuments = [] } = useQuery({
     queryKey: ['workspace-documents', activeWarehouseId],
     queryFn: async () => {
-      const res = await api.get('/api/workspace/documents?limit=1000');
+      const whParam = activeWarehouseId ? `?warehouse_id=${encodeURIComponent(activeWarehouseId)}&limit=1000` : '?limit=1000';
+      const res = await api.get(`/api/workspace/documents${whParam}`);
       if (!res.ok) return [];
       const json = await res.json();
       return json.data ?? [];
@@ -55,13 +57,15 @@ export default function ReportsPage() {
 
   const isLoading = loadingProducts || loadingSerials;
 
-  // Serial stock index: unit tiap serial mengikuti metadata/penanda nomor seri.
-  const serialIndex = useMemo(
-    () => buildSerialStockIndex({ serials: rawSerials, documents: rawDocuments, multipliers, customUnits }),
-    [rawSerials, rawDocuments, multipliers, customUnits]
-  );
+  // Serial stock index: unit tiap serial mengikuti metadata/penanda nomor seri (terikat gudang aktif)
+  const serialIndex = useMemo(() => {
+    const filteredSerials = activeWarehouseId
+      ? (rawSerials ?? []).filter((s) => !s.warehouse_id || String(s.warehouse_id) === String(activeWarehouseId))
+      : (rawSerials ?? []);
+    return buildSerialStockIndex({ serials: filteredSerials, documents: rawDocuments, multipliers, customUnits });
+  }, [rawSerials, rawDocuments, multipliers, customUnits, activeWarehouseId]);
 
-  // Process products and calculate accurate stock positions (strictly Goods In / Goods Out)
+  // Process products and calculate accurate stock positions (strictly Goods In / Goods Out for active warehouse)
   const processedProducts = useMemo(() => {
     const productStockMovements = new Map();
     (rawDocuments ?? []).forEach((doc) => {
@@ -72,6 +76,11 @@ export default function ReportsPage() {
       const isGoodsIn = docType === 'goods_in';
       const isGoodsOut = docType === 'goods_out';
       if (!isGoodsIn && !isGoodsOut) return;
+
+      const docWh = doc.warehouse_id || doc.warehouseId;
+      if (activeWarehouseId && docWh && String(docWh) !== String(activeWarehouseId)) {
+        return;
+      }
 
       (doc.items ?? []).forEach((item) => {
         const productId = item.productId ?? item.product_id;
@@ -103,7 +112,7 @@ export default function ReportsPage() {
         unitKey: getProductUnitKey(row),
       };
     });
-  }, [rawProducts, rawDocuments, multipliers, customUnits]);
+  }, [rawProducts, rawDocuments, multipliers, customUnits, activeWarehouseId]);
 
   // Compute 4 KPIs from processed products
   const kpis = useMemo(() => {

@@ -289,21 +289,57 @@ function getUnitHelpers(customUnits) {
   return { multipliers, isLusin, parseSn };
 }
 
-function getItemQtyInPcs(item, helpers = null) {
-  const isSerial = item.metadata?.isSerial === true || !!item.metadata?.serialNumber;
-  const serialNumber = item.metadata?.serialNumber || '';
-  let unit = (item.metadata?.qtyUnit || item.qtyUnit || item.unit || 'pcs').toLowerCase();
-  if (isSerial && serialNumber && (!unit || unit === 'pcs' || unit === 'piece')) {
+export function getItemQtyInPcs(item, helpers = null) {
+  const metadata = item.metadata ?? {};
+  const isSerial = metadata.isSerial === true || !!metadata.serialNumber || item.isSerial === true;
+  const isGroup = metadata.isGroup === true || item.isGroup === true;
+  const serialNumber = metadata.serialNumber || item.serialNumber || '';
+
+  const rawGroupQty = Number(
+    metadata.targetQty
+    ?? metadata.unitQty
+    ?? item.targetQty
+    ?? item.unitQty
+  );
+  const groupQty = Number.isFinite(rawGroupQty) && rawGroupQty > 0 ? rawGroupQty : null;
+
+  const groupUnit = metadata.targetUnit ?? item.targetUnit ?? null;
+  let unit = String(
+    (isGroup ? groupUnit : null)
+    || metadata.qtyUnit
+    || item.qtyUnit
+    || metadata.unit
+    || item.unit
+    || 'pcs'
+  ).toLowerCase().trim() || 'pcs';
+
+  if (isSerial && !isGroup && serialNumber && (!unit || unit === 'pcs' || unit === 'piece')) {
     unit = helpers ? helpers.parseSn(serialNumber, unit) : parseUnitFromSn(serialNumber, unit);
   }
-  const qty = isSerial ? 1 : Number(item.metadata?.qtyInput ?? item.quantity ?? item.qty ?? 1);
-  const mult = (helpers ? helpers.multipliers[unit] : GOODS_MULTIPLIERS[unit]) || ((helpers ? helpers.isLusin(unit) : isLusinUnit(unit)) ? 12 : 1);
+
+  const rawGroupInput = Number(metadata.qtyInput ?? item.qtyInput ?? item.quantity ?? 1);
+  const qty = isGroup
+    ? (groupQty ?? (Number.isFinite(rawGroupInput) && rawGroupInput > 0 ? rawGroupInput : 1))
+    : isSerial
+      ? 1
+      : Number(metadata.qtyInput ?? item.qtyInput ?? item.quantity ?? item.qty ?? 1);
+
+  const normalizedQty = Number.isFinite(qty) && qty > 0 ? qty : 1;
+  const mult = (helpers ? helpers.multipliers[unit] : GOODS_MULTIPLIERS[unit])
+    || ((helpers ? helpers.isLusin(unit) : isLusinUnit(unit)) ? 12 : 1);
+  const rawTotalPcs = Number(metadata.totalPcs ?? metadata.totalBaseQtyPcs ?? metadata.baseQuantity);
+  const pcs = isGroup && Number.isFinite(rawTotalPcs) && rawTotalPcs > 0
+    ? rawTotalPcs
+    : normalizedQty * mult;
+
   return {
     isSerial,
+    isGroup,
     serialNumber,
     unit,
-    qty,
-    pcs: qty * mult,
+    qty: normalizedQty,
+    pcs,
+    totalPcs: pcs,
   };
 }
 
@@ -606,13 +642,37 @@ function invoicePages(doc, settings, contact, companyName, companyDetail, custom
 
 
 
-function getGroupedProductItems(items, doc = null, customUnits = null) {
+export function getGroupedProductItems(items, doc = null, customUnits = null) {
   const unitsData = customUnits || doc?.metadata?.custom_units || doc?.custom_units;
   const helpers = getUnitHelpers(unitsData);
   const groupMap = new Map();
 
+  // Parse active return transactions from doc metadata
+  const activeReturns = Array.isArray(doc?.metadata?.returns)
+    ? doc.metadata.returns.filter((r) => r && r.status !== 'restored')
+    : [];
+
+  const returnedSerialSet = new Set();
+  const returnedNonSerialQtyByItem = new Map();
+
+  activeReturns.forEach((r) => {
+    (r.items || []).forEach((ri) => {
+      const isSerial = ri.isSerial === true || !!ri.serialNumber;
+      if (isSerial && ri.serialNumber) {
+        returnedSerialSet.add(String(ri.serialNumber).trim().toLowerCase());
+      } else {
+        const idKey = String(ri.itemId || ri.productId || '').trim();
+        if (idKey) {
+          const retQty = Number(ri.returnedQty ?? ri.quantity ?? 1) || 0;
+          returnedNonSerialQtyByItem.set(idKey, (returnedNonSerialQtyByItem.get(idKey) || 0) + retQty);
+        }
+      }
+    });
+  });
+
   (items || []).forEach((item) => {
     const productId = item.product_id ?? item.productId ?? item.sku ?? item.item_name ?? item.productName ?? 'default';
+    const itemId = item.id || item.itemId || productId;
     const name = item.item_name || item.itemName || item.product_name || item.name || 'Produk';
     let sku = item.sku || '—';
     if (sku.includes('|')) {
@@ -628,8 +688,13 @@ function getGroupedProductItems(items, doc = null, customUnits = null) {
         totalPcs: 0,
         totalLusin: 0,
         totalPcsOnly: 0,
+        returnedPcs: 0,
+        returnedLusin: 0,
+        returnedPcsOnly: 0,
         serials: [],
+        returnedSerials: [],
         unitCounts: {},
+        returnedUnitCounts: {},
         purpose: item.metadata?.purpose || 'Pesanan',
         condition: item.metadata?.condition || 'Baik',
       });
@@ -642,6 +707,34 @@ function getGroupedProductItems(items, doc = null, customUnits = null) {
       current.totalLusin += (itemInfo.qty * mult) / 12;
     } else {
       current.totalPcsOnly += itemInfo.pcs;
+    }
+
+    // Check return for this item
+    let itemReturnedQty = 0;
+    if (itemInfo.isSerial && itemInfo.serialNumber) {
+      if (returnedSerialSet.has(itemInfo.serialNumber.toLowerCase())) {
+        itemReturnedQty = itemInfo.qty;
+        if (!current.returnedSerials.includes(itemInfo.serialNumber)) {
+          current.returnedSerials.push(itemInfo.serialNumber);
+        }
+      }
+    } else {
+      const retFromId = returnedNonSerialQtyByItem.get(String(itemId)) || returnedNonSerialQtyByItem.get(String(productId)) || 0;
+      if (retFromId > 0) {
+        itemReturnedQty = Math.min(itemInfo.qty, retFromId);
+      }
+    }
+
+    if (itemReturnedQty > 0) {
+      const retMult = helpers.multipliers[itemInfo.unit] || (helpers.isLusin(itemInfo.unit) ? 12 : 1);
+      const retPcs = itemReturnedQty * retMult;
+      current.returnedPcs += retPcs;
+      if (helpers.isLusin(itemInfo.unit)) {
+        current.returnedLusin += retPcs / 12;
+      } else {
+        current.returnedPcsOnly += retPcs;
+      }
+      current.returnedUnitCounts[itemInfo.unit] = (current.returnedUnitCounts[itemInfo.unit] || 0) + itemReturnedQty;
     }
 
     if (itemInfo.isSerial && itemInfo.serialNumber) {
@@ -681,21 +774,41 @@ function getGroupedProductItems(items, doc = null, customUnits = null) {
           }
         }
       }
-      if (matched && !matched.serials.includes(sn)) {
-        matched.serials.push(sn);
+      if (matched) {
+        if (!matched.serials.includes(sn)) {
+          matched.serials.push(sn);
+        }
+        if (returnedSerialSet.has(String(sn).trim().toLowerCase()) && !matched.returnedSerials.includes(sn)) {
+          matched.returnedSerials.push(sn);
+        }
       }
     });
   }
 
   return Array.from(groupMap.values()).map((g) => {
     g.serials.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+    g.returnedSerials.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
     const unitEntries = Object.entries(g.unitCounts);
     const breakdown = unitEntries.map(([u, q]) => `${q} ${u}`).join(', ');
     const formattedQty = formatDocumentQty(g.totalLusin, g.totalPcsOnly);
+
+    const netLusin = Math.max(0, g.totalLusin - g.returnedLusin);
+    const netPcsOnly = Math.max(0, g.totalPcsOnly - g.returnedPcsOnly);
+    const netFormattedQty = formatDocumentQty(netLusin, netPcsOnly);
+    const returnedFormattedQty = formatDocumentQty(g.returnedLusin, g.returnedPcsOnly);
+    const hasReturns = (g.returnedLusin > 0 || g.returnedPcsOnly > 0 || g.returnedSerials.length > 0);
+    const isFullyReturned = hasReturns && netLusin === 0 && netPcsOnly === 0;
+
     return {
       ...g,
       breakdown,
       formattedQty,
+      netLusin,
+      netPcsOnly,
+      netFormattedQty,
+      returnedFormattedQty,
+      hasReturns,
+      isFullyReturned,
     };
   });
 }
@@ -773,9 +886,28 @@ function goodsOutPagesCompact(doc, settings, contact, companyName, companyDetail
   const title = settings?.documents?.goodsOutTitle || (doc.document_type === 'delivery_note' ? 'Surat Jalan' : 'Surat Jalan / Goods Out');
   const rawItems = doc.items || doc.metadata?.items || [];
   const groupedItems = getGroupedProductItems(rawItems, doc, settings?.custom_units || settings?.customUnits);
+
   const grandTotalLusin = groupedItems.reduce((sum, g) => sum + (g.totalLusin || 0), 0);
   const grandTotalPcsOnly = groupedItems.reduce((sum, g) => sum + (g.totalPcsOnly || 0), 0);
   const totalLusinPcs = formatDocumentQty(grandTotalLusin, grandTotalPcsOnly);
+
+  const grandReturnedLusin = groupedItems.reduce((sum, g) => sum + (g.returnedLusin || 0), 0);
+  const grandReturnedPcsOnly = groupedItems.reduce((sum, g) => sum + (g.returnedPcsOnly || 0), 0);
+  const totalReturnedLusinPcs = formatDocumentQty(grandReturnedLusin, grandReturnedPcsOnly);
+
+  const grandNetLusin = groupedItems.reduce((sum, g) => sum + (g.netLusin || 0), 0);
+  const grandNetPcsOnly = groupedItems.reduce((sum, g) => sum + (g.netPcsOnly || 0), 0);
+  const totalNetLusinPcs = formatDocumentQty(grandNetLusin, grandNetPcsOnly);
+
+  const activeReturns = Array.isArray(doc.metadata?.returns)
+    ? doc.metadata.returns.filter((r) => r && r.status !== 'restored')
+    : [];
+  const hasReturns = activeReturns.length > 0;
+  const isFullReturn = hasReturns && (grandNetLusin <= 0 && grandNetPcsOnly <= 0);
+
+  const returnBadgeHtml = isFullReturn
+    ? `<span class="return-status-tag">DIRETUR TOTAL</span>`
+    : (hasReturns ? `<span class="return-status-tag return-status-tag--partial">DIRETUR SEBAGIAN</span>` : '');
 
   const renderRow = (g) => {
     const name = escapeHtml(g.name);
@@ -785,7 +917,14 @@ function goodsOutPagesCompact(doc, settings, contact, companyName, companyDetail
     }
     let serialHtml = '';
     if (g.serials && g.serials.length > 0) {
-      serialHtml = `<div class="compact-serials" style="font-size: 8.5px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-weight: 500; margin-top: 2px; color: #111827; word-break: break-all; line-height: 1.25; letter-spacing: -0.2px;"><span style="font-family: inherit; font-weight: 700; font-size: 9px; color: #000;">No. Seri (${g.serials.length}):</span> ${escapeHtml(g.serials.join(', '))}</div>`;
+      const serialTokens = g.serials.map((s) => {
+        const isRet = Array.isArray(g.returnedSerials) && g.returnedSerials.includes(s);
+        if (isRet) {
+          return `<span style="color: #dc2626; text-decoration: line-through;">${escapeHtml(s)}</span> <span style="color: #dc2626; font-size: 8px; font-weight: 700; border: 0.5px solid #dc2626; padding: 0 2px;">RETUR</span>`;
+        }
+        return `<span>${escapeHtml(s)}</span>`;
+      });
+      serialHtml = `<div class="compact-serials" style="font-size: 8.5px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-weight: 500; margin-top: 2px; color: #111827; word-break: break-all; line-height: 1.3;"><span style="font-weight: 700; font-size: 9px; color: #000;">No. Seri (${g.serials.length}):</span> ${serialTokens.join(', ')}</div>`;
     }
     const nameHtml = `<div style="font-weight: 700; font-size: 11.5px; line-height: 1.25;">${name}</div>${skuHtml}${serialHtml}`;
 
@@ -793,7 +932,17 @@ function goodsOutPagesCompact(doc, settings, contact, companyName, companyDetail
     if (g.breakdown) {
       breakdownHtml = `<div class="muted" style="font-size: 9.5px; font-weight: normal; margin-top: 1px; line-height: 1.2;">(${escapeHtml(g.breakdown)})</div>`;
     }
-    const qtyHtml = `<div style="font-weight: 700; font-size: 11.5px;">${escapeHtml(g.formattedQty)}</div>${breakdownHtml}`;
+
+    let qtyHtml = '';
+    if (g.hasReturns) {
+      qtyHtml = `
+        <div style="font-weight: 700; font-size: 11.5px;">${escapeHtml(g.formattedQty)}</div>
+        <div style="color: #dc2626; font-size: 9px; font-weight: 700; margin-top: 1px;">Diretur: -${escapeHtml(g.returnedFormattedQty)}</div>
+        <div style="color: #16a34a; font-size: 10px; font-weight: 800; margin-top: 1px;">Net: ${escapeHtml(g.netFormattedQty)}</div>
+      `;
+    } else {
+      qtyHtml = `<div style="font-weight: 700; font-size: 11.5px;">${escapeHtml(g.formattedQty)}</div>${breakdownHtml}`;
+    }
 
     return `<tr><td>${nameHtml}</td><td>${qtyHtml}</td><td class="right">${escapeHtml(g.purpose || 'Pesanan')}</td></tr>`;
   };
@@ -804,10 +953,23 @@ function goodsOutPagesCompact(doc, settings, contact, companyName, companyDetail
   const infoDetail = `Gudang: ${escapeHtml(warehouse)}<br/>Dikeluarkan oleh: ${escapeHtml(releasedBy)}${courier ? `<br/>Kurir: ${escapeHtml(courier)}` : ''}`;
   const notesText = doc.notes || 'Barang telah diperiksa dan diserahkan dalam keadaan baik, lengkap, serta sesuai dengan rincian di atas.';
 
-  // Single continuous flow: the browser's native page-break handles pagination
-  // (see `tbody tr { page-break-inside: avoid }` / `thead { display: table-header-group }`),
-  // so item count no longer needs to be estimated/chunked manually.
-  let html = headerHtml(companyName, companyDetail, title, docNumber, date, settings);
+  let returnHistoryBoxCompact = '';
+  if (hasReturns) {
+    const listHtml = activeReturns.map((r) => {
+      const retNum = r.returnNumber || 'RET-DOKUMEN';
+      const retDate = formatDate(r.returnedAt || r.date);
+      const retReason = r.reason ? ` - ${escapeHtml(r.reason)}` : '';
+      return `<div>&bull; <strong>${escapeHtml(retNum)}</strong> (${escapeHtml(retDate)})${retReason}</div>`;
+    }).join('');
+    returnHistoryBoxCompact = `
+      <div style="padding: 3px 6px; border: 1px dashed #d97706; background: #fffbeb; font-size: 9.5px; color: #92400e; margin-bottom: 3px; line-height: 1.3;">
+        <strong>RIWAYAT RETUR:</strong>
+        ${listHtml}
+      </div>
+    `;
+  }
+
+  let html = headerHtml(companyName, companyDetail, `${title} ${returnBadgeHtml}`, docNumber, date, settings);
   html += `<section class="top-grid">
   <div class="box">
     <div class="label">Kepada Yth.</div>
@@ -829,7 +991,11 @@ function goodsOutPagesCompact(doc, settings, contact, companyName, companyDetail
 </table>`;
   html += `<section class="bottom" style="margin-top: 4px;">
   <div class="notes-column" style="width: 100%;">
-    <div class="total-qty" style="padding: 2.5px 8px; margin-bottom: 3px; font-size: 12px;">Total Jumlah: <span>${escapeHtml(totalLusinPcs)}</span></div>
+    <div class="total-qty" style="padding: 2.5px 8px; margin-bottom: 3px; font-size: 11.5px; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px;">
+      <span>Total Awal: <strong>${escapeHtml(totalLusinPcs)}</strong></span>
+      ${hasReturns ? `<span style="color: #dc2626;">Diretur: <strong>-${escapeHtml(totalReturnedLusinPcs)}</strong></span><span style="color: #16a34a;">Net Terkirim: <strong>${escapeHtml(totalNetLusinPcs)}</strong></span>` : ''}
+    </div>
+    ${returnHistoryBoxCompact}
     <div class="notes" style="padding: 3px 8px; font-size: 11px; line-height: 1.25;"><span class="label" style="font-size: 11px; margin-bottom: 1px;">Catatan</span>${escapeHtml(notesText)}</div>
   </div>
   <div class="goodsout-signatures" style="width: 100%; margin-top: 14px;">
@@ -849,6 +1015,20 @@ function goodsOutPages(doc, settings, contact, companyName, companyDetail, custo
   const grandTotalPcsOnly = groupedItems.reduce((sum, g) => sum + (g.totalPcsOnly || 0), 0);
   const totalLusinPcs = formatDocumentQty(grandTotalLusin, grandTotalPcsOnly);
 
+  const grandReturnedLusin = groupedItems.reduce((sum, g) => sum + (g.returnedLusin || 0), 0);
+  const grandReturnedPcsOnly = groupedItems.reduce((sum, g) => sum + (g.returnedPcsOnly || 0), 0);
+  const totalReturnedLusinPcs = formatDocumentQty(grandReturnedLusin, grandReturnedPcsOnly);
+
+  const grandNetLusin = groupedItems.reduce((sum, g) => sum + (g.netLusin || 0), 0);
+  const grandNetPcsOnly = groupedItems.reduce((sum, g) => sum + (g.netPcsOnly || 0), 0);
+  const totalNetLusinPcs = formatDocumentQty(grandNetLusin, grandNetPcsOnly);
+
+  const activeReturns = Array.isArray(doc.metadata?.returns)
+    ? doc.metadata.returns.filter((r) => r && r.status !== 'restored')
+    : [];
+  const hasReturns = activeReturns.length > 0;
+  const isFullReturn = hasReturns && (grandNetLusin <= 0 && grandNetPcsOnly <= 0);
+
   // Group total summary text
   const unitTotals = {};
   groupedItems.forEach((g) => {
@@ -865,6 +1045,24 @@ function goodsOutPages(doc, settings, contact, companyName, companyDetail, custo
 
   const notesText = doc.notes || 'Barang telah diperiksa dan diserahkan dalam keadaan baik, lengkap, serta sesuai dengan rincian di atas.';
 
+  let returnHistorySummaryHtml = '';
+  if (hasReturns) {
+    const listHtml = activeReturns.map((r) => {
+      const retNum = r.returnNumber || 'RET-DOKUMEN';
+      const retDate = formatDate(r.returnedAt || r.date);
+      const retReason = r.reason ? ` - Alasan: ${escapeHtml(r.reason)}` : '';
+      const retNotes = r.notes ? ` (${escapeHtml(r.notes)})` : '';
+      const retItemsSummary = (r.items || []).map((it) => `${it.returnedQty || 1} ${it.qtyUnit || 'pcs'} ${escapeHtml(it.productName || it.name || '')}`).join(', ');
+      return `<div style="margin-top: 3px;">&bull; <strong>${escapeHtml(retNum)}</strong> (${escapeHtml(retDate)})${retReason}${retNotes}${retItemsSummary ? `: ${retItemsSummary}` : ''}</div>`;
+    }).join('');
+    returnHistorySummaryHtml = `
+      <div class="a4-return-notes-box">
+        <strong>RIWAYAT RETUR BARANG:</strong>
+        ${listHtml}
+      </div>
+    `;
+  }
+
   // Pagination for A4: allows ~12 items on first page, ~18 on next pages
   const getItemWeightA4 = (g) => {
     let w = 1.0;
@@ -872,6 +1070,7 @@ function goodsOutPages(doc, settings, contact, companyName, companyDetail, custo
       w += Math.ceil(g.serials.length / 5) * 0.35;
     }
     if (g.name && g.name.length > 40) w += 0.25;
+    if (g.hasReturns) w += 0.35;
     return w;
   };
 
@@ -915,15 +1114,36 @@ function goodsOutPages(doc, settings, contact, companyName, companyDetail, custo
 
       let serialsHtml = '';
       if (g.serials && g.serials.length > 0) {
+        const serialTokens = g.serials.map((s) => {
+          const isRet = Array.isArray(g.returnedSerials) && g.returnedSerials.includes(s);
+          if (isRet) {
+            return `<span class="a4-serial-returned">${escapeHtml(s)}</span> <span class="a4-serial-returned-tag">RETUR</span>`;
+          }
+          return `<span>${escapeHtml(s)}</span>`;
+        });
         serialsHtml = `
           <div class="a4-serial-box">
             <span class="a4-serial-tag">No. Seri (${g.serials.length}):</span>
-            <span class="a4-serial-list">${escapeHtml(g.serials.join(', '))}</span>
+            <span class="a4-serial-list">${serialTokens.join(', ')}</span>
           </div>
         `;
       }
 
       const breakdownHtml = g.breakdown ? `<div class="a4-qty-breakdown">(${escapeHtml(g.breakdown)})</div>` : '';
+
+      let qtyCellHtml = '';
+      if (g.hasReturns) {
+        qtyCellHtml = `
+          <div class="a4-qty-main">${escapeHtml(g.formattedQty)}</div>
+          <div style="font-size: 10px; color: #dc2626; font-weight: 700; margin-top: 2px;">Diretur: -${escapeHtml(g.returnedFormattedQty)}</div>
+          <div style="font-size: 10.5px; color: #16a34a; font-weight: 800; margin-top: 2px;">Net: ${escapeHtml(g.netFormattedQty)}</div>
+        `;
+      } else {
+        qtyCellHtml = `
+          <div class="a4-qty-main">${escapeHtml(g.formattedQty)}</div>
+          ${breakdownHtml}
+        `;
+      }
 
       return `
         <tr>
@@ -934,8 +1154,7 @@ function goodsOutPages(doc, settings, contact, companyName, companyDetail, custo
             ${serialsHtml}
           </td>
           <td class="a4-col-qty">
-            <div class="a4-qty-main">${escapeHtml(g.formattedQty)}</div>
-            ${breakdownHtml}
+            ${qtyCellHtml}
           </td>
           <td class="a4-col-purpose">${escapeHtml(g.purpose || 'Pesanan')}</td>
         </tr>
@@ -958,6 +1177,7 @@ function goodsOutPages(doc, settings, contact, companyName, companyDetail, custo
             <h1 class="a4-doc-title">${escapeHtml(title)}</h1>
             <div class="a4-doc-num">${escapeHtml(docNumber || '—')}</div>
             <div class="a4-doc-date">Tanggal: <strong>${escapeHtml(date)}</strong></div>
+            ${hasReturns ? `<div class="a4-return-status-badge ${isFullReturn ? '' : 'a4-return-status-badge--partial'}">STATUS: ${isFullReturn ? 'DIRETUR TOTAL' : 'DIRETUR SEBAGIAN'}</div>` : ''}
           </div>
         </header>
 
@@ -1017,16 +1237,27 @@ function goodsOutPages(doc, settings, contact, companyName, companyDetail, custo
             <div class="a4-notes-box">
               <div class="a4-notes-label">CATATAN PENGIRIMAN:</div>
               <div class="a4-notes-text">${escapeHtml(notesText)}</div>
+              ${returnHistorySummaryHtml}
             </div>
             <div class="a4-total-box">
               <div class="a4-total-row">
                 <span>Total Barang:</span>
                 <strong>${groupedItems.length} Item Produk</strong>
               </div>
-              <div class="a4-total-row a4-total-highlight">
-                <span>Total Kuantitas:</span>
+              <div class="a4-total-row ${hasReturns ? '' : 'a4-total-highlight'}">
+                <span>Total Kuantitas Awal:</span>
                 <strong>${escapeHtml(totalLusinPcs)}</strong>
               </div>
+              ${hasReturns ? `
+                <div class="a4-total-row" style="color: #dc2626;">
+                  <span>Total Diretur:</span>
+                  <strong>-${escapeHtml(totalReturnedLusinPcs)}</strong>
+                </div>
+                <div class="a4-total-row a4-total-highlight" style="color: #16a34a;">
+                  <span>Net Terkirim:</span>
+                  <strong>${escapeHtml(totalNetLusinPcs)}</strong>
+                </div>
+              ` : ''}
               ${unitSummary ? `<div class="a4-total-detail">(${escapeHtml(unitSummary)})</div>` : ''}
             </div>
           </div>
@@ -1471,6 +1702,64 @@ export function generateDocumentHtml(doc, settings, contact, paperSize, paperMod
     .goodsout-signatures .line { width: 150px; min-height: 38px; padding-bottom: 22px; text-align: center; font-size: 11.5px; line-height: 1.2; font-weight: 600; }
     .page-spacer { padding: 4px 0 2px; border-bottom: 0.5px solid #000; margin-bottom: 2px; min-height: 30px; }
     .page-num { text-align: right; font-size: 10px; color: #000; font-weight: 600; margin-top: 2px; }
+
+    .return-status-tag {
+      display: inline-block;
+      padding: 1px 6px;
+      font-size: 9px;
+      font-weight: 800;
+      border: 1.5px solid #dc2626;
+      color: #dc2626;
+      border-radius: 2px;
+      margin-left: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+      vertical-align: middle;
+    }
+    .return-status-tag--partial {
+      border-color: #d97706;
+      color: #b45309;
+    }
+    .a4-return-status-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.5px;
+      border: 1.5px solid #dc2626;
+      color: #dc2626;
+      margin-top: 4px;
+      text-transform: uppercase;
+      border-radius: 2px;
+    }
+    .a4-return-status-badge--partial {
+      border-color: #d97706;
+      color: #b45309;
+    }
+    .a4-serial-returned {
+      color: #dc2626;
+      text-decoration: line-through;
+    }
+    .a4-serial-returned-tag {
+      display: inline-block;
+      font-size: 8px;
+      font-weight: 700;
+      color: #dc2626;
+      border: 1px solid #dc2626;
+      padding: 0 3px;
+      margin-left: 2px;
+      border-radius: 2px;
+      vertical-align: middle;
+    }
+    .a4-return-notes-box {
+      margin-top: 8px;
+      padding: 6px 10px;
+      border: 1px dashed #d97706;
+      background: #fffbeb;
+      font-size: 10px;
+      line-height: 1.35;
+      color: #92400e;
+    }
 
     /* ======================================================== */
     /* SPECIFIC CLEAN MONOCHROME A4 SURAT JALAN STYLES          */

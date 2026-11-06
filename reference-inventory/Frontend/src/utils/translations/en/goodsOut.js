@@ -57,6 +57,11 @@ export const goodsOut = {
   'goodsOut.line.newProductSku': 'SKU (required)',
   'goodsOut.line.createProduct': 'Create Product',
   'goodsOut.line.remove': 'Remove row',
+  'goodsOut.line.unrecordedLabel': 'Unrecorded Item (Non-SN)',
+  'goodsOut.line.unrecordedShort': 'Non-SN',
+  'goodsOut.line.unrecordedBadge': 'Unrecorded (Non-SN)',
+  'goodsOut.line.unrecordedWarning': 'Temporary item not in system stock — Does not deduct stock',
+  'goodsOut.line.unrecordedPlaceholder': 'No Serial (Temporary)',
 
   // Validation
   'goodsOut.error.noItems': 'Add at least one item row',

@@ -1,6 +1,33 @@
 import 'dotenv/config';
 import { z } from 'zod';
 
+// PHASE 7G — Fail closed when the Node test runner is active without the
+// mandatory dummy bootstrap. Production never sets NODE_TEST_CONTEXT, so this
+// guard cannot change production behaviour.
+if (process.env.NODE_TEST_CONTEXT) {
+  const testUrl = process.env.SUPABASE_URL || '';
+  let testHost = '';
+  try {
+    testHost = new URL(testUrl).hostname;
+  } catch {
+    testHost = '';
+  }
+
+  const isDummyUrl = testHost.endsWith('.invalid');
+  const hasDummyKeys = String(process.env.SUPABASE_ANON_KEY || '').startsWith('test-')
+    && String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').startsWith('test-');
+
+  if (process.env.DOCUFLOW_TEST_ENV_READY !== '1'
+      || process.env.NODE_ENV !== 'test'
+      || !isDummyUrl
+      || !hasDummyKeys) {
+    throw new Error(
+      'Test environment bootstrap missing or unsafe. Run tests with `npm test` '
+      + '(tests/bootstrap-env.mjs) instead of invoking `node --test` directly.'
+    );
+  }
+}
+
 const envSchema = z.object({
   PORT: z.coerce.number().int().positive().default(4000),
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),

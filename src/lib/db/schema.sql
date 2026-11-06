@@ -146,10 +146,12 @@ CREATE TABLE IF NOT EXISTS product_serials (
   product_id TEXT NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
   serial_number TEXT NOT NULL,
   normalized_serial_number TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'AVAILABLE' CHECK (status IN ('AVAILABLE', 'RESERVED', 'QUARANTINE', 'CONSUMED_OUT', 'DECOMMISSIONED')),
+  status TEXT NOT NULL DEFAULT 'AVAILABLE' CHECK (status IN ('AVAILABLE', 'RESERVED', 'QUARANTINE', 'CONSUMED_OUT', 'DECOMMISSIONED', 'GROUPED', 'RETURNED_TO_SUPPLIER')),
   unit TEXT NOT NULL DEFAULT 'pcs',
   unit_quantity NUMERIC NOT NULL DEFAULT 1,
   base_quantity NUMERIC NOT NULL DEFAULT 1,
+  is_group INTEGER NOT NULL DEFAULT 0 CHECK (is_group IN (0, 1)),
+  parent_group_id TEXT,
   source_goods_in_id TEXT REFERENCES goods_in(id),
   source_line_id TEXT REFERENCES goods_in_lines(id),
   created_at TEXT NOT NULL,
@@ -165,7 +167,7 @@ CREATE TABLE IF NOT EXISTS inventory_ledger (
   warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
   product_id TEXT NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
   location_id TEXT,
-  entry_type TEXT NOT NULL CHECK (entry_type IN ('GOODS_IN_POSTED', 'GOODS_OUT_COMPLETED', 'STOCK_ADJUSTMENT_POSTED', 'RETURN_IN_POSTED')),
+  entry_type TEXT NOT NULL CHECK (entry_type IN ('GOODS_IN_POSTED', 'GOODS_OUT_COMPLETED', 'STOCK_ADJUSTMENT_POSTED', 'RETURN_IN_POSTED', 'RETURN_OUT_POSTED', 'RETURN_REVERSAL_POSTED')),
   source_doc_type TEXT NOT NULL CHECK (source_doc_type IN ('GOODS_IN', 'GOODS_OUT', 'STOCK_OPNAME_ADJUSTMENT', 'RETURN')),
   source_doc_id TEXT NOT NULL,
   source_line_id TEXT NOT NULL,
@@ -200,6 +202,7 @@ CREATE TABLE IF NOT EXISTS goods_in (
   document_number TEXT NOT NULL,
   document_date TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'POSTED', 'CANCELLED')),
+  return_status TEXT NOT NULL DEFAULT 'NONE' CHECK (return_status IN ('NONE', 'PARTIAL', 'FULL')),
   note TEXT,
   created_by_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
   posted_by_user_id TEXT REFERENCES users(id) ON DELETE RESTRICT,
@@ -230,6 +233,7 @@ CREATE TABLE IF NOT EXISTS goods_out (
   document_number TEXT NOT NULL,
   document_date TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'COMPLETED', 'CANCELLED_TOMBSTONE')),
+  return_status TEXT NOT NULL DEFAULT 'NONE' CHECK (return_status IN ('NONE', 'PARTIAL', 'FULL')),
   cancellation_reason TEXT,
   note TEXT,
   created_by_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
@@ -250,6 +254,8 @@ CREATE TABLE IF NOT EXISTS goods_out_lines (
   quantity NUMERIC NOT NULL CHECK (quantity > 0),
   unit TEXT NOT NULL DEFAULT 'pcs',
   allocated_serials_json TEXT,
+  group_id TEXT,
+  group_serials_snapshot_json TEXT,
   created_at TEXT NOT NULL
 );
 
@@ -489,8 +495,11 @@ CREATE TABLE IF NOT EXISTS inventory_returns (
   id TEXT PRIMARY KEY,
   owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE RESTRICT,
   warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
-  customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+  return_type TEXT NOT NULL DEFAULT 'CUSTOMER_RETURN' CHECK (return_type IN ('CUSTOMER_RETURN', 'SUPPLIER_RETURN')),
+  customer_id TEXT REFERENCES customers(id) ON DELETE RESTRICT,
+  supplier_id TEXT REFERENCES suppliers(id) ON DELETE RESTRICT,
   goods_out_id TEXT REFERENCES goods_out(id) ON DELETE RESTRICT,
+  goods_in_id TEXT REFERENCES goods_in(id) ON DELETE RESTRICT,
   return_number TEXT NOT NULL,
   return_date TEXT NOT NULL,
   reason TEXT NOT NULL CHECK (reason IN ('SALAH_KIRIM', 'PEMBATALAN', 'SALAH_INPUT', 'CACAT', 'LAINNYA')),
@@ -513,7 +522,42 @@ CREATE TABLE IF NOT EXISTS inventory_return_lines (
   unit TEXT NOT NULL DEFAULT 'pcs',
   condition TEXT NOT NULL DEFAULT 'BAIK' CHECK (condition IN ('BAIK', 'RUSAK')),
   returned_serials_json TEXT,
+  group_id TEXT,
+  group_return_mode TEXT CHECK (group_return_mode IN ('WHOLE_GROUP', 'ECERAN_DISSOLVE')),
   created_at TEXT NOT NULL
+);
+
+-- 33. HEADER TRANSAKSI GROUPING SERIAL (Wadah SN, Bukan Produk Baru, Tanpa Kolom Harga)
+CREATE TABLE IF NOT EXISTS serial_groupings (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE RESTRICT,
+  warehouse_id TEXT NOT NULL REFERENCES warehouses(id) ON DELETE RESTRICT,
+  group_number TEXT NOT NULL UNIQUE,
+  group_name TEXT,
+  product_id TEXT REFERENCES products(id) ON DELETE RESTRICT,
+  unit TEXT NOT NULL CHECK (unit IN ('pcs', 'lusin')),
+  unit_qty NUMERIC NOT NULL DEFAULT 1 CHECK (unit_qty > 0),
+  total_base_qty_pcs NUMERIC NOT NULL CHECK (total_base_qty_pcs > 0),
+  status TEXT NOT NULL DEFAULT 'AVAILABLE' CHECK (status IN ('AVAILABLE', 'RESERVED', 'CONSUMED_OUT', 'DISSOLVED')),
+  notes TEXT,
+  created_by TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  created_at TEXT NOT NULL,
+  dissolved_by TEXT REFERENCES users(id) ON DELETE RESTRICT,
+  dissolved_at TEXT,
+  UNIQUE(owner_id, warehouse_id, group_number)
+);
+
+-- 34. DETAIL KOMPONEN SERIAL GROUPING
+CREATE TABLE IF NOT EXISTS serial_grouping_components (
+  id TEXT PRIMARY KEY,
+  grouping_id TEXT NOT NULL REFERENCES serial_groupings(id) ON DELETE CASCADE,
+  serial_id TEXT NOT NULL REFERENCES product_serials(id) ON DELETE RESTRICT,
+  product_id TEXT NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+  snapshot_product_name TEXT NOT NULL,
+  snapshot_sku TEXT NOT NULL,
+  base_qty_pcs NUMERIC NOT NULL CHECK (base_qty_pcs > 0),
+  created_at TEXT NOT NULL,
+  UNIQUE(grouping_id, serial_id)
 );
 
 -- INDEKS OPTIMASI PERFORMA & ISOLASI
@@ -538,4 +582,9 @@ CREATE INDEX IF NOT EXISTS idx_comm_docs_owner_wh ON commercial_documents(owner_
 CREATE INDEX IF NOT EXISTS idx_comm_doc_lines_doc ON commercial_document_lines(owner_id, document_id);
 CREATE INDEX IF NOT EXISTS idx_point_ledger_customer ON customer_point_ledger(owner_id, customer_id, entry_type);
 CREATE INDEX IF NOT EXISTS idx_returns_owner ON inventory_returns(owner_id, warehouse_id);
+CREATE INDEX IF NOT EXISTS idx_serial_groupings_owner_wh ON serial_groupings(owner_id, warehouse_id, status);
+CREATE INDEX IF NOT EXISTS idx_serial_groupings_number ON serial_groupings(group_number);
+CREATE INDEX IF NOT EXISTS idx_sg_components_grouping ON serial_grouping_components(grouping_id);
+CREATE INDEX IF NOT EXISTS idx_sg_components_serial ON serial_grouping_components(serial_id);
+CREATE INDEX IF NOT EXISTS idx_product_serials_group ON product_serials(parent_group_id);
 

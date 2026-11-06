@@ -9,6 +9,8 @@ export const sidebar = {
   'sidebar.products': 'Products',
   'sidebar.goodsIn': 'Goods In',
   'sidebar.goodsOut': 'Goods Out',
+  'sidebar.returns': 'Returns',
+  'sidebar.serialGrouping': 'Serial Grouping',
   'sidebar.reports': 'Reports',
   'sidebar.customers': 'Customers',
   'sidebar.suppliers': 'Suppliers',

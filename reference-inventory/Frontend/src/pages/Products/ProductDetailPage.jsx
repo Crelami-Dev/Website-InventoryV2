@@ -15,6 +15,10 @@ import ActivityCard from './ActivityCard.jsx';
 import EditProductModal from './EditProductModal.jsx';
 import { ConfirmModal } from '../../components/ConfirmModal/ConfirmModal.jsx';
 import { useUnits } from '../../hooks/useUnits.js';
+import {
+  calculateDocumentStockMovements,
+  parseSerialUnit,
+} from '../../utils/stockCalculation.js';
 import './ProductDetailPage.css';
 
 function formatMoney(val) {
@@ -196,10 +200,19 @@ export default function ProductDetailPage() {
 
   const serials = product && rawSerials
     ? rawSerials
-      .filter((s) => (s.product_id ?? s.productId) === product.id)
+      .filter((s) => {
+        const matchesProduct = (s.product_id ?? s.productId) === product.id;
+        if (!matchesProduct) return false;
+        const sWh = s.warehouse_id || s.warehouseId;
+        if (activeWarehouseId && sWh && String(sWh) !== String(activeWarehouseId)) {
+          return false;
+        }
+        return true;
+      })
       .map((s) => ({
         id: s.id,
         productId: s.product_id ?? s.productId,
+        warehouseId: s.warehouse_id ?? s.warehouseId ?? null,
         serialNumber: s.serial_number ?? s.serialNumber,
         status: s.status ?? 'available',
         goodsInDocumentId: s.goods_in_document_id ?? s.goodsInDocumentId ?? null,
@@ -257,57 +270,14 @@ export default function ProductDetailPage() {
 
   const productStockMovement = useMemo(() => {
     if (!product || !rawDocuments) return { in: 0, out: 0, net: 0 };
-    let totalIn = 0;
-    let totalOut = 0;
-    rawDocuments.forEach((doc) => {
-      const status = doc.status || 'draft';
-      if (status !== 'completed' && status !== 'processing' && status !== 'ready') return;
-
-      const docType = doc.document_type || doc.type;
-      const isGoodsIn = docType === 'goods_in';
-      const isGoodsOut = docType === 'goods_out';
-      if (!isGoodsIn && !isGoodsOut) return;
-
-      (doc.items || []).forEach((item) => {
-        const matchesProduct =
-          item.productId === product.id ||
-          item.product_id === product.id ||
-          (item.sku && product.sku && String(item.sku).trim().toLowerCase() === String(product.sku).trim().toLowerCase());
-
-        if (!matchesProduct) return;
-
-        const rawQty = item.metadata?.qtyInput ?? item.quantity ?? item.qty ?? 1;
-        const unit = item.metadata?.qtyUnit || item.qtyUnit || item.unit || 'pcs';
-        const mult = multipliers[unit] || 1;
-        const qtyInPcs = rawQty * mult;
-
-        if (isGoodsIn) {
-          totalIn += qtyInPcs;
-        } else if (isGoodsOut) {
-          totalOut += qtyInPcs;
-        }
-      });
-
-      // Deduct returned items from totalOut so stock is restored!
-      if (isGoodsOut && Array.isArray(doc.metadata?.returns)) {
-        doc.metadata.returns.forEach((r) => {
-          (r.items || []).forEach((ri) => {
-            const matchesReturn =
-              ri.productId === product.id ||
-              ri.product_id === product.id ||
-              (ri.sku && product.sku && String(ri.sku).trim().toLowerCase() === String(product.sku).trim().toLowerCase());
-            if (!matchesReturn) return;
-
-            const rQty = Number(ri.returnedQty || 1);
-            const rUnit = ri.qtyUnit || ri.unit || 'pcs';
-            const rMult = multipliers[rUnit] || 1;
-            totalOut = Math.max(0, totalOut - rQty * rMult);
-          });
-        });
-      }
+    const movMap = calculateDocumentStockMovements({
+      documents: rawDocuments,
+      products: [product],
+      multipliers,
+      activeWarehouseId,
     });
-    return { in: totalIn, out: totalOut, net: Math.max(0, totalIn - totalOut) };
-  }, [product, rawDocuments, multipliers]);
+    return movMap.get(product.id) ?? { in: 0, out: 0, net: 0 };
+  }, [product, rawDocuments, multipliers, activeWarehouseId]);
 
   const serialsStats = useMemo(() => {
     if (!serials || serials.length === 0) {
@@ -321,47 +291,28 @@ export default function ProductDetailPage() {
     let soldCount = 0;
     let damagedCount = 0;
 
+    const docMap = new Map((rawDocuments ?? []).map((d) => [d.id, d]));
+
     serials.forEach((s) => {
-      // Serial must be tied to an active Goods In document
+      // 1. Abaikan nomor seri yang sedang berada di dalam group aktif untuk mencegah double-counting
+      if (s.metadata?.isGrouped || s.metadata?.parentGroupId) {
+        return;
+      }
+      // 2. Abaikan group yang sudah dibongkar (dissolved)
+      if (s.metadata?.isDissolved || s.status === 'dissolved') {
+        return;
+      }
+
+      // Serial must not be tied to a cancelled Goods In document
       const goodsInDocId = s.goodsInDocumentId || s.goods_in_document_id;
-      if (goodsInDocId && rawDocuments) {
-        const linkedDoc = rawDocuments.find((d) => d.id === goodsInDocId);
+      if (goodsInDocId) {
+        const linkedDoc = docMap.get(goodsInDocId);
         if (linkedDoc && (linkedDoc.status === 'cancelled' || (linkedDoc.document_type !== 'goods_in' && linkedDoc.type !== 'goods_in'))) {
           return;
         }
       }
 
-      let unit = s.serialUnit || s.metadata?.serialUnit || s.unit;
-      const sn = String(s.serialNumber ?? s.serial_number ?? '').toLowerCase();
-
-      if (!unit || unit === 'piece' || unit === 'pcs') {
-        if (Array.isArray(customUnits) && customUnits.length > 0) {
-          const sorted = [...customUnits].sort((a, b) => (b.key?.length || 0) - (a.key?.length || 0));
-          for (const u of sorted) {
-            const k = String(u.key).toLowerCase().trim();
-            if (!k || k === 'pcs') continue;
-            if (sn.includes(k)) {
-              unit = k;
-              break;
-            }
-          }
-        }
-        if (!unit || unit === 'piece' || unit === 'pcs') {
-          if (sn.includes('10bl') || sn.includes('bal10')) unit = 'bal10';
-          else if (sn.includes('15bl') || sn.includes('bal15')) unit = 'bal15';
-          else if (sn.includes('20bl') || sn.includes('bal20')) unit = 'bal20';
-          else if (sn.includes('25bl') || sn.includes('bal25')) unit = 'bal25';
-          else if (sn.includes('bal5') || sn.includes('5bl')) unit = 'bal5';
-          else if (sn.includes('pack3') || sn.includes('pk3')) unit = 'pack3';
-          else if (sn.includes('pack6') || sn.includes('pk6')) unit = 'pack6';
-          else if (sn.includes('bal') || sn.includes('bl')) unit = 'bal';
-          else if (sn.includes('pack') || sn.includes('pk')) unit = 'pack';
-          else if (sn.includes('lusin') || sn.includes('doz')) unit = 'dozen';
-        }
-      }
-
-      const cleanUnit = String(unit).toLowerCase();
-      const mult = Number(s.metadata?.unitQty) || multipliers[cleanUnit] || 1;
+      const { multiplier: mult } = parseSerialUnit(s, { customUnits, multipliers });
 
       if (s.status === 'available') {
         availablePcs += mult;
@@ -578,6 +529,15 @@ export default function ProductDetailPage() {
             <span className="pd-profile-header__category">
               {product.category || t('productDetail.noCategory')}
             </span>
+            {activeWarehouse?.name && (
+              <>
+                <span className="pd-profile-header__meta-divider" />
+                <span className="pd-profile-header__category" style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                  <Warehouse size={11} style={{ opacity: 0.7 }} />
+                  <strong>{activeWarehouse.name}</strong>
+                </span>
+              </>
+            )}
             {product.discountType !== 'none' && product.discountValue > 0 && (
               <>
                 <span className="pd-profile-header__meta-divider" />

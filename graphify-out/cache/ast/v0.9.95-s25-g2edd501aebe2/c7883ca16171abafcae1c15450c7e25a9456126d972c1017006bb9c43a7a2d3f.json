@@ -1,0 +1,1 @@
+{"nodes": [{"id": "$graphify-root$_reference_inventory_backend_supabase_migrations_archive_006_invoice_number_format_nota_sql", "label": "006_invoice_number_format_nota.sql", "file_type": "code", "source_file": "reference-inventory/Backend/supabase/migrations_archive/006_invoice_number_format_nota.sql", "source_location": null}], "edges": []}

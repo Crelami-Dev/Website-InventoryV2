@@ -1,4 +1,4 @@
-import React from "react";
+import React, { Suspense } from "react";
 import { notFound } from "next/navigation";
 import { Metadata } from "next";
 import {
@@ -19,17 +19,29 @@ export const metadata: Metadata = {
   },
 };
 
-export function generateStaticParams() {
-  return FIXTURE_OPNAME_SESSIONS.map((session) => ({
-    id: session.id,
-  }));
-}
-
 interface PageProps {
   params: Promise<{ id: string }>;
 }
 
-export default async function StockOpnameDetailPage({ params }: PageProps) {
+function StockOpnameDetailSkeleton() {
+  return (
+    <div className="space-y-6 animate-pulse p-2">
+      <div className="flex items-center justify-between">
+        <div className="h-8 bg-surface-muted rounded w-48" />
+        <div className="h-8 bg-surface-muted rounded w-24" />
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div className="h-20 bg-surface-muted rounded-lg" />
+        <div className="h-20 bg-surface-muted rounded-lg" />
+        <div className="h-20 bg-surface-muted rounded-lg" />
+        <div className="h-20 bg-surface-muted rounded-lg" />
+      </div>
+      <div className="h-64 bg-surface-muted rounded-lg" />
+    </div>
+  );
+}
+
+async function StockOpnameDetailContent({ params }: PageProps) {
   const { id } = await params;
   const authSession = await getServerSessionContext();
 
@@ -94,7 +106,11 @@ export default async function StockOpnameDetailPage({ params }: PageProps) {
           />
         );
       }
-    } catch {
+    } catch (err) {
+      console.warn(
+        `[StockOpnameDetailPage] Gagal memuat detail sesi '${id}' untuk '${authSession.context.email}' (Owner: ${authSession.context.ownerId}, Gudang: ${authSession.context.warehouseId}):`,
+        err instanceof Error ? err.message : err
+      );
       // Fallback ke fixtures jika bukan ID database atau untuk pengujian UI statis
     }
   }
@@ -108,5 +124,13 @@ export default async function StockOpnameDetailPage({ params }: PageProps) {
   const items = FIXTURE_OPNAME_ITEMS.filter((i) => i.sessionId === id);
 
   return <StockOpnameDetailView session={session} initialItems={items} />;
+}
+
+export default function StockOpnameDetailPage({ params }: PageProps) {
+  return (
+    <Suspense fallback={<StockOpnameDetailSkeleton />}>
+      <StockOpnameDetailContent params={params} />
+    </Suspense>
+  );
 }
 

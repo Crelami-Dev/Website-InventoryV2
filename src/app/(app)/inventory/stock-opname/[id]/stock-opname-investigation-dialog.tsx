@@ -180,7 +180,7 @@ export function StockOpnameInvestigationDialog({
             <Alert
               variant="warning"
               title="Pergerakan Stok Bersamaan Terdeteksi"
-              description={`Terdapat mutasi transaksi operasional resmi (Goods In/Goods Out) pasca snapshot dengan total delta ${
+              description={`Terdapat mutasi transaksi operasional resmi (Goods In / Goods Out / Retur / Penyesuaian) pasca snapshot dengan total delta ${
                 item.netDelta > 0 ? `+${item.netDelta}` : item.netDelta
               } ${item.unit}. Stok acuan telah disesuaikan secara dinamis.`}
             />

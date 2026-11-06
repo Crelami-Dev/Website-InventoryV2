@@ -68,6 +68,8 @@ function makeEmptyLine() {
     productName: '',
     sku: '',
     isSerial: false,
+    isUnrecorded: false,
+    unrecordedNote: '',
     qty: 1,
     qtyUnit: 'pcs',
     serialNumber: '',
@@ -128,6 +130,16 @@ export default function GoodsOutEditModal({
 
   const activePo = initialSourcePo || fetchedPo;
 
+  const { data: settings } = useQuery({
+    queryKey: ['workspace-settings'],
+    queryFn: async () => {
+      const res = await api.get('/api/workspace/settings');
+      if (!res.ok) return {};
+      const json = await res.json();
+      return json.data || {};
+    },
+  });
+
   // Target PO Items calculation if opened for PO fulfillment
   const poTargetItems = useMemo(() => {
     if (!activePo || !Array.isArray(activePo.items)) return [];
@@ -171,20 +183,28 @@ export default function GoodsOutEditModal({
     if (!rawItems || rawItems.length === 0) return [makeEmptyLine()];
 
     return rawItems.map((item) => {
-      const isSerial = item.metadata?.isSerial === true;
-      const serialNumber = item.metadata?.serialNumber || '';
-      const qtyUnit = item.metadata?.qtyUnit || 'pcs';
-      const qty = isSerial ? 1 : Number(item.metadata?.qtyInput ?? item.quantity ?? 1);
+      const isUnrecorded = item.metadata?.isUnrecorded === true || item.metadata?.isUnrecordedStock === true;
+      const isSerial = !isUnrecorded && item.metadata?.isSerial === true;
+      const serialNumber = isUnrecorded ? '' : (item.metadata?.serialNumber || '');
+      const isGroup = item.metadata?.isGroup === true || item.metadata?.targetQty != null;
+      const qtyUnit = item.metadata?.targetUnit || item.metadata?.qtyUnit || 'pcs';
+      const qty = Number(item.metadata?.qtyInput ?? (item.metadata?.targetQty ? item.metadata.targetQty : (isSerial ? 1 : item.quantity ?? 1))) || 1;
 
       return {
         id: item.id || crypto.randomUUID(),
-        productId: item.product_id ?? item.productId,
+        productId: item.product_id ?? item.productId ?? item.metadata?.originalProductId ?? null,
         productName: item.item_name || item.itemName || '',
         sku: item.sku || '',
         isSerial,
+        isGroup,
+        isUnrecorded,
+        unrecordedNote: item.metadata?.unrecordedNote || '',
         qty,
         qtyUnit,
         serialNumber,
+        targetQty: isGroup ? qty : undefined,
+        targetUnit: isGroup ? qtyUnit : undefined,
+        totalPcs: isGroup ? Number(item.metadata?.totalPcs ?? item.metadata?.baseQuantity ?? item.quantity) || undefined : undefined,
       };
     });
   });
@@ -199,6 +219,7 @@ export default function GoodsOutEditModal({
         productId: l.productId || null,
         sku: (l.sku || '').trim(),
         isSerial: Boolean(l.isSerial),
+        isUnrecorded: Boolean(l.isUnrecorded),
         qty: Number(l.qty) || 0,
         qtyUnit: (l.qtyUnit || 'pcs').toLowerCase(),
         serialNumber: (l.serialNumber || '').trim(),
@@ -218,20 +239,28 @@ export default function GoodsOutEditModal({
   useEffect(() => {
     if (detailDoc?.items && detailDoc.items.length > 0) {
       const initialLines = detailDoc.items.map((item) => {
-        const isSerial = item.metadata?.isSerial === true;
-        const serialNumber = item.metadata?.serialNumber || '';
-        const qtyUnit = item.metadata?.qtyUnit || 'pcs';
-        const qty = isSerial ? 1 : Number(item.metadata?.qtyInput ?? item.quantity ?? 1);
+        const isUnrecorded = item.metadata?.isUnrecorded === true || item.metadata?.isUnrecordedStock === true;
+        const isSerial = !isUnrecorded && item.metadata?.isSerial === true;
+        const serialNumber = isUnrecorded ? '' : (item.metadata?.serialNumber || '');
+        const isGroup = item.metadata?.isGroup === true || item.metadata?.targetQty != null;
+        const qtyUnit = item.metadata?.targetUnit || item.metadata?.qtyUnit || 'pcs';
+        const qty = Number(item.metadata?.qtyInput ?? (item.metadata?.targetQty ? item.metadata.targetQty : (isSerial ? 1 : item.quantity ?? 1))) || 1;
 
         return {
           id: item.id || crypto.randomUUID(),
-          productId: item.product_id ?? item.productId,
+          productId: item.product_id ?? item.productId ?? item.metadata?.originalProductId ?? null,
           productName: item.item_name || item.itemName || '',
           sku: item.sku || '',
           isSerial,
+          isGroup,
+          isUnrecorded,
+          unrecordedNote: item.metadata?.unrecordedNote || '',
           qty,
           qtyUnit,
           serialNumber,
+          targetQty: isGroup ? qty : undefined,
+          targetUnit: isGroup ? qtyUnit : undefined,
+          totalPcs: isGroup ? Number(item.metadata?.totalPcs ?? item.metadata?.baseQuantity ?? item.quantity) || undefined : undefined,
         };
       });
 
@@ -268,7 +297,7 @@ export default function GoodsOutEditModal({
   const mobileInputRefs = useRef({});
 
   const handleCancelOrClose = () => {
-    if (submitting) return;
+    if (submitting || quickProduct?.open || scannerOpen) return;
     if (hasChanges) {
       handleSave('draft');
     } else {
@@ -311,7 +340,7 @@ export default function GoodsOutEditModal({
       const rawQty = Number(l.qty) || 1;
       const unitClean = String(l.qtyUnit || 'pcs').toLowerCase();
       const mult = getMultiplier(unitClean) || multipliers[unitClean] || 1;
-      return l.isSerial ? mult : rawQty * mult;
+      return rawQty * mult;
     };
 
     const catalogTargets = poTargetItems.filter((t) => t.sku && t.sku.toLowerCase() !== 'non-sku');
@@ -408,7 +437,7 @@ export default function GoodsOutEditModal({
       playBeep('warning');
       setScanFeedback({
         type: 'warning',
-        message: `⚠️ Nomor seri "${cleanCode}" SUDAH pernah dipindai!`,
+        message: `Nomor seri "${cleanCode}" SUDAH pernah dipindai!`,
       });
       return;
     }
@@ -425,12 +454,12 @@ export default function GoodsOutEditModal({
         if (lookupRes.status === 404) {
           setScanFeedback({
             type: 'error',
-            message: `❌ Nomor seri "${cleanCode}" tidak ditemukan di sistem!`,
+            message: `Nomor seri "${cleanCode}" tidak ditemukan di sistem!`,
           });
         } else if (rawMsg.toLowerCase().includes('tidak tersedia') || rawMsg.toLowerCase().includes('status:')) {
           setScanFeedback({
             type: 'error',
-            message: `⚠️ Nomor seri "${cleanCode}" sudah keluar sebelumnya atau tidak tersedia!`,
+            message: `Nomor seri "${cleanCode}" sudah keluar sebelumnya atau tidak tersedia!`,
           });
         } else {
           setScanFeedback({
@@ -446,7 +475,7 @@ export default function GoodsOutEditModal({
         playBeep('error');
         setScanFeedback({
           type: 'error',
-          message: `❌ Nomor seri "${cleanCode}" tidak ditemukan.`,
+          message: `Nomor seri "${cleanCode}" tidak ditemukan.`,
         });
         return;
       }
@@ -478,9 +507,15 @@ export default function GoodsOutEditModal({
         return;
       }
 
+      const isGroup = Boolean(matched.metadata?.isGroup || matched.isGroup);
+      const rawGroupQty = Number(matched.metadata?.targetQty ?? matched.metadata?.unitQty ?? matched.targetQty);
+      const qty = isGroup && Number.isFinite(rawGroupQty) && rawGroupQty > 0 ? rawGroupQty : 1;
+
       const unitMap = { piece: 'pcs', pcs: 'pcs', dozen: 'lusin', lusin: 'lusin', pack: 'pack', pack3: 'pack3', pack6: 'pack6', bal5: 'bal5', bal10: 'bal10', bal15: 'bal15', bal20: 'bal20', bal25: 'bal25', bal: 'bal' };
       const snLower = String(matched.serialNumber ?? matched.serial_number ?? '').toLowerCase();
       const metaUnit =
+        matched.metadata?.targetUnit ||
+        matched.targetUnit ||
         matched.metadata?.serialUnit ||
         matched.metadata?.unit ||
         matched.metadata?.qtyUnit ||
@@ -515,7 +550,7 @@ export default function GoodsOutEditModal({
         sku: product.sku || '',
         isSerial: true,
         serialNumber: matched.serialNumber ?? matched.serial_number,
-        qty: 1,
+        qty,
         qtyUnit: qtyUnit,
       };
 
@@ -529,7 +564,7 @@ export default function GoodsOutEditModal({
       playBeep('success');
       setScanFeedback({
         type: 'success',
-        message: `✅ Berhasil dipindai: ${cleanCode} (${product.name})`,
+        message: `Berhasil dipindai: ${cleanCode} (${product.name})`,
       });
     } catch (err) {
       console.error('Scan error:', err);
@@ -560,8 +595,17 @@ export default function GoodsOutEditModal({
         const json = await res.json().catch(() => ({}));
         const rows = Array.isArray(json.data) ? json.data : [];
         const map = new Map();
-        rows.forEach(([serial, productId, unit, status]) => {
-          if (serial) map.set(String(serial).toLowerCase(), { serial, productId, unit, status });
+        rows.forEach(([serial, productId, unit, status, warehouseId, goodsInDocId, createdAt, isGrouped, isGroup, isDissolved, targetQty]) => {
+          if (serial) {
+            map.set(String(serial).toLowerCase(), {
+              serial,
+              productId,
+              unit,
+              status,
+              isGroup: Boolean(isGroup),
+              targetQty: Number(targetQty) || 1,
+            });
+          }
         });
         serialIndexRef.current = map;
       } catch (_) {
@@ -685,11 +729,17 @@ export default function GoodsOutEditModal({
       foundList.map((s) => [String(s.serial_number ?? s.serialNumber ?? '').trim().toLowerCase(), s])
     );
 
-    // A serial is usable here if it's genuinely available, or if it's
+    // A serial is usable here if it's genuinely available (and not grouped/dissolved), or if it's
     // already attached to this same (draft) document being edited.
-    const isUsable = (s) =>
-      s.status === 'available' ||
-      (effectiveDoc?.id && (s.goods_out_document_id ?? s.goodsOutDocumentId) === effectiveDoc.id);
+    const isUsable = (s) => {
+      const isGrouped = Boolean(s.metadata?.isGrouped || s.metadata?.parentGroupId || s.isGrouped);
+      const isDissolved = Boolean(s.metadata?.isDissolved || s.isDissolved);
+      if (isGrouped || isDissolved) return false;
+      return (
+        s.status === 'available' ||
+        (effectiveDoc?.id && (s.goods_out_document_id ?? s.goodsOutDocumentId) === effectiveDoc.id)
+      );
+    };
 
     // Seed the shared cache so editing any pasted row later resolves instantly
     foundList.forEach((s) => {
@@ -743,23 +793,64 @@ export default function GoodsOutEditModal({
             ? products.find((p) => p.id === matchedProductId) || fetchedProducts[matchedProductId]
             : null);
 
-        const resolvedFields = product
-          ? {
-              productId: product.id,
-              productName: product.name,
-              sku: product.sku || '',
-              isSerial: true,
-              serialNumber: matched.serial_number ?? matched.serialNumber ?? serialVal,
-              qty: 1,
-            }
-          : {
-              productId: null,
-              productName: '',
-              sku: '',
-              isSerial: true,
-              serialNumber: serialVal,
-              qty: 1,
-            };
+        let resolvedFields;
+        if (matched && product) {
+          const isGroup = Boolean(matched.metadata?.isGroup || matched.isGroup);
+          const rawGroupQty = Number(matched.metadata?.targetQty ?? matched.metadata?.unitQty ?? matched.targetQty);
+          const qty = isGroup && Number.isFinite(rawGroupQty) && rawGroupQty > 0 ? rawGroupQty : 1;
+
+          const unitMap = { piece: 'pcs', pcs: 'pcs', dozen: 'lusin', lusin: 'lusin', pack: 'pack', pack3: 'pack3', pack6: 'pack6', bal5: 'bal5', bal10: 'bal10', bal15: 'bal15', bal20: 'bal20', bal25: 'bal25', bal: 'bal' };
+          const snLower = String(matched.serial_number ?? matched.serialNumber ?? '').toLowerCase();
+          const metaUnit =
+            matched.metadata?.targetUnit ||
+            matched.targetUnit ||
+            matched.metadata?.serialUnit ||
+            matched.metadata?.unit ||
+            matched.metadata?.qtyUnit ||
+            matched.unit ||
+            matched.serialUnit ||
+            null;
+
+          let qtyUnit = 'pcs';
+          if (metaUnit && metaUnit !== 'piece' && metaUnit !== 'pcs') {
+            qtyUnit = unitMap[metaUnit] ?? metaUnit;
+          } else if (metaUnit === 'pcs' || metaUnit === 'piece') {
+            qtyUnit = 'pcs';
+          } else if (snLower.includes('10bl') || snLower.includes('bl10') || snLower.includes('bal10')) qtyUnit = 'bal10';
+          else if (snLower.includes('15bl') || snLower.includes('bl15') || snLower.includes('bal15')) qtyUnit = 'bal15';
+          else if (snLower.includes('20bl') || snLower.includes('bl20') || snLower.includes('bal20')) qtyUnit = 'bal20';
+          else if (snLower.includes('25bl') || snLower.includes('bl25') || snLower.includes('bal25')) qtyUnit = 'bal25';
+          else if (snLower.includes('5bl') || snLower.includes('bl5') || snLower.includes('bal5')) qtyUnit = 'bal5';
+          else if (snLower.includes('bal') || snLower.includes('bl')) qtyUnit = 'bal';
+          else if (snLower.includes('pack3') || snLower.includes('pk3')) qtyUnit = 'pack3';
+          else if (snLower.includes('pack6') || snLower.includes('pk6')) qtyUnit = 'pack6';
+          else if (snLower.includes('pack') || snLower.includes('pk')) qtyUnit = 'pack';
+          else if (snLower.includes('lusin') || snLower.includes('dozen')) qtyUnit = 'lusin';
+          else {
+            const rawUnit = product?.metadata?.qtyUnit || product?.metadata?.unit || 'pcs';
+            qtyUnit = unitMap[rawUnit] ?? rawUnit ?? 'pcs';
+          }
+
+          resolvedFields = {
+            productId: product.id,
+            productName: product.name,
+            sku: product.sku || '',
+            isSerial: true,
+            serialNumber: matched.serial_number ?? matched.serialNumber ?? serialVal,
+            qty,
+            qtyUnit,
+          };
+        } else {
+          resolvedFields = {
+            productId: null,
+            productName: '',
+            sku: '',
+            isSerial: true,
+            serialNumber: serialVal,
+            qty: 1,
+            qtyUnit: 'pcs',
+          };
+        }
 
         if (targetIdx < next.length) {
           next[targetIdx] = { ...next[targetIdx], ...resolvedFields };
@@ -789,8 +880,9 @@ export default function GoodsOutEditModal({
     const rawItems = (effectiveDoc?.items && effectiveDoc.items.length > 0) ? effectiveDoc.items : (effectiveDoc?.metadata?.items ?? []);
     const existingDocNonSerialPcs = {};
     (rawItems || []).forEach((item) => {
-      if (item.metadata?.isSerial !== true) {
-        const pId = item.product_id ?? item.productId;
+      const isItemUnrecorded = item.metadata?.isUnrecorded === true || item.metadata?.isUnrecordedStock === true;
+      if (item.metadata?.isSerial !== true && !isItemUnrecorded) {
+        const pId = item.product_id ?? item.productId ?? item.metadata?.originalProductId;
         if (pId) {
           const u = item.metadata?.qtyUnit || item.unit || 'pcs';
           const m = multipliers[u] || 1;
@@ -807,9 +899,14 @@ export default function GoodsOutEditModal({
 
       const unit = line.qtyUnit || 'pcs';
       const multiplier = multipliers[unit] || 1;
-      const requestedQty = line.isSerial ? multiplier : (Number(line.qty) || 1) * multiplier;
+      const requestedQty = line.isSerial
+        ? (line.isGroup ? (Number(line.qty) || 1) * multiplier : multiplier)
+        : (Number(line.qty) || 1) * multiplier;
 
-      if (line.isSerial) {
+      if (line.isUnrecorded) {
+        if (!line.qty || line.qty < 1) return `Jumlah kuantitas tidak valid pada baris ${i + 1}`;
+        // Unrecorded item: bypasses serial requirements and recorded stock limit
+      } else if (line.isSerial) {
         const sn = String(line.serialNumber || '').trim();
         if (!sn) return `Nomor seri wajib diisi pada baris ${i + 1}`;
         const snKey = sn.toLowerCase();
@@ -938,7 +1035,7 @@ export default function GoodsOutEditModal({
       const items = resolvedLines.map((line, idx) => {
         const unit = line.qtyUnit || 'pcs';
         const multiplier = multipliers[unit] || 1;
-        const totalQty = line.isSerial ? multiplier : line.qty * multiplier;
+        const totalQty = (Number(line.qty) || 1) * multiplier;
 
         return {
           productId: line.productId || null,
@@ -950,11 +1047,33 @@ export default function GoodsOutEditModal({
           discountValue: 0,
           amount: 0,
           sortOrder: idx,
-          metadata: line.isSerial
+          metadata: line.isUnrecorded
+            ? {
+                isSerial: false,
+                isUnrecorded: true,
+                isUnrecordedStock: true,
+                unrecordedNote: line.unrecordedNote || '',
+                qtyUnit: unit,
+                unitName: units.find((candidate) => candidate.key === unit)?.name || unit,
+                unitMultiplier: multiplier,
+                qtyInput: line.qty,
+                baseQuantity: totalQty,
+                stockDeducted: false,
+              }
+            : line.isSerial
             ? {
                 isSerial: true, serialNumber: line.serialNumber.trim(), qtyUnit: unit,
                 unitName: units.find((candidate) => candidate.key === unit)?.name || unit,
                 unitMultiplier: multiplier, qtyInput: line.qty, baseQuantity: totalQty,
+                ...(line.isGroup ? {
+                  isGroup: true,
+                  targetQty: line.qty,
+                  targetUnit: unit,
+                  totalPcs: totalQty,
+                  resultProductId: line.productId || null,
+                  resultProductName: line.productName,
+                  resultProductSku: line.sku || '',
+                } : {}),
               }
             : {
                 isSerial: false, qtyUnit: unit,
@@ -1027,7 +1146,14 @@ export default function GoodsOutEditModal({
   };
 
   return (
-    <div className="go-modal-overlay" onClick={handleCancelOrClose}>
+    <div
+      className="go-modal-overlay"
+      onClick={(e) => {
+        if (e.target !== e.currentTarget) return;
+        if (quickProduct?.open || scannerOpen) return;
+        handleCancelOrClose();
+      }}
+    >
       <section
         className="go-modal"
         role="dialog"
@@ -1349,6 +1475,7 @@ export default function GoodsOutEditModal({
                           products={products}
                           allLines={lines}
                           canRemove={lines.length > 1}
+                          allowUnrecorded={settings?.allow_unrecorded_goods_out !== false}
                           onChange={(fields) => handleLineChange(line.id, fields)}
                           onRemove={() => handleRemoveRow(line.id)}
                           onAddRow={handleAddRow}
@@ -1376,6 +1503,7 @@ export default function GoodsOutEditModal({
                     products={products}
                     allLines={lines}
                     canRemove={lines.length > 1}
+                    allowUnrecorded={settings?.allow_unrecorded_goods_out !== false}
                     onChange={(fields) => handleLineChange(line.id, fields)}
                     onRemove={() => handleRemoveRow(line.id)}
                     onAddRow={handleAddRow}

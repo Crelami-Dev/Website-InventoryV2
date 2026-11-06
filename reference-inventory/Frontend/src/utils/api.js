@@ -14,12 +14,12 @@ const getApiUrl = (path) => {
       window.location.hostname.endsWith('netlify.app') ||
       window.location.hostname.endsWith('notha.my.id')
     ) {
-      baseUrl = 'https://docu.notha.my.id';
+      baseUrl = 'https://api-docu.vercel.app';
     } else {
-      baseUrl = import.meta.env.VITE_API_URL || 'https://docu.notha.my.id';
+      baseUrl = import.meta.env.VITE_API_URL || 'https://api-docu.vercel.app';
     }
   } else {
-    baseUrl = import.meta.env.VITE_API_URL || 'https://docu.notha.my.id';
+    baseUrl = import.meta.env.VITE_API_URL || 'https://api-docu.vercel.app';
   }
 
   const cleanBase = baseUrl.replace(/\/$/, '');
@@ -55,7 +55,7 @@ export function getSession() {
   if (userStr) {
     try {
       user = normalizeUser(JSON.parse(userStr));
-    } catch (_) {}
+    } catch (_) { }
   }
   return { token, user };
 }
@@ -80,6 +80,7 @@ export function clearSession() {
   window.localStorage.removeItem('docuflow_access_token');
   window.localStorage.removeItem('docuflow_refresh_token');
   window.localStorage.removeItem('docuflow_user');
+  window.localStorage.removeItem('docuflow_active_warehouse_id');
   window.dispatchEvent(new Event('docuflow_user_updated'));
 }
 
@@ -97,7 +98,7 @@ export function normalizeSerials(raw) {
       goodsInItemId: s.goodsInItemId ?? s.goods_in_item_id,
       goodsOutDocumentId: s.goodsOutDocumentId ?? s.goods_out_document_id,
       goodsOutItemId: s.goodsOutItemId ?? s.goods_out_item_id,
-      
+
       product_id: s.product_id ?? s.productId,
       serial_number: s.serial_number ?? s.serialNumber,
       goods_in_document_id: s.goods_in_document_id ?? s.goodsInDocumentId,
@@ -142,7 +143,7 @@ async function refreshSession() {
           redirectToLogin();
           return null;
         }
-        
+
         // Save the refreshed session info
         const accessToken = data.session?.accessToken;
         const nextRefreshToken = data.session?.refreshToken;
@@ -463,28 +464,69 @@ export const DEFAULT_RULES = [
   { type: 'purchase_order', prefix: 'PO', format: '{PREFIX}/{YYYY}{MM}/{SEQ}', seqLength: 4, seqReset: 'monthly', separator: '/', leadingZero: true },
 ];
 
+function parseYMD(val) {
+  if (!val) return null;
+  if (typeof val === 'string') {
+    const clean = val.slice(0, 10);
+    const parts = clean.split('-');
+    if (parts.length === 3) {
+      const y = parseInt(parts[0], 10);
+      const m = parseInt(parts[1], 10) - 1;
+      const d = parseInt(parts[2], 10);
+      if (!isNaN(y) && !isNaN(m) && !isNaN(d)) {
+        return { y, m, d };
+      }
+    }
+  }
+  const dt = new Date(val);
+  if (isNaN(dt.getTime())) return null;
+  return { y: dt.getFullYear(), m: dt.getMonth(), d: dt.getDate() };
+}
+
 export function countDocsForSeqReset(docs, rule, dateStr) {
   if (!rule || !docs || !Array.isArray(docs)) return 0;
-  const targetDate = dateStr ? new Date(dateStr) : new Date();
-  const y = targetDate.getFullYear();
-  const m = targetDate.getMonth();
-  const d = targetDate.getDate();
+  const target = parseYMD(dateStr) || parseYMD(new Date());
+  if (!target) return 0;
 
-  return docs.filter((doc) => {
-    if (doc.document_type !== rule.type) return false;
-    if (!doc.issue_date) return false;
-    const docDate = new Date(doc.issue_date);
+  const matchingDocs = docs.filter((doc) => {
+    if (doc.document_type !== rule.type && doc.type !== rule.type) return false;
+    const docDateVal = doc.issue_date || doc.issueDate || doc.created_at || doc.createdAt;
+    if (!docDateVal) return false;
+    const docParsed = parseYMD(docDateVal);
+    if (!docParsed) return false;
 
     if (rule.seqReset === 'daily') {
-      return docDate.getFullYear() === y && docDate.getMonth() === m && docDate.getDate() === d;
+      return docParsed.y === target.y && docParsed.m === target.m && docParsed.d === target.d;
     } else if (rule.seqReset === 'monthly') {
-      return docDate.getFullYear() === y && docDate.getMonth() === m;
+      return docParsed.y === target.y && docParsed.m === target.m;
     } else if (rule.seqReset === 'yearly') {
-      return docDate.getFullYear() === y;
+      return docParsed.y === target.y;
     }
     // 'never'
     return true;
-  }).length;
+  });
+
+  // Extract the maximum existing sequence number from document numbers
+  const seqLen = rule.seqLength || 4;
+  let maxSeq = 0;
+  for (const doc of matchingDocs) {
+    const docNum = String(doc.document_number || doc.number || doc.documentNumber || '').trim();
+    if (!docNum || docNum.includes('e+') || docNum.includes('NaN')) continue;
+
+    const match = docNum.match(/(\d+)\s*$/);
+    if (match) {
+      const digits = match[1];
+      // If trailing digits are longer than configured sequence length (e.g. date + seq: 202610200028),
+      // take only the trailing seqLen digits (0028 -> 28)
+      const trailing = digits.length > seqLen ? digits.slice(-seqLen) : digits;
+      const val = parseInt(trailing, 10);
+      if (!isNaN(val) && val < 100000 && val > maxSeq) {
+        maxSeq = val;
+      }
+    }
+  }
+
+  return Math.max(maxSeq, matchingDocs.length);
 }
 
 export function buildDocumentNumber(docType, dateStr, existingDocsCount, settings) {

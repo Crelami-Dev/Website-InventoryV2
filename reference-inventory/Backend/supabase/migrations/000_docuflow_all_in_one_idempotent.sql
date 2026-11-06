@@ -334,6 +334,8 @@ CREATE TABLE IF NOT EXISTS public.email_logs (
   document_id UUID REFERENCES public.documents(id) ON DELETE CASCADE,
   sender_email TEXT, recipient_email TEXT, cc_email TEXT, subject TEXT,
   status TEXT NOT NULL DEFAULT 'pending', sent_at TIMESTAMPTZ, error_message TEXT,
+  retry_count INTEGER NOT NULL DEFAULT 0, last_retry_at TIMESTAMPTZ,
+  last_attempt_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -342,6 +344,24 @@ ALTER TABLE public.purchase_orders ADD COLUMN IF NOT EXISTS warehouse_id UUID;
 ALTER TABLE public.purchase_order_items ADD COLUMN IF NOT EXISTS unit TEXT;
 ALTER TABLE public.purchase_order_items ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE public.email_logs ADD COLUMN IF NOT EXISTS document_id UUID REFERENCES public.documents(id) ON DELETE CASCADE;
+ALTER TABLE public.email_logs ADD COLUMN IF NOT EXISTS return_id UUID;
+ALTER TABLE public.email_logs ADD COLUMN IF NOT EXISTS email_type TEXT;
+ALTER TABLE public.email_logs ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE public.email_logs ADD COLUMN IF NOT EXISTS last_retry_at TIMESTAMPTZ;
+ALTER TABLE public.email_logs ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ;
+
+-- Satu log per retur agar retry tidak mengirim notifikasi yang sama dua kali.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_email_logs_return_unique
+  ON public.email_logs (document_id, return_id)
+  WHERE return_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_email_logs_retry_pending
+  ON public.email_logs (created_at DESC)
+  WHERE status = 'failed';
+
+CREATE INDEX IF NOT EXISTS idx_email_logs_pending_lease
+  ON public.email_logs (last_attempt_at)
+  WHERE status = 'pending';
 
 CREATE INDEX IF NOT EXISTS warehouses_owner_idx ON public.warehouses(owner_id, status);
 CREATE INDEX IF NOT EXISTS idx_purchase_orders_owner ON public.purchase_orders(owner_id, created_at DESC);
@@ -964,6 +984,8 @@ begin
       where di.document_id = p_document_id
         and di.product_id is not null
         and coalesce((di.metadata->>'isSerial')::boolean, false) = false
+        and coalesce((di.metadata->>'isUnrecorded')::boolean, false) = false
+        and coalesce((di.metadata->>'isUnrecordedStock')::boolean, false) = false
       group by di.product_id
       order by di.product_id
     loop
@@ -1057,6 +1079,8 @@ begin
       from public.document_items di
       where di.document_id = p_document_id and di.product_id is not null
         and coalesce((di.metadata->>'isSerial')::boolean, false) = false
+        and coalesce((di.metadata->>'isUnrecorded')::boolean, false) = false
+        and coalesce((di.metadata->>'isUnrecordedStock')::boolean, false) = false
       group by di.product_id order by di.product_id
     loop
       select * into v_product from public.products
@@ -1193,6 +1217,8 @@ as $$
       and d.document_type in ('goods_in', 'goods_out')
       and di.product_id is not null
       and coalesce((di.metadata->>'isSerial')::boolean, false) = false
+      and coalesce((di.metadata->>'isUnrecorded')::boolean, false) = false
+      and coalesce((di.metadata->>'isUnrecordedStock')::boolean, false) = false
     group by di.product_id
   )
   select p.id, p.sku, p.name,

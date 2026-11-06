@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Save, RotateCcw, Barcode, SlidersHorizontal, CheckCircle2, AlertCircle } from 'lucide-react';
+import { Save, RotateCcw, Barcode, SlidersHorizontal, CheckCircle2, AlertCircle, AlertTriangle } from 'lucide-react';
 import { useApp } from '../../context/AppContext.jsx';
 import { api, getWorkspaceSettings } from '../../utils/api.js';
 import { useUnits } from '../../hooks/useUnits.js';
@@ -28,17 +28,23 @@ export default function SerialNumberSetting() {
   const [seqLength, setSeqLength] = useState(DEFAULT_SERIAL_SETTINGS.seqLength);
   const [defaultMode, setDefaultMode] = useState(DEFAULT_SERIAL_SETTINGS.defaultMode);
   const [unitShortCodes, setUnitShortCodes] = useState(DEFAULT_UNIT_SHORT_CODES);
+  const [allowUnrecorded, setAllowUnrecorded] = useState(true);
   const [saving, setSaving] = useState(false);
   const [feedback, setFeedback] = useState(null);
 
   useEffect(() => {
-    if (settings?.serial_number_settings) {
-      const s = settings.serial_number_settings;
-      if (s.template) setTemplate(s.template);
-      if (s.seqLength) setSeqLength(Number(s.seqLength));
-      if (s.defaultMode) setDefaultMode(s.defaultMode);
-      if (s.unitShortCodes && typeof s.unitShortCodes === 'object') {
-        setUnitShortCodes({ ...DEFAULT_UNIT_SHORT_CODES, ...s.unitShortCodes });
+    if (settings) {
+      if (typeof settings.allow_unrecorded_goods_out !== 'undefined') {
+        setAllowUnrecorded(settings.allow_unrecorded_goods_out !== false);
+      }
+      if (settings?.serial_number_settings) {
+        const s = settings.serial_number_settings;
+        if (s.template) setTemplate(s.template);
+        if (s.seqLength) setSeqLength(Number(s.seqLength));
+        if (s.defaultMode) setDefaultMode(s.defaultMode);
+        if (s.unitShortCodes && typeof s.unitShortCodes === 'object') {
+          setUnitShortCodes({ ...DEFAULT_UNIT_SHORT_CODES, ...s.unitShortCodes });
+        }
       }
     }
   }, [settings]);
@@ -61,6 +67,7 @@ export default function SerialNumberSetting() {
     setSeqLength(DEFAULT_SERIAL_SETTINGS.seqLength);
     setDefaultMode(DEFAULT_SERIAL_SETTINGS.defaultMode);
     setUnitShortCodes(DEFAULT_UNIT_SHORT_CODES);
+    setAllowUnrecorded(true);
     showFeedback('success', lang === 'id' ? 'Pengaturan dikembalikan ke standar bawaan.' : 'Settings restored to defaults.');
   };
 
@@ -82,6 +89,10 @@ export default function SerialNumberSetting() {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.message || 'Gagal menyimpan pengaturan.');
       }
+
+      await api.patch('/api/workspace/settings/allow_unrecorded_goods_out', {
+        value: allowUnrecorded,
+      });
 
       await queryClient.invalidateQueries({ queryKey: ['workspace-settings'] });
       showFeedback('success', lang === 'id' ? 'Pengaturan nomor seri berhasil disimpan!' : 'Serial number settings saved successfully!');
@@ -268,6 +279,42 @@ export default function SerialNumberSetting() {
                   ? `Simulasi SKU "${sampleSku}", Satuan "${sampleUnitCode}".`
                   : `Simulated for SKU "${sampleSku}", Unit "${sampleUnitCode}".`}
               </span>
+            </div>
+
+            {/* Mode Transisi: Barang Keluar Belum Terdata (Non-SN) */}
+            <div
+              style={{
+                marginTop: 'var(--space-2)',
+                padding: 'var(--space-4)',
+                background: allowUnrecorded ? 'rgba(245, 158, 11, 0.06)' : 'var(--color-surface-hover, #f8fafc)',
+                border: allowUnrecorded ? '1px solid rgba(245, 158, 11, 0.3)' : '1px solid var(--color-border)',
+                borderRadius: 'var(--radius-md)',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 'var(--space-3)' }}>
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600, color: 'var(--color-text-primary)' }}>
+                    <AlertTriangle size={16} color={allowUnrecorded ? '#d97706' : 'var(--color-text-muted)'} />
+                    <span>{lang === 'id' ? 'Barang Keluar Belum Terdata (Non-SN)' : 'Unrecorded Goods Out (Non-SN)'}</span>
+                    <span className={`chip ${allowUnrecorded ? 'chip-success' : 'chip-secondary'} chip-sm`}>
+                      {allowUnrecorded ? (lang === 'id' ? 'Aktif' : 'Active') : (lang === 'id' ? 'Nonaktif' : 'Disabled')}
+                    </span>
+                  </div>
+                  <p style={{ margin: '6px 0 0', fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', lineHeight: 1.5 }}>
+                    {lang === 'id'
+                      ? 'Mengizinkan staf memproses Barang Keluar cepat untuk barang fisik yang belum masuk stok/tidak ada serial number. Transaksi ini tidak memotong stok sistem & tidak membuat nomor seri palsu.'
+                      : 'Allows staff to process Goods Out quickly for physical items not yet in stock/without serial numbers. Does not deduct stock or create fake serials.'}
+                  </p>
+                </div>
+                <label style={{ display: 'inline-flex', alignItems: 'center', cursor: 'pointer', flexShrink: 0, marginTop: '2px' }}>
+                  <input
+                    type="checkbox"
+                    checked={allowUnrecorded}
+                    onChange={(e) => setAllowUnrecorded(e.target.checked)}
+                    style={{ width: '18px', height: '18px', cursor: 'pointer' }}
+                  />
+                </label>
+              </div>
             </div>
           </div>
         </div>

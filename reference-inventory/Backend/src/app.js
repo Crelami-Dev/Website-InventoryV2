@@ -112,6 +112,7 @@ export function createApp() {
     return res.status(status).json({
       error: {
         message: error.message ?? 'Internal server error',
+        ...(error.code ? { code: error.code } : {}),
         ...(isDev && error.details ? { details: error.details } : {}),
       },
     });

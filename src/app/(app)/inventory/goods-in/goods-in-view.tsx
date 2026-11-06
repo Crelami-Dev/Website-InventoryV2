@@ -30,7 +30,10 @@ import {
   registerGoodsInSerialsAction,
   updateWarehouseConversionDisplayUnitAction,
   deleteGoodsInAction,
+  createInventoryReturnAction,
 } from "@/lib/inventory/actions";
+import { ReturnSerialPickerDialog } from "@/components/inventory/return-serial-picker-dialog";
+import { RotateCcwIcon } from "@/components/ui/icons";
 import type { GoodsInSerialsStatusResult } from "@/lib/db/repositories/inventory-repository";
 import {
   SUPPORTED_UNITS,
@@ -226,6 +229,35 @@ export function GoodsInView({
   const [confirmDeleteModalOpen, setConfirmDeleteModalOpen] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
 
+  // Retur Supplier Modal state
+  const [returnTargetTx, setReturnTargetTx] = useState<GoodsInTransaction | null>(null);
+  const [returnAvailableSerials, setReturnAvailableSerials] = useState<string[]>([]);
+  const [isSubmittingReturn, setIsSubmittingReturn] = useState(false);
+  const [isLoadingReturnSerials, setIsLoadingReturnSerials] = useState(false);
+
+  async function handleStartReturnSupplier(tx: GoodsInTransaction) {
+    setIsLoadingReturnSerials(true);
+    try {
+      const res = await getGoodsInSerialsStatusAction(tx.id);
+      if (res.success && res.data) {
+        const availableSns = res.data.lines.flatMap((l) =>
+          l.serials
+            .filter((s) => s.status === "AVAILABLE")
+            .map((s) => s.serialNumber.trim().toUpperCase())
+        );
+        setReturnAvailableSerials(availableSns);
+      } else {
+        setReturnAvailableSerials([]);
+      }
+      setReturnTargetTx(tx);
+    } catch {
+      setReturnAvailableSerials([]);
+      setReturnTargetTx(tx);
+    } finally {
+      setIsLoadingReturnSerials(false);
+    }
+  }
+
   function toggleExpandSerials(itemKey: string) {
     setExpandedSerialItemKeys((prev) => ({
       ...prev,
@@ -235,18 +267,7 @@ export function GoodsInView({
 
   function handleInitiateReturn() {
     if (!selectedTxDetail) return;
-    const selectedCount = Object.values(selectedItemChecks).filter(Boolean).length;
-    toast.push({
-      tone: "info",
-      title: "Proses Retur Barang",
-      description:
-        selectedCount > 0
-          ? `Membuka modul retur untuk ${selectedCount} barang terpilih dari dokumen ${selectedTxDetail.reference}.`
-          : `Membuka modul retur untuk dokumen ${selectedTxDetail.reference}.`,
-    });
-    router.push(
-      `/inventory/returns?source=goods-in&ref=${encodeURIComponent(selectedTxDetail.reference)}`
-    );
+    handleStartReturnSupplier(selectedTxDetail);
   }
 
   async function handleDeleteSelectedTx() {
@@ -1713,6 +1734,20 @@ export function GoodsInView({
               title="Edit transaksi pending ini"
             >
               Edit
+            </Button>
+          )}
+          {t.status === "POSTED" && (
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={() => handleStartReturnSupplier(t)}
+              loading={isLoadingReturnSerials && returnTargetTx?.id === t.id}
+              className="text-xs text-amber-600 dark:text-amber-400 font-medium inline-flex items-center gap-1"
+              title="Retur ke Supplier dari dokumen penerimaan ini"
+            >
+              <RotateCcwIcon className="h-3.5 w-3.5" />
+              Retur ke Supplier
             </Button>
           )}
         </div>
@@ -4243,6 +4278,71 @@ export function GoodsInView({
           </div>
         </div>
       </Dialog>
+
+      {/* Dialog Retur ke Pemasok (Supplier Return) */}
+      {returnTargetTx && (
+        <ReturnSerialPickerDialog
+          open={!!returnTargetTx}
+          onClose={() => setReturnTargetTx(null)}
+          sourceType="SUPPLIER"
+          sourceReference={returnTargetTx.reference}
+          partnerName={returnTargetTx.supplierName}
+          warehouseId={returnTargetTx.warehouseId}
+          warehouseName={returnTargetTx.warehouseName}
+          availableSerials={returnAvailableSerials}
+          items={returnTargetTx.items.map((it) => ({
+            productId: it.productId,
+            productName: it.productName,
+            sku: it.sku,
+            unit: it.unit,
+            qty: it.qty,
+            tracking: it.tracking,
+            serials: it.serials,
+          }))}
+          isSubmitting={isSubmittingReturn}
+          onSubmit={async (data) => {
+            setIsSubmittingReturn(true);
+            try {
+              const res = await createInventoryReturnAction({
+                warehouseId: returnTargetTx.warehouseId,
+                returnType: "SUPPLIER_RETURN",
+                supplierId: returnTargetTx.supplierId,
+                goodsInId: returnTargetTx.id,
+                returnNumber: `RET-SUP-${Date.now().toString().slice(-6)}`,
+                returnDate: new Date().toISOString().slice(0, 10),
+                reason: data.reason,
+                notes: data.notes,
+                lines: data.lines.map((l) => ({
+                  productId: l.productId,
+                  quantity: l.quantity,
+                  unit: l.unit,
+                  condition: l.condition,
+                  returnedSerials: l.returnedSerials,
+                  groupReturnMode: l.groupReturnMode,
+                })),
+              });
+
+              if (!res.success) {
+                toast.push({
+                  tone: "danger",
+                  title: "Gagal Membuat Retur ke Pemasok",
+                  description: res.error || "Terjadi kesalahan saat membuat retur.",
+                });
+                return;
+              }
+
+              toast.push({
+                tone: "success",
+                title: "Retur ke Pemasok Berhasil Dibuat",
+                description: `Dokumen retur ${res.returnRecord?.returnNumber} telah dibuat berstatus DRAFT (Menunggu pengeluaran fisik).`,
+              });
+              setReturnTargetTx(null);
+            } finally {
+              setIsSubmittingReturn(false);
+            }
+          }}
+        />
+      )}
     </div>
   );
 }

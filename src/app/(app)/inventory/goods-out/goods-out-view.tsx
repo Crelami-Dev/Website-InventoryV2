@@ -28,8 +28,12 @@ import {
   getAvailableSerialsByProductAction,
   getAvailableSerialsByWarehouseAction,
   verifySerialForGoodsOutAction,
+  resolveGroupForGoodsOutAction,
   mapPurchaseOrderLineAction,
+  createInventoryReturnAction,
 } from "@/lib/inventory/actions";
+import { ReturnSerialPickerDialog } from "@/components/inventory/return-serial-picker-dialog";
+import { RotateCcwIcon } from "@/components/ui/icons";
 import type { AvailableSerialItem } from "@/lib/db/repositories/inventory-repository";
 import { getUnitMultiplier } from "@/lib/inventory/units";
 import "./goods-out-modal.css";
@@ -101,6 +105,8 @@ export interface GoodsOutFormLine {
   orderedQty?: number;
   orderedUnit?: string;
   mappingStatus?: string;
+  groupId?: string;
+  groupSerialsSnapshot?: string[];
 }
 
 function createEmptyGoodsOutLine(): GoodsOutFormLine {
@@ -276,6 +282,10 @@ export function GoodsOutView({
   const [cancelReason, setCancelReason] = useState("");
   const [isCancelling, setIsCancelling] = useState(false);
   const [isCompleting, setIsCompleting] = useState(false);
+
+  // Return Modal state (Customer Return from Completed Goods Out)
+  const [returnTargetTx, setReturnTargetTx] = useState<GoodsOutTransaction | null>(null);
+  const [isSubmittingReturn, setIsSubmittingReturn] = useState(false);
 
   // Form Header States
   const autoReference = useMemo(() => {
@@ -1050,6 +1060,67 @@ export function GoodsOutView({
     async (targetLineId: string, serialNumber: string): Promise<{ success: boolean; message: string }> => {
       const cleanSn = serialNumber.trim();
       if (!cleanSn) return { success: false, message: "Nomor seri tidak boleh kosong." };
+
+      // Cek apakah scan input adalah barcode Group ("G-xxxx")
+      if (cleanSn.toUpperCase().startsWith("G-")) {
+        try {
+          const groupRes = await resolveGroupForGoodsOutAction(cleanSn.toUpperCase(), context.warehouseId || "");
+          if (!groupRes.success || !("group" in groupRes) || !groupRes.group || !groupRes.lines) {
+            return {
+              success: false,
+              message: ("error" in groupRes ? groupRes.error : undefined) || `Group ${cleanSn} tidak valid atau tidak tersedia di gudang ini.`,
+            };
+          }
+
+          const resolvedGroup = groupRes.group;
+          const resolvedLines = groupRes.lines;
+
+          // Cek apakah ada komponen group yang sudah terdaftar di dokumen saat ini
+          for (const gl of resolvedLines) {
+            for (const s of gl.serials) {
+              if (allSelectedSerials.includes(s)) {
+                return {
+                  success: false,
+                  message: `SN '${s}' di dalam ${resolvedGroup.groupNumber} sudah ada di daftar Goods Out.`,
+                };
+              }
+            }
+          }
+
+          // Masukkan baris-baris produk dari group
+          const newGroupLines: GoodsOutFormLine[] = resolvedLines.map((gl) => {
+            const matchedProd = availableProducts.find((p) => p.id === gl.productId);
+            return {
+              id: `gol-grp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              productId: gl.productId,
+              productName: gl.productName,
+              sku: gl.sku,
+              tracking: "SERIAL",
+              unit: matchedProd?.unit || "pcs",
+              availableStock: matchedProd?.availableStock ?? matchedProd?.stock ?? gl.quantity,
+              quantity: String(gl.quantity),
+              serials: gl.serials,
+              groupId: resolvedGroup.id,
+              groupSerialsSnapshot: gl.serials,
+            };
+          });
+
+          setLines((prev) => {
+            const nonEmpties = prev.filter((l) => Boolean(l.productId));
+            return [...nonEmpties, ...newGroupLines];
+          });
+
+          return {
+            success: true,
+            message: `Group ${resolvedGroup.groupNumber} (${resolvedGroup.groupName || "SN Group"}) berhasil dimasukkan (${resolvedLines.length} produk, total ${resolvedGroup.totalBaseQtyPcs} pcs).`,
+          };
+        } catch (err: unknown) {
+          return {
+            success: false,
+            message: err instanceof Error ? err.message : `Gagal memproses Group ${cleanSn}.`,
+          };
+        }
+      }
 
       // Duplicate check across entire document
       if (allSelectedSerials.includes(cleanSn)) {
@@ -1828,6 +1899,8 @@ export function GoodsOutView({
             quantity: l.tracking === "SERIAL" ? l.serials.length : Number(l.quantity),
             unit: l.unit,
             serials: l.tracking === "SERIAL" ? l.serials : undefined,
+            groupId: l.groupId,
+            groupSerialsSnapshot: l.groupSerialsSnapshot,
           })),
         });
 
@@ -1906,6 +1979,8 @@ export function GoodsOutView({
             quantity: l.tracking === "SERIAL" ? l.serials.length : Number(l.quantity),
             unit: l.unit,
             serials: l.tracking === "SERIAL" ? l.serials : undefined,
+            groupId: l.groupId,
+            groupSerialsSnapshot: l.groupSerialsSnapshot,
           })),
         });
 
@@ -2202,6 +2277,19 @@ export function GoodsOutView({
               title="Edit pengeluaran barang pending ini"
             >
               Edit
+            </Button>
+          )}
+          {t.status === "COMPLETED" && (
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={() => setReturnTargetTx(t)}
+              className="text-xs text-primary font-medium inline-flex items-center gap-1"
+              title="Buat Retur Pelanggan dari dokumen ini"
+            >
+              <RotateCcwIcon className="h-3.5 w-3.5" />
+              Retur Pelanggan
             </Button>
           )}
         </div>
@@ -4796,6 +4884,21 @@ export function GoodsOutView({
                     </Button>
                   </>
                 )}
+                {selectedTxDetail.status === "COMPLETED" && (
+                  <Button
+                    type="button"
+                    variant="primary"
+                    size="sm"
+                    onClick={() => {
+                      setReturnTargetTx(selectedTxDetail);
+                    }}
+                    className="inline-flex items-center gap-1.5"
+                    title="Buat Retur Pelanggan dari dokumen pengeluaran ini"
+                  >
+                    <RotateCcwIcon className="h-3.5 w-3.5" />
+                    <span>Buat Retur Pelanggan</span>
+                  </Button>
+                )}
                 <Button
                   type="button"
                   variant="secondary"
@@ -4860,6 +4963,75 @@ export function GoodsOutView({
             </div>
           </div>
         </Dialog>
+      )}
+      {/* Dialog Retur Pelanggan dari Dokumen Goods Out COMPLETED */}
+      {returnTargetTx && (
+        <ReturnSerialPickerDialog
+          open={!!returnTargetTx}
+          onClose={() => setReturnTargetTx(null)}
+          sourceType="CUSTOMER"
+          sourceReference={returnTargetTx.reference}
+          partnerName={returnTargetTx.recipientName}
+          warehouseId={returnTargetTx.warehouseId}
+          warehouseName={returnTargetTx.warehouseName}
+          items={returnTargetTx.items.map((it) => ({
+            productId: it.productId,
+            productName: it.productName,
+            sku: it.sku,
+            unit: it.unit,
+            qty: it.qty,
+            tracking: it.tracking,
+            serials: it.serials,
+          }))}
+          isSubmitting={isSubmittingReturn}
+          onSubmit={async (data) => {
+            setIsSubmittingReturn(true);
+            try {
+              const matchedCustomer =
+                customers.find(
+                  (c) =>
+                    c.name.trim().toLowerCase() === returnTargetTx.recipientName.trim().toLowerCase()
+                ) || customers[0];
+
+              const res = await createInventoryReturnAction({
+                warehouseId: returnTargetTx.warehouseId,
+                returnType: "CUSTOMER_RETURN",
+                customerId: matchedCustomer?.id,
+                goodsOutId: returnTargetTx.id,
+                returnNumber: `RET-DO-${Date.now().toString().slice(-6)}`,
+                returnDate: new Date().toISOString().slice(0, 10),
+                reason: data.reason,
+                notes: data.notes,
+                lines: data.lines.map((l) => ({
+                  productId: l.productId,
+                  quantity: l.quantity,
+                  unit: l.unit,
+                  condition: l.condition,
+                  returnedSerials: l.returnedSerials,
+                  groupReturnMode: l.groupReturnMode,
+                })),
+              });
+
+              if (!res.success) {
+                toast.push({
+                  tone: "danger",
+                  title: "Gagal Membuat Retur",
+                  description: res.error || "Terjadi kesalahan saat memproses retur pelanggan.",
+                });
+                return;
+              }
+
+              toast.push({
+                tone: "success",
+                title: "Retur Pelanggan Berhasil Dibuat",
+                description: `Dokumen retur ${res.returnRecord?.returnNumber} telah dibuat berstatus DRAFT (Menunggu penerimaan fisik).`,
+              });
+              setReturnTargetTx(null);
+            } finally {
+              setIsSubmittingReturn(false);
+            }
+          }}
+        />
       )}
       {/* Akhir Dialog Goods Out */}
     </div>

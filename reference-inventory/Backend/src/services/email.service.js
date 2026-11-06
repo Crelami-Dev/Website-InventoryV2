@@ -1,6 +1,8 @@
 import nodemailer from 'nodemailer';
 import { supabaseAdmin } from '../lib/supabase.js';
 import { env } from '../config/env.js';
+import { generateReturnPdfCompact } from './pdf.service.js';
+import { resolveDocumentItemQuantity } from '../utils/documentQuantity.js';
 
 const SUPER_ADMIN_TENANT_ID = '00000000-0000-0000-0000-000000000000';
 
@@ -19,24 +21,52 @@ const SUPER_ADMIN_TENANT_ID = '00000000-0000-0000-0000-000000000000';
  */
 let _transporter = null;
 
-function buildTransporter() {
-  const host = process.env.SMTP_HOST;
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
-  if (!host || !user || !pass) return null;
+function readSmtpEnv(name) {
+  const value = process.env[name];
+  return typeof value === 'string' ? value.trim() : '';
+}
 
-  const port = Number(process.env.SMTP_PORT) || 587;
-  const secure = process.env.SMTP_SECURE === 'true' || port === 465;
+/**
+ * Konfigurasi SMTP dibaca langsung dari environment process, sehingga nilai
+ * yang di-set di Vercel Project Settings (Production/Preview) otomatis dipakai
+ * tanpa file .env lokal. Nilai di-trim agar spasi tidak sengaja dari dashboard
+ * tidak membuat autentikasi gagal.
+ */
+export function getSmtpConfig() {
+  const host = readSmtpEnv('SMTP_HOST');
+  const user = readSmtpEnv('SMTP_USER');
+  const pass = readSmtpEnv('SMTP_PASS');
+  const port = Number(readSmtpEnv('SMTP_PORT')) || 587;
+  const secure = readSmtpEnv('SMTP_SECURE').toLowerCase() === 'true' || port === 465;
 
-  return nodemailer.createTransport({
+  return {
     host,
+    user,
+    pass,
     port,
     secure,
-    auth: { user, pass },
+    from: readSmtpEnv('SMTP_FROM') || user,
+    tlsRejectUnauthorized: readSmtpEnv('SMTP_TLS_REJECT_UNAUTHORIZED').toLowerCase() !== 'false',
+  };
+}
+
+export function getSmtpFromAddress() {
+  return getSmtpConfig().from || 'no-reply@docuflow.app';
+}
+
+function buildTransporter() {
+  const config = getSmtpConfig();
+  if (!config.host || !config.user || !config.pass) return null;
+
+  return nodemailer.createTransport({
+    host: config.host,
+    port: config.port,
+    secure: config.secure,
+    auth: { user: config.user, pass: config.pass },
     // TLS: pastikan sertifikat divalidasi (default aman), tapi izinkan
     // override via env untuk host SMTP internal/self-signed bila memang perlu.
     tls: {
-      rejectUnauthorized: process.env.SMTP_TLS_REJECT_UNAUTHORIZED !== 'false',
+      rejectUnauthorized: config.tlsRejectUnauthorized,
       minVersion: 'TLSv1.2',
     },
     pool: true,
@@ -52,7 +82,7 @@ function buildTransporter() {
   });
 }
 
-function getTransporter() {
+export function getTransporter() {
   if (_transporter) return _transporter;
   _transporter = buildTransporter();
   return _transporter;
@@ -126,7 +156,7 @@ function delay(ms) {
  * @returns {Promise<Object>} info hasil sendMail jika sukses
  * @throws akan melempar error terakhir jika seluruh percobaan gagal
  */
-async function sendMailWithRetry(mailOptions, maxRetries = 3) {
+export async function sendMailWithRetry(mailOptions, maxRetries = 3) {
   let lastError = null;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -161,7 +191,7 @@ async function sendMailWithRetry(mailOptions, maxRetries = 3) {
 /**
  * Validasi sederhana alamat email penerima.
  */
-function isValidEmail(email) {
+export function isValidEmail(email) {
   if (!email || typeof email !== 'string') return false;
   const trimmed = email.trim();
   if (!trimmed) return false;
@@ -177,45 +207,39 @@ export async function resolveFinanceEmail(ownerId) {
   if (!ownerId) return null;
 
   if (ownerId && ownerId !== SUPER_ADMIN_TENANT_ID) {
-    // 1. Cek dari key 'company'
-    const { data: compSetting } = await supabaseAdmin
+    const { data: rows } = await supabaseAdmin
       .from('workspace_settings')
-      .select('value')
+      .select('key, value, updated_at')
       .eq('owner_id', ownerId)
-      .eq('key', 'company')
-      .maybeSingle();
-    if (compSetting?.value) {
-      const email =
-        compSetting.value.companyEmail ||
-        compSetting.value.email ||
-        compSetting.value.company?.companyEmail ||
-        compSetting.value.company?.email;
-      if (email) return email;
+      .in('key', ['app', 'company', 'finance_email']);
+
+    let appEmail = null;
+    let appUpdated = 0;
+    let compEmail = null;
+    let compUpdated = 0;
+
+    for (const r of rows || []) {
+      const updatedTime = r.updated_at ? new Date(r.updated_at).getTime() : 0;
+      if (r.key === 'app') {
+        const val = r.value?.company || r.value;
+        appEmail = val?.companyEmail || val?.email || null;
+        appUpdated = updatedTime;
+      }
+      if (r.key === 'company') {
+        const val = r.value?.company || r.value;
+        compEmail = val?.companyEmail || val?.email || null;
+        compUpdated = updatedTime;
+      }
     }
 
-    // 2. Cek dari key 'app' (nested company)
-    const { data: appSetting } = await supabaseAdmin
-      .from('workspace_settings')
-      .select('value')
-      .eq('owner_id', ownerId)
-      .eq('key', 'app')
-      .maybeSingle();
-    if (appSetting?.value) {
-      const email =
-        appSetting.value.company?.companyEmail ||
-        appSetting.value.company?.email ||
-        appSetting.value.companyEmail ||
-        appSetting.value.email;
-      if (email) return email;
+    if (appEmail && compEmail) {
+      return appUpdated >= compUpdated ? appEmail : compEmail;
     }
+    if (appEmail) return appEmail;
+    if (compEmail) return compEmail;
 
-    // 3. Fallback ke key 'finance_email'
-    const { data: finSetting } = await supabaseAdmin
-      .from('workspace_settings')
-      .select('value')
-      .eq('owner_id', ownerId)
-      .eq('key', 'finance_email')
-      .maybeSingle();
+    // Fallback ke key 'finance_email'
+    const finSetting = (rows || []).find((s) => s.key === 'finance_email');
     if (finSetting?.value?.email) return finSetting.value.email;
     if (typeof finSetting?.value === 'string') return finSetting.value;
   }
@@ -269,7 +293,7 @@ const PALETTE_COLORS = {
  */
 export async function sendPOEmail({ po, pdfBuffer, salesEmail, salesName, financeEmail, accentColor }) {
   const subject = `[New PO] - ${po.po_number} dari ${salesName ?? 'Sales'}`;
-  const fromAddress = process.env.SMTP_FROM || process.env.SMTP_USER;
+  const fromAddress = getSmtpFromAddress();
 
   const shouldCcSales = financeEmail && salesEmail && financeEmail.toLowerCase() !== salesEmail.toLowerCase();
   const recipientEmail = financeEmail || salesEmail;
@@ -632,24 +656,6 @@ function getUnitHelpers(customUnits) {
   return { multipliers, isLusin, parseSn };
 }
 
-function getItemQtyInPcs(item, helpers = null) {
-  const isSerial = item.metadata?.isSerial === true || !!item.metadata?.serialNumber;
-  const serialNumber = item.metadata?.serialNumber || '';
-  let unit = (item.metadata?.qtyUnit || item.qtyUnit || item.unit || 'pcs').toLowerCase();
-  if (isSerial && serialNumber && (!unit || unit === 'pcs' || unit === 'piece')) {
-    unit = helpers ? helpers.parseSn(serialNumber, unit) : parseUnitFromSn(serialNumber, unit);
-  }
-  const qty = isSerial ? 1 : Number(item.metadata?.qtyInput ?? item.quantity ?? item.qty ?? 1);
-  const mult = (helpers ? helpers.multipliers[unit] : MULTIPLIERS[unit]) || ((helpers ? helpers.isLusin(unit) : isLusinUnit(unit)) ? 12 : 1);
-  return {
-    isSerial,
-    serialNumber,
-    unit,
-    qty,
-    pcs: qty * mult,
-  };
-}
-
 function formatDocumentQty(totalLusin, totalPcs) {
   let lusin = totalLusin || 0;
   let pcs = totalPcs || 0;
@@ -689,18 +695,54 @@ function formatLusinPcs(totalPcs) {
   return `${pcs} pcs`;
 }
 
-function getGroupedProductItems(items, customUnits = null) {
-  const helpers = getUnitHelpers(customUnits);
+function getGroupedProductItems(items, doc = null, customUnits = null) {
+  let docObj = null;
+  let unitsData = null;
+  if (doc && (Array.isArray(doc) || doc.key || doc.baseType)) {
+    // Legacy signature: getGroupedProductItems(items, customUnits)
+    unitsData = doc;
+  } else {
+    docObj = doc;
+    unitsData = customUnits || doc?.metadata?.custom_units || doc?.custom_units;
+  }
+  const helpers = getUnitHelpers(unitsData);
   const groupMap = new Map();
+
+  // Parse active return transactions from doc metadata
+  const activeReturns = Array.isArray(docObj?.metadata?.returns)
+    ? docObj.metadata.returns.filter((r) => r && r.status !== 'restored')
+    : [];
+
+  const returnedSerialSet = new Set();
+  const returnedNonSerialQtyByItem = new Map();
+
+  activeReturns.forEach((r) => {
+    (r.items || []).forEach((ri) => {
+      const isSerial = ri.isSerial === true || !!ri.serialNumber;
+      if (isSerial && ri.serialNumber) {
+        returnedSerialSet.add(String(ri.serialNumber).trim().toLowerCase());
+      } else {
+        const idKey = String(ri.itemId || ri.productId || '').trim();
+        if (idKey) {
+          const retQty = Number(ri.returnedQty ?? ri.quantity ?? 1) || 0;
+          returnedNonSerialQtyByItem.set(idKey, (returnedNonSerialQtyByItem.get(idKey) || 0) + retQty);
+        }
+      }
+    });
+  });
 
   (items || []).forEach((item) => {
     const productId = item.product_id ?? item.productId ?? item.sku ?? item.item_name ?? item.productName ?? 'default';
+    const itemId = item.id || item.itemId || productId;
     const name = item.item_name || item.itemName || item.product_name || item.name || 'Produk';
     let sku = item.sku || '—';
     if (sku.includes('|')) {
       sku = sku.split('|')[0];
     }
-    const itemInfo = getItemQtyInPcs(item, helpers);
+    const itemInfo = resolveDocumentItemQuantity(item, {
+      multipliers: helpers.multipliers,
+      parseSn: helpers.parseSn,
+    });
 
     if (!groupMap.has(productId)) {
       groupMap.set(productId, {
@@ -710,8 +752,13 @@ function getGroupedProductItems(items, customUnits = null) {
         totalPcs: 0,
         totalLusin: 0,
         totalPcsOnly: 0,
+        returnedPcs: 0,
+        returnedLusin: 0,
+        returnedPcsOnly: 0,
         serials: [],
+        returnedSerials: [],
         unitCounts: {},
+        returnedUnitCounts: {},
       });
     }
 
@@ -724,20 +771,106 @@ function getGroupedProductItems(items, customUnits = null) {
       current.totalPcsOnly += itemInfo.pcs;
     }
 
+    // Check return for this item
+    let itemReturnedQty = 0;
     if (itemInfo.isSerial && itemInfo.serialNumber) {
-      current.serials.push(itemInfo.serialNumber);
+      if (returnedSerialSet.has(itemInfo.serialNumber.toLowerCase())) {
+        itemReturnedQty = itemInfo.qty;
+        if (!current.returnedSerials.includes(itemInfo.serialNumber)) {
+          current.returnedSerials.push(itemInfo.serialNumber);
+        }
+      }
+    } else {
+      const retFromId = returnedNonSerialQtyByItem.get(String(itemId)) || returnedNonSerialQtyByItem.get(String(productId)) || 0;
+      if (retFromId > 0) {
+        itemReturnedQty = Math.min(itemInfo.qty, retFromId);
+      }
+    }
+
+    if (itemReturnedQty > 0) {
+      const retMult = helpers.multipliers[itemInfo.unit] || (helpers.isLusin(itemInfo.unit) ? 12 : 1);
+      const retPcs = itemReturnedQty * retMult;
+      current.returnedPcs += retPcs;
+      if (helpers.isLusin(itemInfo.unit)) {
+        current.returnedLusin += retPcs / 12;
+      } else {
+        current.returnedPcsOnly += retPcs;
+      }
+      current.returnedUnitCounts[itemInfo.unit] = (current.returnedUnitCounts[itemInfo.unit] || 0) + itemReturnedQty;
+    }
+
+    if (itemInfo.isSerial && itemInfo.serialNumber) {
+      if (!current.serials.includes(itemInfo.serialNumber)) {
+        current.serials.push(itemInfo.serialNumber);
+      }
+    }
+    if (Array.isArray(item.serials)) {
+      item.serials.forEach((s) => {
+        if (s && !current.serials.includes(s)) current.serials.push(s);
+      });
+    }
+    if (Array.isArray(item.metadata?.serials)) {
+      item.metadata.serials.forEach((s) => {
+        if (s && !current.serials.includes(s)) current.serials.push(s);
+      });
     }
     current.unitCounts[itemInfo.unit] = (current.unitCounts[itemInfo.unit] || 0) + itemInfo.qty;
   });
 
+  // Extract from doc level serials if present
+  const docSerials = docObj?.serials || docObj?.productSerials || docObj?.metadata?.serials || [];
+  if (Array.isArray(docSerials)) {
+    docSerials.forEach((s) => {
+      const sn = typeof s === 'string' ? s : (s.serialNumber || s.serial_number);
+      if (!sn) return;
+      const sProdId = s.productId || s.product_id;
+      const sDocItemId = s.goodsInItemId || s.goods_in_item_id;
+      let matched = null;
+      if (sProdId && groupMap.has(sProdId)) {
+        matched = groupMap.get(sProdId);
+      } else {
+        for (const g of groupMap.values()) {
+          if (g.productId === sProdId || g.productId === sDocItemId || (s.sku && g.sku === s.sku)) {
+            matched = g;
+            break;
+          }
+        }
+      }
+      if (matched) {
+        if (!matched.serials.includes(sn)) {
+          matched.serials.push(sn);
+        }
+        if (returnedSerialSet.has(String(sn).trim().toLowerCase()) && !matched.returnedSerials.includes(sn)) {
+          matched.returnedSerials.push(sn);
+        }
+      }
+    });
+  }
+
   return Array.from(groupMap.values()).map((g) => {
+    g.serials.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+    g.returnedSerials.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
     const unitEntries = Object.entries(g.unitCounts);
     const breakdown = unitEntries.map(([u, q]) => `${q} ${u}`).join(', ');
     const formattedQty = formatDocumentQty(g.totalLusin, g.totalPcsOnly);
+
+    const netLusin = Math.max(0, g.totalLusin - g.returnedLusin);
+    const netPcsOnly = Math.max(0, g.totalPcsOnly - g.returnedPcsOnly);
+    const netFormattedQty = formatDocumentQty(netLusin, netPcsOnly);
+    const returnedFormattedQty = formatDocumentQty(g.returnedLusin, g.returnedPcsOnly);
+    const hasReturns = (g.returnedLusin > 0 || g.returnedPcsOnly > 0 || g.returnedSerials.length > 0);
+    const isFullyReturned = hasReturns && netLusin === 0 && netPcsOnly === 0;
+
     return {
       ...g,
       breakdown,
       formattedQty,
+      netLusin,
+      netPcsOnly,
+      netFormattedQty,
+      returnedFormattedQty,
+      hasReturns,
+      isFullyReturned,
     };
   });
 }
@@ -755,6 +888,7 @@ function getGroupedProductItems(items, customUnits = null) {
  * @param {string|null} params.contactEmail - email kontak tujuan jika ada
  * @param {string|null} params.accentColor - warna aksen dari workspace setting
  * @param {string|null} params.warehouseName - nama gudang asal pengeluaran
+ * @param {Array|null} params.customUnits - custom unit configurations
  * @returns {Promise<{status: 'sent'|'failed', error?: string, messageId?: string, subject: string}>}
  */
 export async function sendGoodsOutEmail({
@@ -770,8 +904,32 @@ export async function sendGoodsOutEmail({
 }) {
   const destination = doc.contact_name || 'Customer';
   const whTag = warehouseName ? ` [${warehouseName}]` : '';
-  const subject = `[Goods Out] - ${doc.document_number} ke ${destination}${whTag}`;
-  const fromAddress = process.env.SMTP_FROM || process.env.SMTP_USER;
+
+  const rawItems = Array.isArray(doc.items) ? doc.items : (doc.metadata?.items || []);
+  const groupedItems = getGroupedProductItems(rawItems, doc, customUnits || doc.metadata?.custom_units);
+  const grandTotalLusin = groupedItems.reduce((sum, g) => sum + (g.totalLusin || 0), 0);
+  const grandTotalPcsOnly = groupedItems.reduce((sum, g) => sum + (g.totalPcsOnly || 0), 0);
+  const totalDocumentFormatted = formatDocumentQty(grandTotalLusin, grandTotalPcsOnly);
+
+  const grandReturnedLusin = groupedItems.reduce((sum, g) => sum + (g.returnedLusin || 0), 0);
+  const grandReturnedPcsOnly = groupedItems.reduce((sum, g) => sum + (g.returnedPcsOnly || 0), 0);
+  const totalReturnedFormatted = formatDocumentQty(grandReturnedLusin, grandReturnedPcsOnly);
+
+  const grandNetLusin = groupedItems.reduce((sum, g) => sum + (g.netLusin || 0), 0);
+  const grandNetPcsOnly = groupedItems.reduce((sum, g) => sum + (g.netPcsOnly || 0), 0);
+  const totalNetFormatted = formatDocumentQty(grandNetLusin, grandNetPcsOnly);
+
+  const activeReturns = Array.isArray(doc.metadata?.returns)
+    ? doc.metadata.returns.filter((r) => r && r.status !== 'restored')
+    : [];
+  const hasReturns = activeReturns.length > 0;
+  const isFullReturn = hasReturns && (grandNetLusin <= 0 && grandNetPcsOnly <= 0);
+
+  const returnSubjectPrefix = isFullReturn
+    ? ' - RETUR TOTAL'
+    : (hasReturns ? ' - RETUR SEBAGIAN' : '');
+  const subject = `[Goods Out${returnSubjectPrefix}] - ${doc.document_number} ke ${destination}${whTag}`;
+  const fromAddress = getSmtpFromAddress();
 
   const recipientEmail = financeEmail || creatorEmail || contactEmail;
 
@@ -829,24 +987,45 @@ export async function sendGoodsOutEmail({
   const cleanAccent = String(accentColor || 'indigo').toLowerCase();
   const colors = PALETTE_COLORS[cleanAccent] || PALETTE_COLORS.indigo;
 
-  const rawItems = Array.isArray(doc.items) ? doc.items : (doc.metadata?.items || []);
-  const groupedItems = getGroupedProductItems(rawItems, customUnits || doc.metadata?.custom_units);
-  const grandTotalLusin = groupedItems.reduce((sum, g) => sum + (g.totalLusin || 0), 0);
-  const grandTotalPcsOnly = groupedItems.reduce((sum, g) => sum + (g.totalPcsOnly || 0), 0);
-  const totalDocumentFormatted = formatDocumentQty(grandTotalLusin, grandTotalPcsOnly);
-
   const itemLines = groupedItems.map((group, index) => {
-    const serialInfo = group.serials.length > 0
-      ? `\n   No. Seri (${group.serials.length}): ${group.serials.join(', ')}`
-      : '';
+    let serialInfo = '';
+    if (group.serials.length > 0) {
+      const serialTokens = group.serials.map((s) => {
+        const isRet = Array.isArray(group.returnedSerials) && group.returnedSerials.includes(s);
+        return isRet ? `${s} [RETUR]` : s;
+      });
+      serialInfo = `\n   No. Seri (${group.serials.length}): ${serialTokens.join(', ')}`;
+    }
     const breakdownInfo = group.breakdown ? ` (${group.breakdown})` : '';
+    if (group.hasReturns) {
+      return `${index + 1}. ${group.name} (SKU: ${group.sku})\n   Qty Awal: ${group.formattedQty}${breakdownInfo} | Diretur: -${group.returnedFormattedQty} | Net: ${group.netFormattedQty}${serialInfo}`;
+    }
     return `${index + 1}. ${group.name} (SKU: ${group.sku}) - ${group.formattedQty}${breakdownInfo}${serialInfo}`;
   }).join('\n');
 
   const issueDateFormatted = doc.issue_date || new Date().toISOString().slice(0, 10);
 
+  const returnHistoryPlainText = hasReturns
+    ? [
+        '',
+        'Riwayat Retur Dokumen Ini:',
+        ...activeReturns.map((r) => {
+          const retNum = r.returnNumber || 'RET-DOKUMEN';
+          const retDate = r.returnedAt || r.date ? new Date(r.returnedAt || r.date).toLocaleDateString('id-ID') : '-';
+          const reason = r.reason ? ` - ${r.reason}` : '';
+          const retItems = (r.items || []).map((it) => `${it.returnedQty || 1} ${it.qtyUnit || 'pcs'} ${it.productName || it.name || ''}`).join(', ');
+          return `- ${retNum} (${retDate})${reason}${retItems ? `: ${retItems}` : ''}`;
+        }),
+      ].join('\n')
+    : '';
+
+  const totalSummaryPlainText = hasReturns
+    ? `Total Awal    : ${totalDocumentFormatted}\nTotal Diretur : -${totalReturnedFormatted}\nNet Terkirim  : ${totalNetFormatted}`
+    : `Total Keseluruhan: ${totalDocumentFormatted}`;
+
   const plainText = [
-    `Catatan Barang Keluar baru telah dibuat oleh ${creatorName ?? 'Petugas'} (${creatorEmail || '-'}).`,
+    hasReturns ? `STATUS PENGIRIMAN: ${isFullReturn ? 'DIRETUR TOTAL' : 'DIRETUR SEBAGIAN'}\n` : '',
+    `Catatan Barang Keluar telah dibuat oleh ${creatorName ?? 'Petugas'} (${creatorEmail || '-'}).`,
     '',
     `No. Referensi : ${doc.document_number}`,
     `Gudang Asal   : ${warehouseName}`,
@@ -858,7 +1037,8 @@ export async function sendGoodsOutEmail({
     'Daftar Barang Keluar:',
     itemLines,
     '',
-    `Total Keseluruhan: ${totalDocumentFormatted}`,
+    totalSummaryPlainText,
+    returnHistoryPlainText,
     '',
     `Lihat Barang Keluar selengkapnya di: ${docLink}`,
     '',
@@ -866,22 +1046,53 @@ export async function sendGoodsOutEmail({
   ].filter(Boolean).join('\n');
 
   const htmlTableRows = groupedItems.map((group) => {
-    const serialSubtitle = group.serials.length > 0
-      ? `<div style="font-size: 11px; color: ${colors.primary}; font-weight: 500; margin-top: 4px; word-break: break-all;">No. Seri (${group.serials.length}): ${group.serials.join(', ')}</div>`
-      : '';
+    let serialSubtitle = '';
+    if (group.serials.length > 0) {
+      const serialTokens = group.serials.map((s) => {
+        const isRet = Array.isArray(group.returnedSerials) && group.returnedSerials.includes(s);
+        if (isRet) {
+          return `<span style="text-decoration: line-through; color: #DC2626;">${escapeEmailHtml(s)}</span> <span style="color: #DC2626; font-size: 9px; font-weight: 700; border: 1px solid #DC2626; padding: 0 2px; border-radius: 2px;">RETUR</span>`;
+        }
+        return `<span>${escapeEmailHtml(s)}</span>`;
+      });
+      serialSubtitle = `<div style="font-size: 11px; color: ${colors.primary}; font-weight: 500; margin-top: 4px; word-break: break-all;">No. Seri (${group.serials.length}): ${serialTokens.join(', ')}</div>`;
+    }
+
     const breakdownSubtitle = group.breakdown
-      ? `<span style="font-size: 11px; color: #6C6C78; font-weight: normal; display: block; margin-top: 2px;">${group.breakdown}</span>`
+      ? `<span style="font-size: 11px; color: #6C6C78; font-weight: normal; display: block; margin-top: 2px;">${escapeEmailHtml(group.breakdown)}</span>`
       : '';
+
+    if (hasReturns) {
+      return `
+        <tr>
+          <td style="padding: 10px 12px; font-size: 13px; color: #0D0D0F; border-bottom: 1px solid #EEEEEF; line-height: 1.4; vertical-align: top;">
+            <div style="font-weight: 600;">${escapeEmailHtml(group.name)}</div>
+            <div style="font-size: 11px; color: #6C6C78; margin-top: 2px;">SKU: ${escapeEmailHtml(group.sku)}</div>
+            ${serialSubtitle}
+          </td>
+          <td align="right" style="padding: 10px 12px; font-size: 13px; font-weight: 600; color: #0D0D0F; border-bottom: 1px solid #EEEEEF; white-space: nowrap; vertical-align: top;">
+            <div>${escapeEmailHtml(group.formattedQty)}</div>
+            ${breakdownSubtitle}
+          </td>
+          <td align="right" style="padding: 10px 12px; font-size: 13px; font-weight: 600; color: #DC2626; border-bottom: 1px solid #EEEEEF; white-space: nowrap; vertical-align: top;">
+            ${group.hasReturns ? `-${escapeEmailHtml(group.returnedFormattedQty)}` : '—'}
+          </td>
+          <td align="right" style="padding: 10px 12px; font-size: 13px; font-weight: 700; color: #16A34A; border-bottom: 1px solid #EEEEEF; white-space: nowrap; vertical-align: top;">
+            ${escapeEmailHtml(group.netFormattedQty)}
+          </td>
+        </tr>
+      `;
+    }
 
     return `
       <tr>
         <td style="padding: 10px 12px; font-size: 13px; color: #0D0D0F; border-bottom: 1px solid #EEEEEF; line-height: 1.4; vertical-align: top;">
-          <div style="font-weight: 600;">${group.name}</div>
-          <div style="font-size: 11px; color: #6C6C78; margin-top: 2px;">SKU: ${group.sku}</div>
+          <div style="font-weight: 600;">${escapeEmailHtml(group.name)}</div>
+          <div style="font-size: 11px; color: #6C6C78; margin-top: 2px;">SKU: ${escapeEmailHtml(group.sku)}</div>
           ${serialSubtitle}
         </td>
         <td align="right" style="padding: 10px 12px; font-size: 13px; font-weight: 600; color: #0D0D0F; border-bottom: 1px solid #EEEEEF; white-space: nowrap; vertical-align: top;">
-          <div>${group.formattedQty}</div>
+          <div>${escapeEmailHtml(group.formattedQty)}</div>
           ${breakdownSubtitle}
         </td>
       </tr>
@@ -889,29 +1100,89 @@ export async function sendGoodsOutEmail({
   }).join('');
 
   const htmlItemsTable = `
-    <table border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse: collapse; margin-top: 24px; margin-bottom: 32px; border: 1px solid #E4E4E9; border-radius: 8px; overflow: hidden;">
+    <table border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse: collapse; margin-top: 24px; margin-bottom: 24px; border: 1px solid #E4E4E9; border-radius: 8px; overflow: hidden;">
       <thead>
         <tr style="background-color: #F8F9FA; border-bottom: 1px solid #E4E4E9;">
           <th align="left" style="padding: 8px 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #6C6C78;">Item</th>
-          <th align="right" style="padding: 8px 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #6C6C78;">Jumlah</th>
+          ${hasReturns ? `
+            <th align="right" style="padding: 8px 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #6C6C78;">Qty Awal</th>
+            <th align="right" style="padding: 8px 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #DC2626;">Diretur</th>
+            <th align="right" style="padding: 8px 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #16A34A;">Net Terkirim</th>
+          ` : `
+            <th align="right" style="padding: 8px 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #6C6C78;">Jumlah</th>
+          `}
         </tr>
       </thead>
       <tbody>
         ${htmlTableRows}
       </tbody>
       <tfoot>
-        <tr style="background-color: #F8F9FA; border-top: 2px solid #E4E4E9;">
-          <td style="padding: 10px 12px; font-size: 13px; font-weight: 700; color: #0D0D0F;">Total Keseluruhan</td>
-          <td align="right" style="padding: 10px 12px; font-size: 13px; font-weight: 700; color: ${colors.primary}; white-space: nowrap;">${totalDocumentFormatted}</td>
-        </tr>
+        ${hasReturns ? `
+          <tr style="background-color: #F8F9FA; border-top: 2px solid #E4E4E9;">
+            <td style="padding: 10px 12px; font-size: 13px; font-weight: 700; color: #0D0D0F;">Total</td>
+            <td align="right" style="padding: 10px 12px; font-size: 13px; font-weight: 600; color: #0D0D0F; white-space: nowrap;">${escapeEmailHtml(totalDocumentFormatted)}</td>
+            <td align="right" style="padding: 10px 12px; font-size: 13px; font-weight: 600; color: #DC2626; white-space: nowrap;">-${escapeEmailHtml(totalReturnedFormatted)}</td>
+            <td align="right" style="padding: 10px 12px; font-size: 13px; font-weight: 700; color: #16A34A; white-space: nowrap;">${escapeEmailHtml(totalNetFormatted)}</td>
+          </tr>
+        ` : `
+          <tr style="background-color: #F8F9FA; border-top: 2px solid #E4E4E9;">
+            <td style="padding: 10px 12px; font-size: 13px; font-weight: 700; color: #0D0D0F;">Total Keseluruhan</td>
+            <td align="right" style="padding: 10px 12px; font-size: 13px; font-weight: 700; color: ${colors.primary}; white-space: nowrap;">${escapeEmailHtml(totalDocumentFormatted)}</td>
+          </tr>
+        `}
       </tfoot>
     </table>
   `;
 
+  let returnHistoryHtml = '';
+  if (hasReturns) {
+    const returnItemsList = activeReturns.map((r) => {
+      const retNum = r.returnNumber || 'RET-DOKUMEN';
+      const retDate = r.returnedAt || r.date ? new Date(r.returnedAt || r.date).toLocaleDateString('id-ID', { day: 'numeric', month: 'short', year: 'numeric' }) : '-';
+      const reason = r.reason ? ` - Alasan: <em>${escapeEmailHtml(r.reason)}</em>` : '';
+      const notes = r.notes ? ` (${escapeEmailHtml(r.notes)})` : '';
+      const itemsList = (r.items || []).map((it) => `${escapeEmailHtml(it.returnedQty || 1)} ${escapeEmailHtml(it.qtyUnit || 'pcs')} ${escapeEmailHtml(it.productName || it.name || '')}`).join(', ');
+      return `
+        <li style="margin-bottom: 6px;">
+          <strong>${escapeEmailHtml(retNum)}</strong> (${retDate})${reason}${notes}
+          ${itemsList ? `<div style="font-size: 12px; color: #92400E; margin-top: 2px;">Barang: ${itemsList}</div>` : ''}
+        </li>
+      `;
+    }).join('');
+
+    returnHistoryHtml = `
+      <div style="background-color: #FFFBEB; border: 1px solid #FDE68A; border-radius: 8px; padding: 16px; margin-bottom: 24px;">
+        <div style="font-size: 13px; font-weight: 700; color: #92400E; margin-bottom: 8px;">
+          RIWAYAT RETUR PENGIRIMAN:
+        </div>
+        <ul style="margin: 0; padding-left: 20px; font-size: 12px; color: #78350F; line-height: 1.5;">
+          ${returnItemsList}
+        </ul>
+      </div>
+    `;
+  }
+
+  let returnBannerHtml = '';
+  if (isFullReturn) {
+    returnBannerHtml = `
+      <div style="background-color: #FEF2F2; border: 1px solid #F87171; border-radius: 8px; padding: 12px 16px; margin-bottom: 20px;">
+        <strong style="color: #991B1B; font-size: 13px;">⚠️ STATUS DOKUMEN: DIRETUR TOTAL</strong>
+        <div style="color: #B91C1C; font-size: 12px; margin-top: 2px;">Seluruh barang pada pengeluaran ini telah berhasil diretur kembali ke inventori.</div>
+      </div>
+    `;
+  } else if (hasReturns) {
+    returnBannerHtml = `
+      <div style="background-color: #FFFBEB; border: 1px solid #FBBF24; border-radius: 8px; padding: 12px 16px; margin-bottom: 20px;">
+        <strong style="color: #92400E; font-size: 13px;">⚠️ STATUS DOKUMEN: DIRETUR SEBAGIAN</strong>
+        <div style="color: #B45309; font-size: 12px; margin-top: 2px;">Terdapat barang yang telah diretur pada pengeluaran ini. Silakan periksa rincian net terkirim di bawah.</div>
+      </div>
+    `;
+  }
+
   const notesRowHtml = doc.notes ? `
     <tr>
       <td width="30%" valign="top" style="font-size: 13px; font-weight: 500; color: #6C6C78;">Catatan</td>
-      <td width="70%" valign="top" style="font-size: 13px; color: #0D0D0F;">${doc.notes}</td>
+      <td width="70%" valign="top" style="font-size: 13px; color: #0D0D0F;">${escapeEmailHtml(doc.notes)}</td>
     </tr>
   ` : '';
 
@@ -931,7 +1202,7 @@ export async function sendGoodsOutEmail({
           
           <!-- Decorative Header Accent -->
           <tr>
-            <td height="6" style="background-color: ${colors.primary};"></td>
+            <td height="6" style="background-color: ${isFullReturn ? '#DC2626' : (hasReturns ? '#D97706' : colors.primary)};"></td>
           </tr>
           
           <tr>
@@ -943,14 +1214,22 @@ export async function sendGoodsOutEmail({
                     <span style="font-size: 20px; font-weight: 700; color: #0D0D0F; letter-spacing: -0.02em;">Docuflow</span>
                   </td>
                   <td align="right">
-                    <span style="display: inline-block; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; background-color: ${colors.light}; color: ${colors.primary}; padding: 6px 12px; border-radius: 9999px;">Barang Keluar</span>
+                    ${isFullReturn ? `
+                      <span style="display: inline-block; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; background-color: #FEF2F2; color: #DC2626; border: 1px solid #F87171; padding: 6px 12px; border-radius: 9999px;">Diretur Total</span>
+                    ` : (hasReturns ? `
+                      <span style="display: inline-block; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; background-color: #FFFBEB; color: #D97706; border: 1px solid #FBBF24; padding: 6px 12px; border-radius: 9999px;">Diretur Sebagian</span>
+                    ` : `
+                      <span style="display: inline-block; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; background-color: ${colors.light}; color: ${colors.primary}; padding: 6px 12px; border-radius: 9999px;">Barang Keluar</span>
+                    `)}
                   </td>
                 </tr>
               </table>
 
+              ${returnBannerHtml}
+
               <!-- Greeting & Subject -->
               <h1 style="margin: 0 0 16px 0; font-size: 22px; font-weight: 600; color: #0D0D0F; letter-spacing: -0.02em; line-height: 1.3;">
-                Bukti Pengeluaran Barang Baru
+                ${isFullReturn ? 'Bukti Pengeluaran Barang (Diretur Total)' : (hasReturns ? 'Bukti Pengeluaran Barang (Diretur Sebagian)' : 'Bukti Pengeluaran Barang')}
               </h1>
               
               <p style="margin: 0 0 24px 0; font-size: 14px; line-height: 1.6; color: #6C6C78;">
@@ -958,7 +1237,7 @@ export async function sendGoodsOutEmail({
               </p>
               
               <p style="margin: 0 0 24px 0; font-size: 14px; line-height: 1.6; color: #0D0D0F;">
-                Catatan Barang Keluar (Goods Out) baru telah dibuat oleh <strong>${creatorName ?? 'Petugas'}</strong>${creatorEmail ? ` (<a href="mailto:${creatorEmail}" style="color: ${colors.primary}; text-decoration: none;">${creatorEmail}</a>)` : ''} dengan rincian berikut:
+                Catatan Barang Keluar (Goods Out) untuk referensi <strong>${escapeEmailHtml(doc.document_number)}</strong> dibuat oleh <strong>${escapeEmailHtml(creatorName ?? 'Petugas')}</strong>${creatorEmail ? ` (<a href="mailto:${creatorEmail}" style="color: ${colors.primary}; text-decoration: none;">${escapeEmailHtml(creatorEmail)}</a>)` : ''} dengan rincian berikut:
               </p>
 
               <!-- Document Details Box -->
@@ -968,19 +1247,19 @@ export async function sendGoodsOutEmail({
                     <table border="0" cellpadding="0" cellspacing="0" width="100%">
                       <tr>
                         <td width="30%" valign="top" style="padding-bottom: 12px; font-size: 13px; font-weight: 500; color: #6C6C78;">No. Referensi</td>
-                        <td width="70%" valign="top" style="padding-bottom: 12px; font-size: 13px; font-weight: 600; color: #0D0D0F;">${doc.document_number}</td>
+                        <td width="70%" valign="top" style="padding-bottom: 12px; font-size: 13px; font-weight: 600; color: #0D0D0F;">${escapeEmailHtml(doc.document_number)}</td>
                       </tr>
                       <tr>
                         <td width="30%" valign="top" style="padding-bottom: 12px; font-size: 13px; font-weight: 500; color: #6C6C78;">Gudang Asal</td>
-                        <td width="70%" valign="top" style="padding-bottom: 12px; font-size: 13px; font-weight: 600; color: #0D0D0F;">${warehouseName}</td>
+                        <td width="70%" valign="top" style="padding-bottom: 12px; font-size: 13px; font-weight: 600; color: #0D0D0F;">${escapeEmailHtml(warehouseName)}</td>
                       </tr>
                       <tr>
                         <td width="30%" valign="top" style="padding-bottom: 12px; font-size: 13px; font-weight: 500; color: #6C6C78;">Tanggal</td>
-                        <td width="70%" valign="top" style="padding-bottom: 12px; font-size: 13px; color: #0D0D0F;">${issueDateFormatted}</td>
+                        <td width="70%" valign="top" style="padding-bottom: 12px; font-size: 13px; color: #0D0D0F;">${escapeEmailHtml(issueDateFormatted)}</td>
                       </tr>
                       <tr>
                         <td width="30%" valign="top" style="padding-bottom: ${doc.notes ? '12px' : '0'}; font-size: 13px; font-weight: 500; color: #6C6C78;">Tujuan / Penerima</td>
-                        <td width="70%" valign="top" style="padding-bottom: ${doc.notes ? '12px' : '0'}; font-size: 13px; color: #0D0D0F; font-weight: 600;">${destination}</td>
+                        <td width="70%" valign="top" style="padding-bottom: ${doc.notes ? '12px' : '0'}; font-size: 13px; color: #0D0D0F; font-weight: 600;">${escapeEmailHtml(destination)}</td>
                       </tr>
                       ${notesRowHtml}
                     </table>
@@ -990,6 +1269,9 @@ export async function sendGoodsOutEmail({
 
               <!-- Document Items Table -->
               ${htmlItemsTable}
+
+              <!-- Return History Box if any -->
+              ${returnHistoryHtml}
 
               <!-- Call to Action Button -->
               <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 32px;">
@@ -1096,7 +1378,7 @@ export async function sendGoodsInEmail({
   const vendorName = doc.contact_name || doc.contactName || 'Vendor';
   const whTag = warehouseName ? ` [${warehouseName}]` : '';
   const subject = `[Goods In] - ${doc.document_number} dari ${vendorName}${whTag}`;
-  const fromAddress = process.env.SMTP_FROM || process.env.SMTP_USER;
+  const fromAddress = getSmtpFromAddress();
 
   const recipientEmail = financeEmail || creatorEmail;
 
@@ -1381,6 +1663,726 @@ export async function sendGoodsInEmail({
         error_message: errorMessage,
       });
     } catch (_) {}
+    return { status: 'failed', error: errorMessage, subject };
+  }
+}
+
+// ============================================================================
+// EMAIL NOTIFIKASI RETUR
+// ============================================================================
+
+const RETURN_REASON_LABELS = {
+  salah_produk: 'Salah Produk',
+  cacat_produk: 'Cacat / Rusak',
+  batal_beli: 'Batal Beli / Gak Jadi',
+  cacat_supplier: 'Cacat / Rusak Supplier',
+  salah_kirim: 'Salah Kirim Supplier',
+  batal_masuk: 'Batal Masuk Gudang',
+  lainnya: 'Lainnya',
+};
+
+function escapeEmailHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatReturnDateTime(value) {
+  const date = value ? new Date(value) : new Date();
+  if (Number.isNaN(date.getTime())) return String(value || '-');
+  return `${date.toLocaleString('id-ID', {
+    timeZone: 'Asia/Jakarta',
+    day: '2-digit',
+    month: 'long',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  })} WIB`;
+}
+
+function getReturnDocumentLabel(documentType) {
+  return documentType === 'goods_in' ? 'Barang Masuk' : 'Barang Keluar';
+}
+
+function resolveReturnItems(returnRecord, doc) {
+  const docItems = Array.isArray(doc?.items) ? doc.items : [];
+  const items = Array.isArray(returnRecord?.items) ? returnRecord.items : [];
+
+  const rawList = items.map((item) => {
+    const matchedDocItem =
+      docItems.find((di) => item.itemId && di.id === item.itemId) ||
+      docItems.find((di) => item.productId && (di.product_id ?? di.productId) === item.productId) ||
+      docItems.find(
+        (di) =>
+          item.serialNumber &&
+          di.metadata?.isSerial === true &&
+          String(di.metadata?.serialNumber || '').trim().toLowerCase() ===
+            String(item.serialNumber).trim().toLowerCase()
+      ) ||
+      null;
+
+    const returnedQty = Number(item.returnedQty || 1) || 1;
+    const qtyUnit = item.qtyUnit || matchedDocItem?.metadata?.qtyUnit || 'pcs';
+    const baseQty = Number(item.baseQuantityPcs || 0);
+    const condition = item.condition || item.targetStatus || 'available';
+    const serialNumber = item.serialNumber ? String(item.serialNumber).trim() : null;
+    const serialNumbers = Array.isArray(item.serialNumbers)
+      ? item.serialNumbers.map((s) => String(s).trim()).filter(Boolean)
+      : (serialNumber ? [serialNumber] : []);
+
+    return {
+      name: item.productName || matchedDocItem?.item_name || 'Barang',
+      sku: item.sku || matchedDocItem?.sku || '',
+      productId: item.productId || matchedDocItem?.product_id || matchedDocItem?.productId || '',
+      qty: returnedQty,
+      unit: qtyUnit,
+      baseQty: Number.isFinite(baseQty) ? baseQty : 0,
+      serialNumber,
+      serialNumbers,
+      condition,
+      isSerial: Boolean(item.isSerial) || Boolean(serialNumber) || serialNumbers.length > 0,
+    };
+  });
+
+  const grouped = [];
+  const map = new Map();
+
+  rawList.forEach((item) => {
+    const key = `${item.productId || item.name}::${item.sku}::${item.unit}::${item.condition}`;
+    if (!map.has(key)) {
+      const copy = { ...item, serialNumbers: [...item.serialNumbers] };
+      map.set(key, copy);
+      grouped.push(copy);
+    } else {
+      const existing = map.get(key);
+      existing.qty += item.qty;
+      existing.baseQty += item.baseQty;
+      item.serialNumbers.forEach((sn) => {
+        if (!existing.serialNumbers.includes(sn)) {
+          existing.serialNumbers.push(sn);
+        }
+      });
+      if (existing.serialNumbers.length === 1) {
+        existing.serialNumber = existing.serialNumbers[0];
+      } else if (existing.serialNumbers.length > 1) {
+        existing.serialNumber = null;
+      }
+    }
+  });
+
+  return grouped;
+}
+
+function isMissingEmailLogColumn(error) {
+  const message = error?.message || '';
+  return (
+    error?.code === '42703' ||
+    error?.code === 'PGRST204' ||
+    /column .* does not exist/i.test(message) ||
+    /could not find the .*column/i.test(message)
+  );
+}
+
+// Lease harus lebih panjang dari total waktu SMTP internal (3 percobaan +
+// backoff + timeout socket). 10 menit memberi ruang aman di serverless.
+const PENDING_EMAIL_LEASE_MS = 10 * 60 * 1000;
+const UNCERTAIN_PENDING_MESSAGE =
+  'Status pengiriman tidak pasti: worker berhenti setelah email diklaim. Email mungkin sudah terkirim. Periksa kotak masuk/outbox sebelum mengirim ulang secara manual.';
+
+function isStalePendingLog(log, hasLeaseColumns) {
+  if (!hasLeaseColumns || !log?.last_attempt_at) return false;
+  const startedAt = Date.parse(log.last_attempt_at);
+  if (!Number.isFinite(startedAt)) return false;
+  return Date.now() - startedAt >= PENDING_EMAIL_LEASE_MS;
+}
+
+async function selectReturnEmailLog({ documentId, returnId, existingLogId = null }) {
+  const buildQuery = (columns) => {
+    let query = supabaseAdmin.from('email_logs').select(columns);
+    if (existingLogId) {
+      query = query.eq('id', existingLogId);
+    } else {
+      query = query
+        .eq('document_id', documentId)
+        .eq('return_id', returnId)
+        .eq('email_type', 'return');
+    }
+    return query.maybeSingle();
+  };
+
+  const withLease = await buildQuery('id, status, last_attempt_at, created_at');
+  if (!withLease.error) return { ...withLease, hasLeaseColumns: true };
+
+  if (!isMissingEmailLogColumn(withLease.error)) return { ...withLease, hasLeaseColumns: false };
+
+  // Migration 021 belum dijalankan: tetap bisa kirim, tetapi recovery log
+  // pending tidak diaktifkan agar tidak ada klaim palsu terhadap worker lain.
+  const withoutLease = await buildQuery('id, status, created_at');
+  if (!withoutLease.error) return { ...withoutLease, hasLeaseColumns: false };
+
+  if (isMissingEmailLogColumn(withoutLease.error)) {
+    throw new Error(
+      'Migration 020_return_email_logs.sql belum dijalankan (kolom return_id/email_type belum ada).'
+    );
+  }
+  throw withoutLease.error;
+}
+
+async function markStalePendingAsUncertain(logId) {
+  const { data, error } = await supabaseAdmin
+    .from('email_logs')
+    .update({ status: 'uncertain', error_message: UNCERTAIN_PENDING_MESSAGE })
+    .eq('id', logId)
+    .eq('status', 'pending')
+    .select('id')
+    .maybeSingle();
+  if (error) throw error;
+  return Boolean(data?.id);
+}
+
+async function claimKnownReturnEmailLog(log, { manualRetry, hasLeaseColumns }) {
+  if (!log?.id) return { skipped: true, reason: 'log_not_found' };
+
+  if (log.status === 'sent') return { skipped: true, reason: 'already_sent' };
+
+  if (log.status === 'pending') {
+    if (isStalePendingLog(log, hasLeaseColumns)) {
+      const marked = await markStalePendingAsUncertain(log.id);
+      return {
+        skipped: true,
+        reason: marked ? 'stale_pending_marked_uncertain' : 'pending_claim_race',
+      };
+    }
+    return { skipped: true, reason: 'in_progress' };
+  }
+
+  const canClaimFailed = log.status === 'failed';
+  const canClaimUncertain = manualRetry && log.status === 'uncertain';
+  if (!canClaimFailed && !canClaimUncertain) {
+    return { skipped: true, reason: 'not_retryable' };
+  }
+
+  const claimPatch = {
+    status: 'pending',
+    error_message: null,
+    ...(hasLeaseColumns ? { last_attempt_at: new Date().toISOString() } : {}),
+  };
+  const { data, error } = await supabaseAdmin
+    .from('email_logs')
+    .update(claimPatch)
+    .eq('id', log.id)
+    .eq('status', log.status)
+    .select('id')
+    .maybeSingle();
+  if (error) throw error;
+  return data?.id ? { logId: data.id } : { skipped: true, reason: 'claim_lost' };
+}
+
+async function insertReturnEmailLog(fullBaseLog) {
+  const nowIso = new Date().toISOString();
+  const insertWithLease = () =>
+    supabaseAdmin
+      .from('email_logs')
+      .insert({ ...fullBaseLog, status: 'pending', last_attempt_at: nowIso })
+      .select('id')
+      .single();
+
+  let { data, error } = await insertWithLease();
+  if (!error) return { logId: data?.id ?? null, hasLeaseColumns: true, error: null };
+
+  // Migration 021 belum jalan: email tetap boleh dikirim, hanya lease yang
+  // tidak tersedia. Jangan fallback untuk kolom retur yang hilang (020).
+  if (isMissingEmailLogColumn(error) && /last_attempt_at/i.test(error?.message || '')) {
+    ({ data, error } = await supabaseAdmin
+      .from('email_logs')
+      .insert({ ...fullBaseLog, status: 'pending' })
+      .select('id')
+      .single());
+    if (!error) return { logId: data?.id ?? null, hasLeaseColumns: false, error: null };
+  }
+
+  return { logId: null, hasLeaseColumns: false, error };
+}
+
+/**
+ * Klaim idempoten satu baris email_logs per retur.
+ * - Return yang sudah punya log `sent` tidak akan dikirim ulang.
+ * - Log `pending` yang masih dalam lease dilewati (worker lain sedang kirim).
+ * - Log `pending` yang lease-nya kedaluwarsa ditandai `uncertain`, TIDAK
+ *   dikirim ulang otomatis karena email bisa saja sudah sampai ke penerima.
+ * - Log `failed` boleh diklaim ulang oleh retry worker.
+ * - Log `uncertain` hanya boleh diklaim lewat aksi manual (manualRetry).
+ */
+async function claimReturnEmailLog({
+  fullBaseLog,
+  documentId,
+  returnId,
+  subject,
+  existingLogId = null,
+  manualRetry = false,
+}) {
+  if (existingLogId) {
+    const current = await selectReturnEmailLog({ documentId, returnId, existingLogId });
+    if (current.data) {
+      return claimKnownReturnEmailLog(current.data, {
+        manualRetry,
+        hasLeaseColumns: current.hasLeaseColumns,
+      });
+    }
+  }
+
+  if (returnId) {
+    const current = await selectReturnEmailLog({ documentId, returnId });
+    if (current.data) {
+      return claimKnownReturnEmailLog(current.data, {
+        manualRetry,
+        hasLeaseColumns: current.hasLeaseColumns,
+      });
+    }
+  } else {
+    const { data: sentLog, error } = await supabaseAdmin
+      .from('email_logs')
+      .select('id')
+      .eq('document_id', documentId)
+      .eq('subject', subject)
+      .eq('status', 'sent')
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    if (sentLog?.id) return { skipped: true, reason: 'already_sent' };
+  }
+
+  const inserted = await insertReturnEmailLog(fullBaseLog);
+  if (!inserted.error) return { logId: inserted.logId };
+
+  if (inserted.error.code === '23505' && returnId) {
+    const current = await selectReturnEmailLog({ documentId, returnId });
+    if (current.data) {
+      return claimKnownReturnEmailLog(current.data, {
+        manualRetry,
+        hasLeaseColumns: current.hasLeaseColumns,
+      });
+    }
+  }
+
+  if (isMissingEmailLogColumn(inserted.error)) {
+    throw new Error('Migration 020_return_email_logs.sql belum dijalankan (kolom return_id/email_type belum ada).');
+  }
+  throw inserted.error;
+}
+
+/**
+ * Pulihkan log retur `pending` yang lease-nya sudah kedaluwarsa.
+ * Sengaja hanya menandai `uncertain`, bukan `failed` atau mengirim ulang:
+ * SMTP tidak punya idempotency key, jadi email bisa sudah terkirim sebelum
+ * worker mati. Retry otomatis pada kondisi ini berisiko mengirim duplikat.
+ *
+ * @returns {Promise<{supported:boolean, scanned:number, recovered:number}>}
+ */
+export async function recoverStalePendingReturnEmails({ limit = 3 } = {}) {
+  const staleBefore = new Date(Date.now() - PENDING_EMAIL_LEASE_MS).toISOString();
+  const { data, error } = await supabaseAdmin
+    .from('email_logs')
+    .select('id')
+    .eq('status', 'pending')
+    .eq('email_type', 'return')
+    .not('return_id', 'is', null)
+    .lt('last_attempt_at', staleBefore)
+    .limit(limit);
+
+  if (error) {
+    if (isMissingEmailLogColumn(error)) return { supported: false, scanned: 0, recovered: 0 };
+    throw error;
+  }
+
+  let recovered = 0;
+  for (const row of data || []) {
+    const { data: updated, error: updateError } = await supabaseAdmin
+      .from('email_logs')
+      .update({ status: 'uncertain', error_message: UNCERTAIN_PENDING_MESSAGE })
+      .eq('id', row.id)
+      .eq('status', 'pending')
+      .select('id')
+      .maybeSingle();
+    if (updateError) {
+      if (isMissingEmailLogColumn(updateError)) return { supported: false, scanned: data.length, recovered };
+      throw updateError;
+    }
+    if (updated?.id) recovered += 1;
+  }
+
+  return { supported: true, scanned: (data || []).length, recovered };
+}
+
+async function updateReturnEmailLog(logId, patch) {
+  if (!logId) return;
+  const { error } = await supabaseAdmin.from('email_logs').update(patch).eq('id', logId);
+  if (error) {
+    console.error('[Return Email] Failed to update email_logs:', error.message);
+  }
+}
+
+/**
+ * Kirim notifikasi retur (Goods In / Goods Out) ke penerima yang sudah
+ * dikonfigurasi, lengkap dengan lampiran PDF retur format rangkap.
+ *
+ * @param {Object} params
+ * @param {Object} params.doc - Dokumen asal (id, document_number, document_type, contact_name, items)
+ * @param {Object} params.returnRecord - Record retur dari documents.metadata.returns
+ * @param {string} params.returnNumber - Nomor retur yang ditampilkan ke pengguna
+ * @param {string} params.creatorEmail - Email petugas yang memproses retur
+ * @param {string} params.creatorName - Nama petugas yang memproses retur
+ * @param {string} params.financeEmail - Email finance/owner/gudang dari konfigurasi workspace
+ * @param {string} [params.accentColor]
+ * @param {string} [params.warehouseName]
+ * @param {Object} [params.companySettings] - Settings workspace untuk header PDF
+ * @param {Object} [params.contactData] - Data kontak asal untuk header PDF
+ * @param {string} [params.existingLogId] - Dipakai retry worker agar baris log yang sama di-update
+ * @param {boolean} [params.manualRetry] - Izinkan klaim ulang log `uncertain` (aksi manual)
+ * @returns {Promise<{status:'sent'|'failed'|'skipped', error?:string, messageId?:string, subject:string}>}
+ */
+export async function sendReturnEmail({
+  doc,
+  returnRecord,
+  returnNumber,
+  creatorEmail,
+  creatorName,
+  financeEmail,
+  accentColor,
+  warehouseName = 'Gudang Utama',
+  companySettings = {},
+  contactData = {},
+  existingLogId = null,
+  manualRetry = false,
+}) {
+  const documentLabel = getReturnDocumentLabel(doc?.document_type);
+  const destination = doc?.contact_name || '—';
+  const resolvedReturnNumber =
+    returnNumber || returnRecord?.returnNumber || `RET-${doc?.document_number || 'DOKUMEN'}`;
+  const whTag = warehouseName ? ` [${warehouseName}]` : '';
+  const subject = `[Return] - ${resolvedReturnNumber} - ${doc?.document_number || '-'}${whTag}`;
+  const fromAddress = getSmtpFromAddress();
+  const recipientEmail = financeEmail || creatorEmail;
+
+  const ccSet = new Set();
+  if (creatorEmail && recipientEmail && creatorEmail.toLowerCase() !== recipientEmail.toLowerCase()) {
+    ccSet.add(creatorEmail);
+  }
+  const ccArray = Array.from(ccSet);
+
+  const fullBaseLog = {
+    sender_email: fromAddress || 'no-reply@docuflow.app',
+    recipient_email: recipientEmail || null,
+    cc_email: ccArray.length > 0 ? ccArray.join(', ') : null,
+    subject,
+    document_id: doc?.id || null,
+    return_id: returnRecord?.id || null,
+    email_type: 'return',
+  };
+
+  let claim;
+  try {
+    claim = await claimReturnEmailLog({
+      fullBaseLog,
+      documentId: doc?.id || null,
+      returnId: returnRecord?.id || null,
+      subject,
+      existingLogId,
+      manualRetry,
+    });
+  } catch (claimError) {
+    console.error('[Return Email] Failed to claim email_logs:', claimError?.message ?? claimError);
+    return {
+      status: 'failed',
+      error: claimError?.message ?? 'Gagal menyiapkan log email retur.',
+      subject,
+    };
+  }
+
+  if (claim.skipped) {
+    return {
+      status: 'skipped',
+      reason: claim.reason || 'already_sent_or_in_progress',
+      subject,
+    };
+  }
+
+  const logId = claim.logId || null;
+
+  if (!isValidEmail(recipientEmail)) {
+    const errorMessage = 'Recipient email is empty or invalid.';
+    await updateReturnEmailLog(logId, { status: 'failed', error_message: errorMessage });
+    return { status: 'failed', error: errorMessage, subject };
+  }
+
+  const transporter = getTransporter();
+  if (!transporter) {
+    const errorMessage = 'SMTP credentials not configured (SMTP_HOST/SMTP_USER/SMTP_PASS missing).';
+    await updateReturnEmailLog(logId, { status: 'failed', error_message: errorMessage });
+    return { status: 'failed', error: errorMessage, subject };
+  }
+
+  let pdfBuffer;
+  try {
+    pdfBuffer = generateReturnPdfCompact(
+      {
+        ...(returnRecord || {}),
+        documentNumber: doc?.document_number || returnRecord?.documentNumber || '-',
+        documentType: doc?.document_type || returnRecord?.documentType || returnRecord?.document_type,
+        contactName: doc?.contact_name || returnRecord?.contactName,
+        warehouseName,
+      },
+      companySettings || {},
+      contactData || {},
+      doc || {}
+    );
+  } catch (pdfError) {
+    const errorMessage = `Gagal membuat PDF retur: ${pdfError?.message || String(pdfError)}`;
+    await updateReturnEmailLog(logId, { status: 'failed', error_message: errorMessage });
+    return { status: 'failed', error: errorMessage, subject };
+  }
+
+  const rawFrontendUrl =
+    process.env.FRONTEND_URL ||
+    (process.env.FRONTEND_ORIGIN ? process.env.FRONTEND_ORIGIN.split(',')[0] : 'http://localhost:5173');
+  const cleanFrontendUrl = rawFrontendUrl.replace(/\/+$/, '');
+  const docLink = `${cleanFrontendUrl}/returns`;
+
+  const cleanAccent = String(accentColor || 'indigo').toLowerCase();
+  const colors = PALETTE_COLORS[cleanAccent] || PALETTE_COLORS.indigo;
+
+  const returnDate = formatReturnDateTime(returnRecord?.returnedAt || returnRecord?.date);
+  const reason = RETURN_REASON_LABELS[returnRecord?.reason] || returnRecord?.reason || '-';
+  const notes = returnRecord?.notes || null;
+  const items = resolveReturnItems(returnRecord, doc);
+  const conditionLabel = (condition) => (condition === 'damaged' ? 'Rusak' : 'Baik');
+
+  const itemLines = items.map((item, index) => {
+    let serialInfo = '';
+    if (item.serialNumbers && item.serialNumbers.length > 1) {
+      serialInfo = ` | No. Seri (${item.serialNumbers.length}): ${item.serialNumbers.join(', ')}`;
+    } else if (item.serialNumber || (item.serialNumbers && item.serialNumbers.length === 1)) {
+      serialInfo = ` | No. Seri: ${item.serialNumber || item.serialNumbers[0]}`;
+    }
+    const baseInfo = item.baseQty > 0 && item.baseQty !== item.qty ? ` (${item.baseQty} pcs)` : '';
+    const skuInfo = item.sku ? ` | SKU: ${item.sku}` : '';
+    return `${index + 1}. ${item.name}${skuInfo} - ${item.qty} ${item.unit}${baseInfo} | Kondisi: ${conditionLabel(item.condition)}${serialInfo}`;
+  });
+
+  const plainText = [
+    `Notifikasi retur ${documentLabel} telah diproses.`,
+    '',
+    `No. Retur       : ${resolvedReturnNumber}`,
+    `Dokumen Asal    : ${doc?.document_number || '-'} (${documentLabel})`,
+    `Tanggal / Waktu : ${returnDate}`,
+    `Gudang          : ${warehouseName || '-'}`,
+    `Petugas         : ${creatorName || 'Petugas'}${creatorEmail ? ` (${creatorEmail})` : ''}`,
+    doc?.contact_name ? `Pihak Terkait   : ${destination}` : '',
+    `Alasan          : ${reason}`,
+    notes ? `Catatan         : ${notes}` : '',
+    '',
+    'Barang yang diretur:',
+    itemLines.length > 0 ? itemLines.join('\n') : '-',
+    '',
+    `Total jenis item: ${items.length}`,
+    '',
+    'Terlampir dokumen PDF Bukti Retur (format rangkap 21 x 12 cm).',
+    '',
+    `Lihat daftar retur di: ${docLink}`,
+    '',
+    'Email ini dikirim otomatis oleh DocuFlow.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const itemRowsHtml = items
+    .map((item) => {
+      let serialHtml = '';
+      if (item.serialNumbers && item.serialNumbers.length > 1) {
+        serialHtml = `<div style="font-size: 11px; color: ${colors.primary}; margin-top: 4px; word-break: break-all;">No. Seri (${item.serialNumbers.length}): ${escapeEmailHtml(item.serialNumbers.join(', '))}</div>`;
+      } else if (item.serialNumber || (item.serialNumbers && item.serialNumbers.length === 1)) {
+        serialHtml = `<div style="font-size: 11px; color: ${colors.primary}; margin-top: 4px; word-break: break-all;">No. Seri: ${escapeEmailHtml(item.serialNumber || item.serialNumbers[0])}</div>`;
+      }
+      const baseHtml =
+        item.baseQty > 0 && item.baseQty !== item.qty
+          ? `<div style="font-size: 11px; color: #6C6C78; margin-top: 2px;">${escapeEmailHtml(item.baseQty)} pcs</div>`
+          : '';
+      return `
+        <tr>
+          <td style="padding: 10px 12px; font-size: 13px; color: #0D0D0F; border-bottom: 1px solid #EEEEEF; vertical-align: top;">
+            <div style="font-weight: 600;">${escapeEmailHtml(item.name)}</div>
+            ${item.sku ? `<div style="font-size: 11px; color: #6C6C78; margin-top: 2px;">SKU: ${escapeEmailHtml(item.sku)}</div>` : ''}
+            ${serialHtml}
+          </td>
+          <td align="right" style="padding: 10px 12px; font-size: 13px; font-weight: 600; color: #0D0D0F; border-bottom: 1px solid #EEEEEF; white-space: nowrap; vertical-align: top;">
+            <div>${escapeEmailHtml(item.qty)} ${escapeEmailHtml(item.unit)}</div>
+            ${baseHtml}
+          </td>
+          <td align="right" style="padding: 10px 12px; font-size: 12px; color: ${item.condition === 'damaged' ? '#E11D48' : '#059669'}; border-bottom: 1px solid #EEEEEF; white-space: nowrap; vertical-align: top;">
+            ${conditionLabel(item.condition)}
+          </td>
+        </tr>
+      `;
+    })
+    .join('');
+
+  const htmlContent = `<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Notifikasi Retur</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #F7F7F8; font-family: 'DM Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
+  <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color: #F7F7F8; padding: 40px 16px;">
+    <tr>
+      <td align="center">
+        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width: 600px; background-color: #FFFFFF; border-radius: 12px; border: 1px solid #E4E4E9; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.03); overflow: hidden;">
+          <tr>
+            <td height="6" style="background-color: ${colors.primary};"></td>
+          </tr>
+          <tr>
+            <td style="padding: 40px 32px;">
+              <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 32px;">
+                <tr>
+                  <td>
+                    <span style="font-size: 20px; font-weight: 700; color: #0D0D0F; letter-spacing: -0.02em;">Docuflow</span>
+                  </td>
+                  <td align="right">
+                    <span style="display: inline-block; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; background-color: ${colors.light}; color: ${colors.primary}; padding: 6px 12px; border-radius: 9999px;">Retur ${escapeEmailHtml(documentLabel)}</span>
+                  </td>
+                </tr>
+              </table>
+
+              <h1 style="margin: 0 0 16px 0; font-size: 22px; font-weight: 600; color: #0D0D0F; letter-spacing: -0.02em; line-height: 1.3;">
+                Retur ${escapeEmailHtml(documentLabel)} Berhasil Diproses
+              </h1>
+
+              <p style="margin: 0 0 24px 0; font-size: 14px; line-height: 1.6; color: #6C6C78;">
+                Halo Team,
+              </p>
+
+              <p style="margin: 0 0 24px 0; font-size: 14px; line-height: 1.6; color: #0D0D0F;">
+                Retur untuk dokumen <strong>${escapeEmailHtml(doc?.document_number || '-')}</strong> telah diproses oleh <strong>${escapeEmailHtml(creatorName || 'Petugas')}</strong>${creatorEmail ? ` (<a href="mailto:${escapeEmailHtml(creatorEmail)}" style="color: ${colors.primary}; text-decoration: none;">${escapeEmailHtml(creatorEmail)}</a>)` : ''}. Berikut rinciannya:
+              </p>
+
+              <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color: #F8F9FA; border: 1px solid #E4E4E9; border-radius: 8px; margin-bottom: 24px;">
+                <tr>
+                  <td style="padding: 20px 24px;">
+                    <table border="0" cellpadding="0" cellspacing="0" width="100%">
+                      <tr>
+                        <td width="32%" valign="top" style="padding-bottom: 12px; font-size: 13px; font-weight: 500; color: #6C6C78;">No. Retur</td>
+                        <td width="68%" valign="top" style="padding-bottom: 12px; font-size: 13px; font-weight: 600; color: #0D0D0F;">${escapeEmailHtml(resolvedReturnNumber)}</td>
+                      </tr>
+                      <tr>
+                        <td width="32%" valign="top" style="padding-bottom: 12px; font-size: 13px; font-weight: 500; color: #6C6C78;">Dokumen Asal</td>
+                        <td width="68%" valign="top" style="padding-bottom: 12px; font-size: 13px; font-weight: 600; color: #0D0D0F;">${escapeEmailHtml(doc?.document_number || '-')} (${escapeEmailHtml(documentLabel)})</td>
+                      </tr>
+                      <tr>
+                        <td width="32%" valign="top" style="padding-bottom: 12px; font-size: 13px; font-weight: 500; color: #6C6C78;">Tanggal / Waktu</td>
+                        <td width="68%" valign="top" style="padding-bottom: 12px; font-size: 13px; color: #0D0D0F;">${escapeEmailHtml(returnDate)}</td>
+                      </tr>
+                      <tr>
+                        <td width="32%" valign="top" style="padding-bottom: 12px; font-size: 13px; font-weight: 500; color: #6C6C78;">Gudang</td>
+                        <td width="68%" valign="top" style="padding-bottom: 12px; font-size: 13px; color: #0D0D0F;">${escapeEmailHtml(warehouseName || '-')}</td>
+                      </tr>
+                      <tr>
+                        <td width="32%" valign="top" style="padding-bottom: 12px; font-size: 13px; font-weight: 500; color: #6C6C78;">Pihak Terkait</td>
+                        <td width="68%" valign="top" style="padding-bottom: 12px; font-size: 13px; color: #0D0D0F;">${escapeEmailHtml(destination)}</td>
+                      </tr>
+                      <tr>
+                        <td width="32%" valign="top" style="padding-bottom: ${notes ? '12px' : '0'}; font-size: 13px; font-weight: 500; color: #6C6C78;">Alasan</td>
+                        <td width="68%" valign="top" style="padding-bottom: ${notes ? '12px' : '0'}; font-size: 13px; color: #0D0D0F;">${escapeEmailHtml(reason)}</td>
+                      </tr>
+                      ${notes ? `
+                      <tr>
+                        <td width="32%" valign="top" style="font-size: 13px; font-weight: 500; color: #6C6C78;">Catatan</td>
+                        <td width="68%" valign="top" style="font-size: 13px; color: #0D0D0F;">${escapeEmailHtml(notes)}</td>
+                      </tr>` : ''}
+                    </table>
+                  </td>
+                </tr>
+              </table>
+
+              <table border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse: collapse; margin-bottom: 28px; border: 1px solid #E4E4E9; border-radius: 8px; overflow: hidden;">
+                <thead>
+                  <tr style="background-color: #F8F9FA; border-bottom: 1px solid #E4E4E9;">
+                    <th align="left" style="padding: 8px 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #6C6C78;">Item</th>
+                    <th align="right" style="padding: 8px 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #6C6C78;">Jumlah</th>
+                    <th align="right" style="padding: 8px 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #6C6C78;">Kondisi</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${itemRowsHtml || '<tr><td colspan="3" style="padding: 12px; font-size: 13px; color: #6C6C78;">Tidak ada item.</td></tr>'}
+                </tbody>
+              </table>
+
+              <p style="margin: 0 0 20px 0; font-size: 13px; line-height: 1.5; color: #6C6C78;">
+                <em>*Terlampir dokumen PDF Bukti Retur (format rangkap 21 x 12 cm).</em>
+              </p>
+
+              <table border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 32px;">
+                <tr>
+                  <td align="center">
+                    <a href="${docLink}" target="_blank" style="display: inline-block; background-color: ${colors.primary}; color: #FFFFFF; font-size: 14px; font-weight: 600; text-decoration: none; padding: 12px 28px; border-radius: 6px; box-shadow: 0 4px 14px ${colors.shadow};">
+                      Lihat Daftar Retur
+                    </a>
+                  </td>
+                </tr>
+              </table>
+
+              <hr style="border: 0; border-top: 1px solid #E4E4E9; margin: 32px 0 24px 0;">
+
+              <p style="margin: 0 0 8px 0; font-size: 12px; line-height: 1.6; color: #A1A1AA;">
+                Email ini dikirim secara otomatis oleh sistem <strong>Docuflow</strong> setelah transaksi retur berhasil disimpan. Harap tidak membalas email ini secara langsung.
+              </p>
+              <p style="margin: 0; font-size: 11px; color: #A1A1AA;">
+                &copy; 2026 Docuflow. All rights reserved.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+
+  const cleanReturnNumber = String(resolvedReturnNumber || 'retur')
+    .replace(/[/\\?%*:|"<>]/g, '_')
+    .replace(/\s+/g, '_');
+
+  try {
+    const info = await sendMailWithRetry({
+      from: fromAddress,
+      to: recipientEmail,
+      cc: ccArray.length > 0 ? ccArray : undefined,
+      subject,
+      text: plainText,
+      html: htmlContent,
+      attachments: [
+        {
+          filename: `Return-${cleanReturnNumber}.pdf`,
+          content: pdfBuffer,
+          contentType: 'application/pdf',
+        },
+      ],
+    });
+
+    await updateReturnEmailLog(logId, {
+      status: 'sent',
+      sent_at: new Date().toISOString(),
+      error_message: null,
+    });
+
+    return { status: 'sent', messageId: info.messageId, subject };
+  } catch (err) {
+    const errorMessage = err?.message || String(err);
+    await updateReturnEmailLog(logId, { status: 'failed', error_message: errorMessage });
     return { status: 'failed', error: errorMessage, subject };
   }
 }

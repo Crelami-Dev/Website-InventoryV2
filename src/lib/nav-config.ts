@@ -81,6 +81,7 @@ export const NAV_ITEMS: readonly NavItem[] = NAV_SECTIONS.flatMap((s) => s.items
 /** Judul breadcrumb untuk route internal yang sengaja tidak masuk sitemap. */
 export const EXTRA_ROUTE_TITLES: Readonly<Record<string, string>> = {
   "/design-system": "Demo Design System (internal)",
+  "/inventory/grouping": "Grouping Serial Number",
 };
 
 /** Item aktif untuk pathname (cocok persis atau sebagai prefix segmen). */

@@ -42,6 +42,55 @@ export function StockOpnameView({
   const [page, setPage] = useState(1);
   const [modalOpen, setModalOpen] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+
+  async function handleExportListExcel() {
+    if (isExporting) return;
+    setIsExporting(true);
+
+    try {
+      const whId = activeWarehouseId || context.warehouseId || "";
+      const params = new URLSearchParams();
+      if (whId) params.set("warehouseId", whId);
+      if (statusFilter) params.set("status", statusFilter);
+      if (search.trim()) params.set("search", search.trim());
+
+      const res = await fetch(`/api/inventory/stock-opname/export?${params.toString()}`);
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.error || "Gagal mengunduh daftar Stock Opname.");
+      }
+      const disposition = res.headers.get("Content-Disposition");
+      let filename = `Daftar_Stock_Opname_${whId || "Semua"}.xlsx`;
+      if (disposition) {
+        const match = disposition.match(/filename="?([^"]+)"?/);
+        if (match && match[1]) filename = match[1];
+      }
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+      toast.push({
+        tone: "success",
+        title: "Ekspor Berhasil",
+        description: `File '${filename}' berhasil diunduh.`,
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Gagal mengekspor data ke Excel.";
+      toast.push({
+        tone: "danger",
+        title: "Ekspor Gagal",
+        description: msg,
+      });
+    } finally {
+      setIsExporting(false);
+    }
+  }
 
   const effectiveWhName = activeWarehouseName || context.warehouseName || "WH01";
   const autoSessionNo = `SO-202610-${effectiveWhName.slice(0, 4)}-${String(sessions.length + 1).padStart(2, "0")}`;
@@ -208,9 +257,20 @@ export function StockOpnameView({
         title="Stock Opname"
         description="Pencatatan sesi hitung fisik, snapshot saldo beku, dan rekonsiliasi selisih stok."
         actions={
-          <Button variant="primary" onClick={() => setModalOpen(true)}>
-            Buat Sesi Opname
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={handleExportListExcel}
+              disabled={isExporting}
+              title="Unduh daftar sesi Stock Opname sesuai filter (.xlsx)"
+            >
+              {isExporting ? "Mengekspor..." : "Ekspor Daftar (.xlsx)"}
+            </Button>
+            <Button variant="primary" onClick={() => setModalOpen(true)}>
+              Buat Sesi Opname
+            </Button>
+          </div>
         }
       />
 

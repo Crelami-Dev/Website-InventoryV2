@@ -17,13 +17,15 @@ import { Dialog } from "@/components/ui/dialog";
 import { FormField, Input, Select, Textarea } from "@/components/ui/form-fields";
 import { ListToolbar } from "@/components/ui/list-toolbar";
 import { Pagination } from "@/components/ui/pagination";
-import { PlusIcon, EyeIcon } from "@/components/ui/icons";
-
-const PAGE_SIZE = 50;
+import { PlusIcon, EyeIcon, RotateCcwIcon, TrashIcon, CheckCircleIcon } from "@/components/ui/icons";
 import {
   createInventoryReturnAction,
   approveAndReceiveReturnAction,
+  cancelInventoryReturnAction,
+  revertInventoryReturnAction,
 } from "@/lib/inventory/actions";
+
+const PAGE_SIZE = 50;
 
 export interface ReturnsViewProps {
   initialReturns?: ReturnItem[];
@@ -41,13 +43,16 @@ export function ReturnsView({
     initialReturns.length > 0 ? initialReturns : FIXTURE_RETURNS
   );
   const partners = useMemo(
-    () => (initialPartners.length > 0 ? initialPartners : FIXTURE_PARTNERS.filter((p) => p.type === "CUSTOMER")),
+    () => (initialPartners.length > 0 ? initialPartners : FIXTURE_PARTNERS),
     [initialPartners]
   );
   const products = useMemo(
     () => (initialProducts.length > 0 ? initialProducts : FIXTURE_PRODUCTS),
     [initialProducts]
   );
+
+  // Tab State: Retur Pelanggan vs Retur Supplier
+  const [activeTab, setActiveTab] = useState<"CUSTOMER" | "SUPPLIER">("CUSTOMER");
 
   const [search, setSearch] = useState("");
   const [reasonFilter, setReasonFilter] = useState("ALL");
@@ -58,9 +63,16 @@ export function ReturnsView({
   // Modal State
   const [selectedReturn, setSelectedReturn] = useState<ReturnItem | null>(null);
   const [isCreateOpen, setIsCreateOpen] = useState(false);
+  const [cancelDraftTarget, setCancelDraftTarget] = useState<ReturnItem | null>(null);
+  const [revertTarget, setRevertTarget] = useState<ReturnItem | null>(null);
+  const [revertReason, setRevertReason] = useState("");
 
-  // Form State Buat Retur
-  const [customerId, setCustomerId] = useState(partners[0]?.id || "");
+  // Form State Buat Retur Baru
+  const [createType, setCreateType] = useState<"CUSTOMER" | "SUPPLIER">("CUSTOMER");
+  const customerPartners = useMemo(() => partners.filter((p) => p.type === "CUSTOMER"), [partners]);
+  const supplierPartners = useMemo(() => partners.filter((p) => p.type === "SUPPLIER"), [partners]);
+
+  const [partnerId, setPartnerId] = useState(customerPartners[0]?.id || partners[0]?.id || "");
   const [productId, setProductId] = useState(products[0]?.id || "");
   const [quantity, setQuantity] = useState(1);
   const [reason, setReason] = useState<ReturnItem["reason"]>("SALAH_KIRIM");
@@ -70,29 +82,54 @@ export function ReturnsView({
   const [returnError, setReturnError] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
-  // Evaluasi baseline reopen_source_qty sesuai LOCKED rule:
-  // SALAH_KIRIM, PEMBATALAN, SALAH_INPUT = true; CACAT, LAINNYA = false
+  // Hitung jumlah untuk counter badge pada tab
+  const customerReturnsCount = useMemo(() => {
+    return returns.filter((r) => r.returnType !== "SUPPLIER_RETURN").length;
+  }, [returns]);
+
+  const supplierReturnsCount = useMemo(() => {
+    return returns.filter((r) => r.returnType === "SUPPLIER_RETURN").length;
+  }, [returns]);
+
   const willReopenQty =
     reason === "SALAH_KIRIM" || reason === "PEMBATALAN" || reason === "SALAH_INPUT";
 
   const filteredReturns = useMemo(() => {
     return returns.filter((ret) => {
-      // Isolasi gudang jika staff/sales
+      // 1. Filter Tab Retur Pelanggan vs Supplier
+      const isSupplier = ret.returnType === "SUPPLIER_RETURN";
+      if (activeTab === "CUSTOMER" && isSupplier) return false;
+      if (activeTab === "SUPPLIER" && !isSupplier) return false;
+
+      // 2. Isolasi gudang jika staff/sales
       if (currentRole !== "OWNER" && ret.warehouseId !== activeWarehouseId) {
         return false;
       }
 
+      // 3. Pencarian
       const matchSearch =
         ret.returnNumber.toLowerCase().includes(search.toLowerCase()) ||
         ret.sourceReference.toLowerCase().includes(search.toLowerCase()) ||
         ret.partnerName.toLowerCase().includes(search.toLowerCase());
 
+      // 4. Filter Alasan
       const matchReason = reasonFilter === "ALL" || ret.reason === reasonFilter;
-      const matchStatus = statusFilter === "ALL" || ret.status === statusFilter;
+
+      // 5. Filter Status
+      let matchStatus = true;
+      if (statusFilter !== "ALL") {
+        if (statusFilter === "DRAFT") {
+          matchStatus = ret.status === "DRAFT" || ret.status === "PENDING_REVIEW";
+        } else if (statusFilter === "RECEIVED") {
+          matchStatus = ret.status === "RECEIVED" || ret.status === "COMPLETED" || ret.status === "APPROVED";
+        } else if (statusFilter === "CANCELLED") {
+          matchStatus = ret.status === "CANCELLED" || ret.status === "REJECTED";
+        }
+      }
 
       return matchSearch && matchReason && matchStatus;
     });
-  }, [returns, currentRole, activeWarehouseId, search, reasonFilter, statusFilter]);
+  }, [returns, activeTab, currentRole, activeWarehouseId, search, reasonFilter, statusFilter]);
 
   const totalPages = Math.max(1, Math.ceil(filteredReturns.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -101,13 +138,15 @@ export function ReturnsView({
     return filteredReturns.slice(start, start + PAGE_SIZE);
   }, [filteredReturns, safePage]);
 
+  // Handler Submit Buat Retur Manual
   const handleCreateReturn = (e: React.FormEvent) => {
     e.preventDefault();
     setReturnError(null);
 
-    const cust = partners.find((p) => p.id === customerId) || partners[0];
-    if (!cust) {
-      setReturnError("Pelanggan harus dipilih.");
+    const partnerList = createType === "CUSTOMER" ? customerPartners : supplierPartners;
+    const currentPartner = partnerList.find((p) => p.id === partnerId) || partnerList[0] || partners[0];
+    if (!currentPartner) {
+      setReturnError(`${createType === "CUSTOMER" ? "Pelanggan" : "Pemasok"} harus dipilih.`);
       return;
     }
 
@@ -122,14 +161,18 @@ export function ReturnsView({
       .map((s) => s.trim().toUpperCase())
       .filter(Boolean);
 
-    const newNumber = `RET-${Date.now().toString().slice(-6)}`;
+    const newNumber = createType === "CUSTOMER"
+      ? `RET-CUST-${Date.now().toString().slice(-6)}`
+      : `RET-SUP-${Date.now().toString().slice(-6)}`;
 
     if (isPending) return;
 
     startTransition(async () => {
       const res = await createInventoryReturnAction({
         warehouseId: activeWarehouseId,
-        customerId: cust.id,
+        returnType: createType === "CUSTOMER" ? "CUSTOMER_RETURN" : "SUPPLIER_RETURN",
+        customerId: createType === "CUSTOMER" ? currentPartner.id : undefined,
+        supplierId: createType === "SUPPLIER" ? currentPartner.id : undefined,
         returnNumber: newNumber,
         returnDate: new Date().toISOString().slice(0, 10),
         reason,
@@ -155,14 +198,15 @@ export function ReturnsView({
       const newReturn: ReturnItem = {
         id: created?.id || `ret-${Date.now()}`,
         returnNumber: created?.returnNumber || newNumber,
-        sourceReference: "GO-LANGSUNG",
+        returnType: createType === "CUSTOMER" ? "CUSTOMER_RETURN" : "SUPPLIER_RETURN",
+        sourceReference: createType === "CUSTOMER" ? "GO-LANGSUNG" : "GI-LANGSUNG",
         warehouseId: activeWarehouseId,
         warehouseName: activeWarehouse?.name || "Gudang Aktif",
         date: created?.returnDate || new Date().toISOString().slice(0, 10),
-        partnerName: cust.name,
+        partnerName: currentPartner.name,
         reason,
         reopenSourceQty: willReopen,
-        status: "PENDING_REVIEW",
+        status: "DRAFT",
         notes: notes.trim() || undefined,
         items: [
           {
@@ -179,34 +223,91 @@ export function ReturnsView({
       setReturns((prev) => [newReturn, ...prev]);
       setIsCreateOpen(false);
       setStatusMessage(
-        `Pengajuan retur ${newReturn.returnNumber} berhasil dibuat dengan status DRAFT / Menunggu Review (belum mengubah stok fisik sebelum penerimaan barang).`
+        `Pengajuan retur ${newReturn.returnNumber} berhasil dibuat dengan status DRAFT (belum mempengaruhi saldo stok fisik sebelum persetujuan).`
       );
     });
   };
 
+  // Handler Persetujuan & Penerimaan Fisik Retur
   const handleApproveAndReceive = (ret: ReturnItem) => {
     if (isPending) return;
     setReturnError(null);
     startTransition(async () => {
       const res = await approveAndReceiveReturnAction(ret.id);
       if (!res.success) {
-        setReturnError(res.error || "Gagal memproses penerimaan fisik retur.");
+        setReturnError(res.error || "Gagal memproses persetujuan retur.");
         return;
       }
 
       setReturns((prev) =>
         prev.map((item) =>
-          item.id === ret.id ? { ...item, status: "APPROVED" } : item
+          item.id === ret.id ? { ...item, status: "RECEIVED" } : item
         )
       );
 
       if (selectedReturn?.id === ret.id) {
-        setSelectedReturn((prev) => (prev ? { ...prev, status: "APPROVED" } : null));
+        setSelectedReturn((prev) => (prev ? { ...prev, status: "RECEIVED" } : null));
+      }
+
+      const isSupplier = ret.returnType === "SUPPLIER_RETURN";
+      setStatusMessage(
+        isSupplier
+          ? `Retur supplier ${ret.returnNumber} berhasil disetujui & diposting ke ledger (RETURN_OUT_POSTED). Stok telah dipotong dari gudang.`
+          : `Retur pelanggan ${ret.returnNumber} resmi disetujui & diterima fisik. Mutasi stok fisik RETURN_IN_POSTED telah dicatat di ledger.${ret.reopenSourceQty ? " Kuota pemenuhan pesanan dibuka kembali." : ""}`
+      );
+    });
+  };
+
+  // Handler Batalkan Draft
+  const handleConfirmCancelDraft = () => {
+    if (!cancelDraftTarget || isPending) return;
+    startTransition(async () => {
+      const res = await cancelInventoryReturnAction(cancelDraftTarget.id, "Dibatalkan oleh staf gudang.");
+      if (!res.success) {
+        setReturnError(res.error || "Gagal membatalkan draft retur.");
+        return;
+      }
+
+      setReturns((prev) =>
+        prev.map((item) =>
+          item.id === cancelDraftTarget.id ? { ...item, status: "CANCELLED" } : item
+        )
+      );
+
+      if (selectedReturn?.id === cancelDraftTarget.id) {
+        setSelectedReturn((prev) => (prev ? { ...prev, status: "CANCELLED" } : null));
+      }
+
+      setStatusMessage(`Draft dokumen retur ${cancelDraftTarget.returnNumber} berhasil dibatalkan.`);
+      setCancelDraftTarget(null);
+    });
+  };
+
+  // Handler Revert / Batalkan Retur yang Sudah RECEIVED
+  const handleConfirmRevert = () => {
+    if (!revertTarget || !revertReason.trim() || isPending) return;
+    startTransition(async () => {
+      const res = await revertInventoryReturnAction(revertTarget.id, revertReason.trim());
+      if (!res.success) {
+        setReturnError(res.error || "Gagal membatalkan (revert) retur.");
+        return;
+      }
+
+      setReturns((prev) =>
+        prev.map((item) =>
+          item.id === revertTarget.id ? { ...item, status: "CANCELLED" } : item
+        )
+      );
+
+      if (selectedReturn?.id === revertTarget.id) {
+        setSelectedReturn((prev) => (prev ? { ...prev, status: "CANCELLED" } : null));
       }
 
       setStatusMessage(
-        `Retur ${ret.returnNumber} resmi disetujui & diterima fisik. Mutasi ledger fisik RETURN_IN_POSTED telah dicatat di database.${ret.reopenSourceQty ? " Kuota pemenuhan pesanan dibuka kembali." : ""}`
+        `Retur ${revertTarget.returnNumber} berhasil dibatalkan (Reverted). Mutasi ledger pembalik RETURN_REVERSAL_POSTED telah dicatat secara resmi.`
       );
+      setRevertTarget(null);
+      setRevertReason("");
     });
   };
 
@@ -227,14 +328,20 @@ export function ReturnsView({
     }
   };
 
+  // Badge Status Konsisten Sesuai Spesifikasi:
+  // DRAFT (kuning), RECEIVED / COMPLETED (hijau), CANCELLED (abu-abu/merah)
   const getStatusBadge = (s: ReturnItem["status"]) => {
     switch (s) {
+      case "DRAFT":
       case "PENDING_REVIEW":
-        return <Badge variant="warning">Menunggu Review</Badge>;
+        return <Badge variant="warning">DRAFT</Badge>;
+      case "RECEIVED":
+      case "COMPLETED":
       case "APPROVED":
-        return <Badge variant="success">Disetujui</Badge>;
+        return <Badge variant="success">RECEIVED</Badge>;
+      case "CANCELLED":
       case "REJECTED":
-        return <Badge variant="danger">Ditolak</Badge>;
+        return <Badge variant="danger">CANCELLED</Badge>;
       default:
         return <Badge variant="neutral">{s}</Badge>;
     }
@@ -244,30 +351,105 @@ export function ReturnsView({
     <div className="space-y-6">
       <PageHeader
         title="Retur Barang"
-        description="Pencatatan pengembalian barang, alasan retur, dan evaluasi kuantitas sumber pemenuhan (reopen source qty)."
+        description="Kelola pengembalian barang dari pelanggan (Customer Returns) maupun pengembalian ke pemasok (Supplier Returns) dengan kepatuhan buku besar ledger."
         actions={
           <Button
             variant="primary"
             size="sm"
-            onClick={() => setIsCreateOpen(true)}
+            onClick={() => {
+              setReturnError(null);
+              setIsCreateOpen(true);
+            }}
           >
-            <PlusIcon className="h-4 w-4" />
+            <PlusIcon className="h-4 w-4 mr-1" />
             Buat Pengajuan Retur
           </Button>
         }
       />
 
+      {/* Tabs Pemisah Retur Pelanggan vs Retur Supplier */}
+      <div className="flex border-b border-border-default">
+        <button
+          type="button"
+          onClick={() => {
+            setActiveTab("CUSTOMER");
+            setPage(1);
+          }}
+          className={`flex items-center gap-2 px-5 py-3 text-xs font-semibold border-b-2 transition-all cursor-pointer ${
+            activeTab === "CUSTOMER"
+              ? "border-primary text-primary bg-primary/5"
+              : "border-transparent text-text-muted hover:text-text-primary hover:bg-surface-subtle"
+          }`}
+        >
+          <span>Retur Pelanggan (Customer Returns)</span>
+          <span
+            className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${
+              activeTab === "CUSTOMER"
+                ? "bg-primary text-surface"
+                : "bg-surface-muted text-text-muted"
+            }`}
+          >
+            {customerReturnsCount}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => {
+            setActiveTab("SUPPLIER");
+            setPage(1);
+          }}
+          className={`flex items-center gap-2 px-5 py-3 text-xs font-semibold border-b-2 transition-all cursor-pointer ${
+            activeTab === "SUPPLIER"
+              ? "border-primary text-primary bg-primary/5"
+              : "border-transparent text-text-muted hover:text-text-primary hover:bg-surface-subtle"
+          }`}
+        >
+          <span>Retur ke Supplier (Supplier Returns)</span>
+          <span
+            className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${
+              activeTab === "SUPPLIER"
+                ? "bg-primary text-surface"
+                : "bg-surface-muted text-text-muted"
+            }`}
+          >
+            {supplierReturnsCount}
+          </span>
+        </button>
+      </div>
+
+      {/* Kebijakan Ledger & Reopen */}
       <div className="rounded border border-info/30 bg-surface-subtle p-3 text-xs text-text-secondary space-y-1">
-        <div className="font-semibold text-text-primary">Kebijakan Reopen Source Qty (RPD §7.8 & §10.6):</div>
-        <div>
-          1. <strong className="text-text-primary">SALAH_KIRIM, PEMBATALAN, SALAH_INPUT</strong> = Kuota sumber dibuka kembali (<span className="text-success font-semibold">reopen = true</span>).
+        <div className="font-semibold text-text-primary">
+          {activeTab === "CUSTOMER"
+            ? "Kebijakan Retur Pelanggan (Inbound / Goods Out Return):"
+            : "Kebijakan Retur ke Supplier (Outbound / Goods In Return):"}
         </div>
-        <div>
-          2. <strong className="text-text-primary">CACAT, LAINNYA</strong> = Kuota sumber tidak dibuka (<span className="text-danger font-semibold">reopen = false</span>).
-        </div>
-        <div>
-          3. Retur tidak memodifikasi saldo ledger secara langsung. Penyesuaian stok fisik hanya melalui transaksi resmi setelah approval.
-        </div>
+        {activeTab === "CUSTOMER" ? (
+          <>
+            <div>
+              1. Status <strong className="text-amber-600 dark:text-amber-400">DRAFT</strong> belum memutasi stok fisik sebelum disetujui (Terima Fisik & Setujui).
+            </div>
+            <div>
+              2. Persetujuan retur mencatat mutasi ledger <span className="font-mono font-semibold text-success">RETURN_IN_POSTED</span> (+qty) dan serial kembali <span className="font-semibold text-success">AVAILABLE</span> (atau <span className="font-semibold text-danger">QUARANTINE</span> jika rusak).
+            </div>
+            <div>
+              3. Pembatalan retur (Revert) mencatat mutasi pembalik <span className="font-mono font-semibold text-danger">RETURN_REVERSAL_POSTED</span> (-qty) dan serial kembali <span className="font-mono text-text-primary">CONSUMED_OUT</span>.
+            </div>
+          </>
+        ) : (
+          <>
+            <div>
+              1. Pengembalian ke vendor memotong stok fisik gudang melalui mutasi ledger <span className="font-mono font-semibold text-danger">RETURN_OUT_POSTED</span> (-qty).
+            </div>
+            <div>
+              2. Hanya serial yang berstatus <span className="font-semibold text-success">AVAILABLE</span> di gudang yang dapat dikembalikan ke supplier.
+            </div>
+            <div>
+              3. Revert retur supplier memulihkan stok fisik melalui <span className="font-mono font-semibold text-success">RETURN_REVERSAL_POSTED</span> (+qty) dan serial kembali <span className="font-semibold text-success">AVAILABLE</span>.
+            </div>
+          </>
+        )}
       </div>
 
       {statusMessage && (
@@ -280,7 +462,11 @@ export function ReturnsView({
 
       {/* Toolbar Filter */}
       <ListToolbar
-        searchPlaceholder="Cari nomor retur, referensi sumber, atau mitra..."
+        searchPlaceholder={
+          activeTab === "CUSTOMER"
+            ? "Cari nomor retur, referensi DO, atau pelanggan..."
+            : "Cari nomor retur, referensi barang masuk, atau pemasok..."
+        }
         searchValue={search}
         onSearchChange={setSearch}
         filters={
@@ -301,22 +487,21 @@ export function ReturnsView({
               </Select>
             </div>
             <div className="w-40">
-              <label htmlFor="ret-status-filter" className="sr-only">Status Review</label>
+              <label htmlFor="ret-status-filter" className="sr-only">Status Retur</label>
               <Select
                 id="ret-status-filter"
                 value={statusFilter}
                 onChange={(e) => setStatusFilter(e.target.value)}
               >
                 <option value="ALL">Semua Status</option>
-                <option value="PENDING_REVIEW">Menunggu Review</option>
-                <option value="APPROVED">Disetujui</option>
-                <option value="REJECTED">Ditolak</option>
+                <option value="DRAFT">DRAFT (Kuning)</option>
+                <option value="RECEIVED">RECEIVED (Hijau)</option>
+                <option value="CANCELLED">CANCELLED (Merah)</option>
               </Select>
             </div>
           </div>
         }
       />
-
 
       {/* Desktop Table View */}
       <div className="hidden md:block rounded border border-border-default bg-surface-card overflow-hidden">
@@ -325,7 +510,7 @@ export function ReturnsView({
             <tr>
               <th className="p-3">Nomor Retur</th>
               <th className="p-3">Referensi Sumber</th>
-              <th className="p-3">Mitra Terkait</th>
+              <th className="p-3">{activeTab === "CUSTOMER" ? "Pelanggan" : "Pemasok"}</th>
               <th className="p-3">Gudang</th>
               <th className="p-3">Alasan Retur</th>
               <th className="p-3 text-center">Reopen Kuota</th>
@@ -337,50 +522,91 @@ export function ReturnsView({
             {filteredReturns.length === 0 ? (
               <tr>
                 <td colSpan={8} className="p-6 text-center text-text-muted">
-                  Tidak ada data retur yang cocok dengan kriteria filter.
+                  Tidak ada data retur {activeTab === "CUSTOMER" ? "pelanggan" : "supplier"} yang cocok dengan kriteria filter.
                 </td>
               </tr>
             ) : (
-              pagedReturns.map((ret) => (
-                <tr key={ret.id} className="hover:bg-surface-subtle/50 transition-colors">
-                  <td className="p-3 font-mono font-semibold text-text-primary">{ret.returnNumber}</td>
-                  <td className="p-3 font-mono text-text-muted">{ret.sourceReference}</td>
-                  <td className="p-3 font-medium text-text-primary">{ret.partnerName}</td>
-                  <td className="p-3 text-text-muted">{ret.warehouseName}</td>
-                  <td className="p-3">{getReasonBadge(ret.reason)}</td>
-                  <td className="p-3 text-center">
-                    <Badge variant={ret.reopenSourceQty ? "success" : "neutral"} size="sm">
-                      {ret.reopenSourceQty ? "YA (Reopen)" : "TIDAK"}
-                    </Badge>
-                  </td>
-                  <td className="p-3">{getStatusBadge(ret.status)}</td>
-                  <td className="p-3 text-right">
-                    <div className="flex items-center justify-end gap-1">
-                      {ret.status === "PENDING_REVIEW" && (
+              pagedReturns.map((ret) => {
+                const isDraft = ret.status === "DRAFT" || ret.status === "PENDING_REVIEW";
+                const isReceived = ret.status === "RECEIVED" || ret.status === "COMPLETED" || ret.status === "APPROVED";
+
+                return (
+                  <tr key={ret.id} className="hover:bg-surface-subtle/50 transition-colors">
+                    <td className="p-3 font-mono font-semibold text-text-primary">{ret.returnNumber}</td>
+                    <td className="p-3 font-mono text-text-muted">{ret.sourceReference}</td>
+                    <td className="p-3 font-medium text-text-primary">{ret.partnerName}</td>
+                    <td className="p-3 text-text-muted">{ret.warehouseName}</td>
+                    <td className="p-3">{getReasonBadge(ret.reason)}</td>
+                    <td className="p-3 text-center">
+                      <Badge variant={ret.reopenSourceQty ? "success" : "neutral"} size="sm">
+                        {ret.reopenSourceQty ? "YA" : "TIDAK"}
+                      </Badge>
+                    </td>
+                    <td className="p-3">{getStatusBadge(ret.status)}</td>
+                    <td className="p-3 text-right">
+                      <div className="flex items-center justify-end gap-1.5">
+                        {/* Aksi untuk DRAFT */}
+                        {isDraft && (
+                          <>
+                            <Button
+                              variant="primary"
+                              size="sm"
+                              onClick={() => handleApproveAndReceive(ret)}
+                              disabled={isPending}
+                              loading={isPending}
+                              loadingLabel="Memproses..."
+                              title="Setujui dan posting mutasi stok ke buku besar ledger"
+                            >
+                              <CheckCircleIcon className="h-3.5 w-3.5 mr-1" />
+                              Terima Fisik & Setujui
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => setCancelDraftTarget(ret)}
+                              disabled={isPending}
+                              className="text-danger hover:bg-danger/10"
+                              title="Batalkan dokumen draft ini"
+                            >
+                              <TrashIcon className="h-3.5 w-3.5 mr-1" />
+                              Batalkan Draft
+                            </Button>
+                          </>
+                        )}
+
+                        {/* Aksi untuk RECEIVED / COMPLETED */}
+                        {isReceived && (
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={() => {
+                              setRevertTarget(ret);
+                              setRevertReason("");
+                            }}
+                            disabled={isPending}
+                            className="text-danger border-danger/30 hover:bg-danger/10"
+                            title="Batalkan retur yang sudah diterima dengan mencatat jurnal pembalik"
+                          >
+                            <RotateCcwIcon className="h-3.5 w-3.5 mr-1" />
+                            Batalkan Retur (Revert)
+                          </Button>
+                        )}
+
+                        {/* Tombol Detail */}
                         <Button
-                          variant="primary"
+                          variant="ghost"
                           size="sm"
-                          onClick={() => handleApproveAndReceive(ret)}
-                          disabled={isPending}
-                          loading={isPending}
-                          loadingLabel="Memposting..."
+                          onClick={() => setSelectedReturn(ret)}
+                          aria-label={`Lihat detail ${ret.returnNumber}`}
                         >
-                          Terima Fisik & Posting
+                          <EyeIcon className="h-4 w-4" />
+                          Detail
                         </Button>
-                      )}
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => setSelectedReturn(ret)}
-                        aria-label={`Lihat detail ${ret.returnNumber}`}
-                      >
-                        <EyeIcon className="h-4 w-4" />
-                        Detail
-                      </Button>
-                    </div>
-                  </td>
-                </tr>
-              ))
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })
             )}
           </tbody>
         </table>
@@ -394,50 +620,78 @@ export function ReturnsView({
             description="Tidak ada dokumen retur yang cocok dengan filter."
           />
         ) : (
-          pagedReturns.map((ret) => (
-            <div
-              key={ret.id}
-              className="p-4 rounded border border-border-default bg-surface-card space-y-3"
-            >
-              <div className="flex items-center justify-between">
-                <span className="font-mono font-semibold text-text-primary">{ret.returnNumber}</span>
-                {getStatusBadge(ret.status)}
-              </div>
-              <div className="text-sm font-medium text-text-primary">{ret.partnerName}</div>
-              <div className="flex items-center justify-between text-xs text-text-muted font-mono">
-                <span>Sumber: {ret.sourceReference}</span>
-                <span>Tgl: {ret.date}</span>
-              </div>
-              <div className="flex items-center justify-between text-xs border-t border-border-default pt-2">
-                <div>{getReasonBadge(ret.reason)}</div>
-                <div className="flex items-center gap-1">
-                  {ret.status === "PENDING_REVIEW" && (
+          pagedReturns.map((ret) => {
+            const isDraft = ret.status === "DRAFT" || ret.status === "PENDING_REVIEW";
+            const isReceived = ret.status === "RECEIVED" || ret.status === "COMPLETED" || ret.status === "APPROVED";
+
+            return (
+              <div
+                key={ret.id}
+                className="p-4 rounded border border-border-default bg-surface-card space-y-3"
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-mono font-semibold text-text-primary">{ret.returnNumber}</span>
+                  {getStatusBadge(ret.status)}
+                </div>
+                <div className="text-sm font-medium text-text-primary">{ret.partnerName}</div>
+                <div className="flex items-center justify-between text-xs text-text-muted font-mono">
+                  <span>Sumber: {ret.sourceReference}</span>
+                  <span>Tgl: {ret.date}</span>
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs border-t border-border-default pt-2">
+                  <div>{getReasonBadge(ret.reason)}</div>
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    {isDraft && (
+                      <>
+                        <Button
+                          variant="primary"
+                          size="sm"
+                          onClick={() => handleApproveAndReceive(ret)}
+                          disabled={isPending}
+                        >
+                          Setujui
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setCancelDraftTarget(ret)}
+                          disabled={isPending}
+                          className="text-danger"
+                        >
+                          Batal
+                        </Button>
+                      </>
+                    )}
+                    {isReceived && (
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => {
+                          setRevertTarget(ret);
+                          setRevertReason("");
+                        }}
+                        disabled={isPending}
+                        className="text-danger"
+                      >
+                        Revert
+                      </Button>
+                    )}
                     <Button
-                      variant="primary"
+                      variant="secondary"
                       size="sm"
-                      onClick={() => handleApproveAndReceive(ret)}
-                      disabled={isPending}
-                      loading={isPending}
-                      loadingLabel="Memposting..."
+                      onClick={() => setSelectedReturn(ret)}
                     >
-                      Terima Fisik
+                      Detail
                     </Button>
-                  )}
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    onClick={() => setSelectedReturn(ret)}
-                  >
-                    Detail Retur
-                  </Button>
+                  </div>
                 </div>
               </div>
-            </div>
-          ))
+            );
+          })
         )}
       </div>
 
-      {/* Paginasi Retur (Maksimal 50 Data per Halaman) */}
+      {/* Paginasi Retur */}
       {filteredReturns.length > 0 && (
         <div className="rounded-lg border border-border bg-surface">
           <Pagination
@@ -454,12 +708,12 @@ export function ReturnsView({
         isOpen={Boolean(selectedReturn)}
         onClose={() => setSelectedReturn(null)}
         title={`Detail Dokumen Retur: ${selectedReturn?.returnNumber || ""}`}
-        description={`Sumber: ${selectedReturn?.sourceReference || ""} | Gudang: ${selectedReturn?.warehouseName || ""}`}
+        description={`Jenis: ${selectedReturn?.returnType === "SUPPLIER_RETURN" ? "Retur ke Supplier" : "Retur Pelanggan"} | Sumber: ${selectedReturn?.sourceReference || ""} | Gudang: ${selectedReturn?.warehouseName || ""}`}
       >
         {selectedReturn && (
           <div className="space-y-4">
             <div className="flex items-center justify-between p-3 rounded bg-surface-subtle border border-border-default">
-              <span className="text-xs text-text-secondary">Status Evaluasi:</span>
+              <span className="text-xs text-text-secondary">Status Retur Saat Ini:</span>
               {getStatusBadge(selectedReturn.status)}
             </div>
 
@@ -479,7 +733,7 @@ export function ReturnsView({
             </div>
 
             <div className="space-y-2">
-              <div className="text-xs font-semibold text-text-primary">Item yang Diretur:</div>
+              <div className="text-xs font-semibold text-text-primary">Daftar Item yang Diretur:</div>
               <div className="rounded border border-border-default overflow-hidden">
                 <table className="w-full text-left text-xs border-collapse">
                   <thead className="bg-surface-subtle text-text-muted uppercase">
@@ -520,16 +774,31 @@ export function ReturnsView({
               </div>
             )}
 
-            <div className="flex justify-end gap-2 pt-2 border-t border-border-default">
-              {selectedReturn.status === "PENDING_REVIEW" && (
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-border-default">
+              {(selectedReturn.status === "DRAFT" || selectedReturn.status === "PENDING_REVIEW") && (
                 <Button
                   variant="primary"
                   onClick={() => handleApproveAndReceive(selectedReturn)}
                   disabled={isPending}
                   loading={isPending}
-                  loadingLabel="Memposting..."
+                  loadingLabel="Memproses..."
                 >
-                  Terima Fisik & Posting Stok ke Ledger
+                  <CheckCircleIcon className="h-4 w-4 mr-1.5" />
+                  Terima Fisik & Setujui
+                </Button>
+              )}
+              {(selectedReturn.status === "RECEIVED" || selectedReturn.status === "COMPLETED" || selectedReturn.status === "APPROVED") && (
+                <Button
+                  variant="danger"
+                  onClick={() => {
+                    setRevertTarget(selectedReturn);
+                    setSelectedReturn(null);
+                    setRevertReason("");
+                  }}
+                  disabled={isPending}
+                >
+                  <RotateCcwIcon className="h-4 w-4 mr-1.5" />
+                  Batalkan Retur (Revert)
                 </Button>
               )}
               <Button variant="secondary" onClick={() => setSelectedReturn(null)}>
@@ -540,26 +809,171 @@ export function ReturnsView({
         )}
       </Dialog>
 
-      {/* Modal Buat Pengajuan Retur */}
+      {/* Dialog Konfirmasi Revert (Batalkan Retur RECEIVED) */}
+      {revertTarget && (
+        <Dialog
+          isOpen={Boolean(revertTarget)}
+          onClose={() => setRevertTarget(null)}
+          title={`Batalkan Transaksi Retur (Revert): ${revertTarget.returnNumber}`}
+          description="Aksi ini akan mencatat jurnal mutasi pembalik RETURN_REVERSAL_POSTED, membatalkan penyesuaian stok sebelumnya, dan memulihkan status nomor seri ke kondisi asal."
+        >
+          <div className="space-y-4">
+            <Alert
+              variant="warning"
+              title="Perhatian Reversal Stok"
+              description="Pastikan fisik barang benar-benar dikoreksi. Serial number yang dikembalikan ke pelanggan akan kembali menjadi CONSUMED_OUT, sedangkan pada retur supplier akan kembali AVAILABLE di gudang."
+            />
+
+            <div className="space-y-1.5">
+              <label htmlFor="revert-reason" className="text-xs font-semibold text-text-primary block">
+                Alasan Pembatalan (Revert) Retur *
+              </label>
+              <textarea
+                id="revert-reason"
+                className="w-full rounded border border-border-strong bg-surface p-2 text-xs text-text-primary focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+                rows={3}
+                placeholder="Contoh: Salah proses dokumen retur, barang fisik tidak jadi diserahkan oleh pelanggan..."
+                value={revertReason}
+                onChange={(e) => setRevertReason(e.target.value)}
+                autoFocus
+                required
+              />
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-border-default">
+              <Button
+                variant="secondary"
+                type="button"
+                onClick={() => setRevertTarget(null)}
+                disabled={isPending}
+              >
+                Kembali
+              </Button>
+              <Button
+                variant="danger"
+                type="button"
+                onClick={handleConfirmRevert}
+                disabled={isPending || !revertReason.trim()}
+                loading={isPending}
+                loadingLabel="Memproses Revert..."
+              >
+                <RotateCcwIcon className="h-4 w-4 mr-1.5" />
+                Ya, Batalkan Retur Ini (Revert)
+              </Button>
+            </div>
+          </div>
+        </Dialog>
+      )}
+
+      {/* Dialog Konfirmasi Batalkan Draft */}
+      {cancelDraftTarget && (
+        <Dialog
+          isOpen={Boolean(cancelDraftTarget)}
+          onClose={() => setCancelDraftTarget(null)}
+          title={`Batalkan Draft Retur: ${cancelDraftTarget.returnNumber}`}
+          description="Draft retur ini belum dicatat di buku besar mutasi stok ledger. Pembatalan akan mengubah status menjadi CANCELLED secara permanen."
+        >
+          <div className="space-y-4">
+            <p className="text-xs text-text-secondary">
+              Apakah Anda yakin ingin membatalkan pengajuan retur untuk mitra{" "}
+              <strong className="text-text-primary">{cancelDraftTarget.partnerName}</strong>?
+            </p>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-border-default">
+              <Button
+                variant="secondary"
+                type="button"
+                onClick={() => setCancelDraftTarget(null)}
+                disabled={isPending}
+              >
+                Kembali
+              </Button>
+              <Button
+                variant="danger"
+                type="button"
+                onClick={handleConfirmCancelDraft}
+                disabled={isPending}
+                loading={isPending}
+                loadingLabel="Membatalkan..."
+              >
+                <TrashIcon className="h-4 w-4 mr-1.5" />
+                Ya, Batalkan Draft
+              </Button>
+            </div>
+          </div>
+        </Dialog>
+      )}
+
+      {/* Modal Buat Pengajuan Retur Baru */}
       <Dialog
         isOpen={isCreateOpen}
         onClose={() => setIsCreateOpen(false)}
         title="Buat Pengajuan Retur Baru"
-        description="Pencatatan pengembalian barang dan penetapan kebijakan kuantitas sumber."
+        description="Pencatatan pengembalian barang dan penetapan kebijakan kuantitas sumber pemenuhan."
       >
         <form onSubmit={handleCreateReturn} className="space-y-4">
           {returnError && (
             <Alert variant="danger" title="Kesalahan Form" description={returnError} />
           )}
 
+          {/* Pemilihan Jenis Retur */}
+          <div className="p-3 rounded-lg border border-border-default bg-surface-subtle space-y-2">
+            <span className="text-xs font-semibold text-text-primary block">Pilih Alur Retur:</span>
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <label
+                className={`flex items-center gap-2 p-2 rounded border cursor-pointer ${
+                  createType === "CUSTOMER"
+                    ? "border-primary bg-primary/10 font-bold text-primary"
+                    : "border-border-default bg-surface text-text-secondary hover:bg-surface-hover"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="return-type-radio"
+                  checked={createType === "CUSTOMER"}
+                  onChange={() => {
+                    setCreateType("CUSTOMER");
+                    setPartnerId(customerPartners[0]?.id || "");
+                  }}
+                  className="text-primary"
+                />
+                <span>Retur Pelanggan (Inbound)</span>
+              </label>
+
+              <label
+                className={`flex items-center gap-2 p-2 rounded border cursor-pointer ${
+                  createType === "SUPPLIER"
+                    ? "border-primary bg-primary/10 font-bold text-primary"
+                    : "border-border-default bg-surface text-text-secondary hover:bg-surface-hover"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="return-type-radio"
+                  checked={createType === "SUPPLIER"}
+                  onChange={() => {
+                    setCreateType("SUPPLIER");
+                    setPartnerId(supplierPartners[0]?.id || "");
+                  }}
+                  className="text-primary"
+                />
+                <span>Retur ke Supplier (Outbound)</span>
+              </label>
+            </div>
+          </div>
+
           <div className="grid grid-cols-2 gap-3">
-            <FormField id="ret-partner" label="Pelanggan" isRequired>
+            <FormField
+              id="ret-partner"
+              label={createType === "CUSTOMER" ? "Pelanggan Terkait" : "Pemasok / Vendor"}
+              isRequired
+            >
               <Select
                 id="ret-partner"
-                value={customerId}
-                onChange={(e) => setCustomerId(e.target.value)}
+                value={partnerId}
+                onChange={(e) => setPartnerId(e.target.value)}
               >
-                {partners.map((p) => (
+                {(createType === "CUSTOMER" ? customerPartners : supplierPartners).map((p) => (
                   <option key={p.id} value={p.id}>
                     {p.name} ({p.code})
                   </option>
@@ -624,7 +1038,7 @@ export function ReturnsView({
           <FormField id="ret-serials" label="Nomor Seri (Serial Number) - Jika Serial Tracking">
             <Input
               id="ret-serials"
-              placeholder="Contoh: SN-TEST-001, SN-TEST-002"
+              placeholder="Contoh: SN-TEST-001, G-20261024-0001"
               value={serialNumbers}
               onChange={(e) => setSerialNumbers(e.target.value)}
               className="font-mono text-xs"
@@ -633,15 +1047,17 @@ export function ReturnsView({
 
           <div className="p-3 rounded bg-surface-subtle border border-border-default text-xs space-y-1">
             <div className="font-semibold text-text-primary">
-              Efek Terhadap Kuantitas Sumber & Stok (RPD §10.6):
+              Efek Terhadap Kuantitas Sumber & Stok:
             </div>
             <div className={willReopenQty ? "text-success font-medium" : "text-text-muted"}>
               {willReopenQty
-                ? "✓ Alasan ini membuka kembali alokasi pengiriman pada PO/Goods Out terkait (reopen_source_qty = true)."
+                ? "✓ Alasan ini membuka kembali alokasi kuota pesanan pada PO/Goods Out terkait (reopen_source_qty = true)."
                 : "✗ Alasan ini TIDAK membuka kembali alokasi pengiriman (barang cacat/klaim garansi)."}
             </div>
             <div className="text-text-secondary">
-              Penerimaan fisik akan langsung mencatat mutasi ledger <strong>RETURN_IN_POSTED</strong> (+{quantity} stok fisik).
+              {createType === "CUSTOMER"
+                ? `Persetujuan fisik akan menambah saldo ledger (+${quantity} stok fisik di gudang).`
+                : `Persetujuan fisik akan memotong saldo ledger (-${quantity} stok fisik keluar dari gudang).`}
             </div>
           </div>
 
@@ -651,7 +1067,7 @@ export function ReturnsView({
               rows={2}
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
-              placeholder="Deskripsi kerusakan atau kronologi kesalahan pengiriman..."
+              placeholder="Deskripsi kerusakan atau kronologi kesalahan..."
             />
           </FormField>
 

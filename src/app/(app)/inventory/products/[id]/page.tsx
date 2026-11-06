@@ -1,3 +1,4 @@
+import React, { Suspense } from "react";
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { getServerSessionContext } from "@/lib/auth/server-session";
@@ -10,11 +11,32 @@ export const metadata: Metadata = {
   description: "Informasi produk, nomor seri (Unit & SN), dan riwayat mutasi stok.",
 };
 
-export default async function ProductDetailPage({
-  params,
-}: {
+interface PageProps {
   params: Promise<{ id: string }>;
-}) {
+}
+
+function ProductDetailSkeleton() {
+  return (
+    <div className="space-y-6 animate-pulse p-2">
+      <div className="flex items-center justify-between">
+        <div className="h-8 bg-surface-muted rounded w-48" />
+        <div className="h-8 bg-surface-muted rounded w-24" />
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div className="md:col-span-2 space-y-4">
+          <div className="h-40 bg-surface-muted rounded-xl" />
+          <div className="h-60 bg-surface-muted rounded-xl" />
+        </div>
+        <div className="space-y-4">
+          <div className="h-32 bg-surface-muted rounded-xl" />
+          <div className="h-48 bg-surface-muted rounded-xl" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+async function ProductDetailContent({ params }: PageProps) {
   const { id } = await params;
   const session = await getServerSessionContext();
 
@@ -72,5 +94,13 @@ export default async function ProductDetailPage({
       initialSerials={initialSerials}
       initialHistory={initialHistory}
     />
+  );
+}
+
+export default function ProductDetailPage({ params }: PageProps) {
+  return (
+    <Suspense fallback={<ProductDetailSkeleton />}>
+      <ProductDetailContent params={params} />
+    </Suspense>
   );
 }

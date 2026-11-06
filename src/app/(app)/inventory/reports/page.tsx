@@ -43,6 +43,8 @@ export default async function ReportsPage() {
       stockPhysical: p.physicalStock ?? 0,
       stockReserved: p.reservedStock ?? 0,
       stockAvailable: p.availableStock ?? 0,
+      availableStandaloneStock: p.availableStandaloneStock,
+      groupedStock: p.groupedStock,
       minStock: p.minStock,
       maxStock: p.minStock * 5,
       status: p.status === "ARCHIVED" ? "INACTIVE" : p.status,

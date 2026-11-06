@@ -724,6 +724,7 @@ export default function GoodsInPage() {
           suppliers={suppliers}
           contactsEnabled={contactsEnabled}
           existingDocsThisMonth={existingDocsThisMonth}
+          docs={docs}
         />
       )}
 

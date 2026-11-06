@@ -7,6 +7,7 @@ export const settings = {
   'settings.tab.units': 'Inventory Units',
   'settings.tab.documents': 'Documents',
   'settings.tab.modules': 'Modules',
+  'settings.tab.dailyReport': 'Daily Report',
 
   'settings.profile.title': 'My Profile',
   'settings.profile.subtitle': 'Manage profile information, password, and appearance preferences',

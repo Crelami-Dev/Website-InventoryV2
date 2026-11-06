@@ -3,6 +3,8 @@
  * Standardized Error Contracts & Safe Error Handling
  */
 
+import type { ReturnErrorCode } from '../types/inventory-domain.ts';
+
 export type AppErrorCode =
   | 'ERR_UNAUTHORIZED'
   | 'ERR_FORBIDDEN_OWNER'
@@ -14,7 +16,9 @@ export type AppErrorCode =
   | 'ERR_CONFLICT'
   | 'ERR_CONFLICT_SN'
   | 'ERR_IDEMPOTENCY_REPLAY'
-  | 'ERR_INTERNAL_SERVER';
+  | 'UNIT_MISMATCH'
+  | 'ERR_INTERNAL_SERVER'
+  | ReturnErrorCode;
 
 export interface SafeErrorResponse {
   success: false;

@@ -2,9 +2,8 @@ import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react'
 import { useClickOutside } from '../../hooks/useClickOutside.js';
 import { X, Plus, AlertCircle, Check, Search, ChevronDown, FileJson, CheckCircle2 } from 'lucide-react';
 import { useApp } from '../../context/AppContext.jsx';
-import { api, buildDocumentNumber } from '../../utils/api.js';
+import { api, buildDocumentNumber, countDocsForSeqReset, DEFAULT_RULES, getWorkspaceSettings } from '../../utils/api.js';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { getWorkspaceSettings } from '../../utils/api.js';
 import { useUnits } from '../../hooks/useUnits.js';
 import GoodsInLineItem from './GoodsInLineItem.jsx';
 import './GoodsInCreateModal.css';
@@ -36,7 +35,17 @@ function docToLine(item) {
   };
 }
 
-export default function GoodsInCreateModal({ doc, initialAiData, onClose, onSuccess, products, suppliers, contactsEnabled = true, existingDocsThisMonth }) {
+export default function GoodsInCreateModal({
+  doc,
+  initialAiData,
+  onClose,
+  onSuccess,
+  products,
+  suppliers,
+  contactsEnabled = true,
+  existingDocsThisMonth,
+  docs = [],
+}) {
   const { t } = useApp();
   const queryClient = useQueryClient();
   const isEdit = Boolean(doc);
@@ -52,11 +61,20 @@ export default function GoodsInCreateModal({ doc, initialAiData, onClose, onSucc
       ? (doc.issue_date ? doc.issue_date.slice(0, 10) : todayIso())
       : (initialAiData?.date || todayIso())
   );
+  const effectiveDocsCount = useMemo(() => {
+    if (docs && docs.length > 0) {
+      const rules = settings?.numbering?.rules || (Array.isArray(settings?.numbering) ? settings.numbering : null);
+      const rule = rules?.find((r) => r.type === 'goods_in') || DEFAULT_RULES.find((r) => r.type === 'goods_in');
+      return countDocsForSeqReset(docs, rule, date);
+    }
+    return existingDocsThisMonth ?? 0;
+  }, [docs, settings, date, existingDocsThisMonth]);
+
   const refNumber = useMemo(
     () => isEdit
       ? doc.document_number
-      : buildDocumentNumber('goods_in', date, existingDocsThisMonth ?? 0, settings),
-    [settings, date, existingDocsThisMonth, isEdit, doc]
+      : buildDocumentNumber('goods_in', date, effectiveDocsCount, settings),
+    [settings, date, effectiveDocsCount, isEdit, doc]
   );
   const [source, setSource] = useState(
     doc

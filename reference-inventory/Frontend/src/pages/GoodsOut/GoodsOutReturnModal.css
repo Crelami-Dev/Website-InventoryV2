@@ -538,3 +538,171 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* ── Document Picker (Standalone Mode) ───────────────────────── */
+.go-return__doc-picker {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.go-return__doc-picker-header {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.go-return__doc-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-height: 380px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.go-return__doc-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  transition: all var(--duration-fast);
+  cursor: pointer;
+}
+
+.go-return__doc-item:hover {
+  background: var(--color-surface-hover);
+  border-color: var(--color-interactive);
+}
+
+.go-return__doc-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.go-return__doc-num {
+  font-family: var(--font-mono);
+  font-size: var(--text-small);
+  font-weight: 700;
+  color: var(--color-text-primary);
+}
+
+.go-return__doc-meta {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* ── Selected Document Banner ────────────────────────────────── */
+.go-return__selected-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2-5) var(--space-4);
+  background: var(--color-surface-alt);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.go-return__selected-info {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.go-return__selected-badge {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  color: var(--color-interactive);
+  font-size: var(--text-small);
+}
+
+.go-return__change-doc-btn {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-interactive);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all var(--duration-fast);
+}
+
+.go-return__change-doc-btn:hover {
+  background: var(--color-surface);
+  border-color: var(--color-interactive);
+}
+
+/* ── Dual Condition Inputs (Baik / Rusak) ────────────────────── */
+.go-return__dual-qty {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.go-return__dual-box {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.go-return__dual-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 4px;
+  border-radius: var(--radius-xs);
+}
+
+.go-return__dual-label--good {
+  color: var(--color-success);
+  background: var(--color-success-surface);
+}
+
+.go-return__dual-label--damaged {
+  color: var(--color-danger);
+  background: var(--color-danger-surface);
+}
+
+.go-return__serial-condition-toggle {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.go-return__serial-condition-btn {
+  padding: 2px 7px;
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  border: none;
+  cursor: pointer;
+  transition: all var(--duration-fast);
+}
+
+.go-return__serial-condition-btn--active-good {
+  background: var(--color-success);
+  color: #ffffff;
+}
+
+.go-return__serial-condition-btn--active-damaged {
+  background: var(--color-danger);
+  color: #ffffff;
+}
+

@@ -9,6 +9,8 @@ export const sidebar = {
   'sidebar.products': 'Produk',
   'sidebar.goodsIn': 'Barang Masuk',
   'sidebar.goodsOut': 'Barang Keluar',
+  'sidebar.returns': 'Retur Barang',
+  'sidebar.serialGrouping': 'Grouping Serial',
   'sidebar.reports': 'Laporan',
   'sidebar.customers': 'Pelanggan',
   'sidebar.suppliers': 'Pemasok',

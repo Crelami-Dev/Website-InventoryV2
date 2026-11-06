@@ -371,7 +371,8 @@ export default function StockOpname({ products = [], documents = [] }) {
   const { data: queriedDocuments = [] } = useQuery({
     queryKey: ['workspace-documents', activeWarehouseId || 'all'],
     queryFn: async () => {
-      const res = await api.get('/api/workspace/documents');
+      const whParam = activeWarehouseId ? `?warehouse_id=${encodeURIComponent(activeWarehouseId)}` : '';
+      const res = await api.get(`/api/workspace/documents${whParam}`);
       if (!res.ok) return [];
       const json = await res.json().catch(() => ({}));
       return Array.isArray(json?.data) ? json.data : [];
@@ -402,12 +403,15 @@ export default function StockOpname({ products = [], documents = [] }) {
     refetchOnWindowFocus: false,
   });
 
-  // Fast In-Memory Lookup Map: serial (lowercase & normalized) -> { serialNumber, productId, unit, status, warehouseId }
+  // Fast In-Memory Lookup Map: serial (lowercase & normalized) -> { serialNumber, productId, unit, status, warehouseId, goodsInDocId, createdAt }
   const serialIndexLookupMap = useMemo(() => {
     const map = new Map();
     (serialIndexResponse || []).forEach((row) => {
-      const [sn, pId, unit, status, whId] = row;
+      const [sn, pId, unit, status, whId, goodsInDocId, createdAt] = row;
       if (!sn) return;
+      if (activeWarehouseId && whId && String(whId) !== String(activeWarehouseId)) {
+        return;
+      }
       const cleanSn = String(sn).trim();
       const lower = cleanSn.toLowerCase();
       const entry = {
@@ -416,15 +420,25 @@ export default function StockOpname({ products = [], documents = [] }) {
         unit: unit || null,
         status: status || 'available',
         warehouseId: whId || null,
+        goodsInDocId: goodsInDocId || null,
+        createdAt: createdAt || null,
       };
       map.set(lower, entry);
       const norm = lower.replace(/[^a-z0-9]/g, '');
       if (norm && norm !== lower) {
         map.set(norm, entry);
       }
+      // Pemetaan variasi barcode tanpa tanda strip / kode unit (contoh: HGET110-PK5-2707260007 -> hget1102707260007)
+      const parts = cleanSn.split('-');
+      if (parts.length >= 3) {
+        const withoutUnit = (parts[0] + parts.slice(2).join('')).toLowerCase().replace(/[^a-z0-9]/g, '');
+        if (withoutUnit && !map.has(withoutUnit)) {
+          map.set(withoutUnit, entry);
+        }
+      }
     });
     return map;
-  }, [serialIndexResponse]);
+  }, [serialIndexResponse, activeWarehouseId]);
 
   // Fast Product Lookups by ID and SKU for 0ms in-memory resolution
   const productsById = useMemo(() => {
@@ -449,6 +463,9 @@ export default function StockOpname({ products = [], documents = [] }) {
     (serialIndexResponse || []).forEach((row) => {
       const [sn, pId, unit, status, whId, goodsInDocId, createdAt] = row;
       if (!pId) return;
+      if (activeWarehouseId && whId && String(whId) !== String(activeWarehouseId)) {
+        return;
+      }
       if (!map.has(pId)) map.set(pId, []);
       map.get(pId).push({
         serialNumber: sn,
@@ -460,7 +477,50 @@ export default function StockOpname({ products = [], documents = [] }) {
       });
     });
     return map;
-  }, [serialIndexResponse]);
+  }, [serialIndexResponse, activeWarehouseId]);
+
+  // Map: product SKU (uppercase) -> array of { serialNumber, unit, status, warehouseId, goodsInDocId, createdAt, productId }
+  // Menjaga agar pencarian serial per SKU benar-benar berasal dari produk yang sama, BUKAN substring collision
+  const productSerialsBySkuMap = useMemo(() => {
+    const map = new Map();
+    const idToSku = new Map();
+    (products || []).forEach((p) => {
+      if (p.id && p.sku) idToSku.set(p.id, String(p.sku).trim().toUpperCase());
+    });
+    (serialIndexResponse || []).forEach((row) => {
+      const [sn, pId, unit, status, whId, goodsInDocId, createdAt] = row;
+      if (!sn || !pId) return;
+      if (activeWarehouseId && whId && String(whId) !== String(activeWarehouseId)) {
+        return;
+      }
+      const sku = idToSku.get(pId);
+      if (sku) {
+        if (!map.has(sku)) map.set(sku, []);
+        map.get(sku).push({
+          serialNumber: sn,
+          unit,
+          status,
+          warehouseId: whId,
+          goodsInDocId,
+          createdAt,
+          productId: pId,
+        });
+      }
+    });
+    return map;
+  }, [serialIndexResponse, products, activeWarehouseId]);
+
+  // Helper untuk mendapatkan seluruh nomor seri terdaftar yang sah untuk sebuah produk (bebas dari substring collision)
+  const getRegisteredSerialsForProduct = (pId, sku) => {
+    if (pId && productSerialsMap.has(pId)) {
+      return productSerialsMap.get(pId) || [];
+    }
+    const skuKey = String(sku || '').trim().toUpperCase();
+    if (skuKey && productSerialsBySkuMap.has(skuKey)) {
+      return productSerialsBySkuMap.get(skuKey) || [];
+    }
+    return [];
+  };
 
   // Map: serial (lowercase) -> unit key, dari database serial gudang
   const serialUnitMap = useMemo(() => {
@@ -543,17 +603,24 @@ export default function StockOpname({ products = [], documents = [] }) {
     let totalManualPcs = 0;
     let hasAnyManualInput = false;
 
-    const entries = Array.isArray(item?.manualEntries) && item.manualEntries.length > 0
-      ? item.manualEntries
-      : (item?.manualQty !== undefined && item?.manualQty !== null && String(item?.manualQty).trim() !== ''
-          ? [{ qty: item.manualQty, unit: item.manualUnit || item.inputUnit || 'pcs' }]
-          : (item?.inputVal !== undefined && item?.inputVal !== null && String(item?.inputVal).trim() !== ''
-              ? [{ qty: item.inputVal, unit: item.inputUnit || 'pcs' }]
-              : []));
+    // Jika produk ber-seri dan sudah memiliki nomor seri yang di-scan,
+    // jangan pernah fallback ke manualQty/inputVal dan abaikan entri m_legacy_ / m_init_
+    let entries = [];
+    if (Array.isArray(item?.manualEntries) && item.manualEntries.length > 0) {
+      entries = hasSerials
+        ? item.manualEntries.filter((e) => !String(e.id || '').startsWith('m_legacy_') && !String(e.id || '').startsWith('m_init_'))
+        : item.manualEntries;
+    } else if (!hasSerials) {
+      if (item?.manualQty !== undefined && item?.manualQty !== null && String(item?.manualQty).trim() !== '') {
+        entries = [{ qty: item.manualQty, unit: item.manualUnit || item.inputUnit || 'pcs' }];
+      } else if (item?.inputVal !== undefined && item?.inputVal !== null && String(item?.inputVal).trim() !== '') {
+        entries = [{ qty: item.inputVal, unit: item.inputUnit || 'pcs' }];
+      }
+    }
 
     entries.forEach((entry) => {
       const rawQty = String(entry?.qty ?? '').trim();
-      if (rawQty !== '' && !isNaN(Number(rawQty))) {
+      if (rawQty !== '' && !isNaN(Number(rawQty)) && Number(rawQty) > 0) {
         hasAnyManualInput = true;
         const mult = Number(getMultiplier(entry.unit || 'pcs')) || 1;
         totalManualPcs += Number(rawQty) * mult;
@@ -622,6 +689,7 @@ export default function StockOpname({ products = [], documents = [] }) {
   const scannedSerialsInCurrentAreaRef = useRef(new Set());
   const scannedSerialsInCurrentAreaMapRef = useRef(new Map()); // Map: cleanSerial -> { itemId, name, sku } untuk lookup O(1)
   const [expandedSerialGroups, setExpandedSerialGroups] = useState({}); // State expand/collapse per group serial chip
+  const [expandedLocationSerials, setExpandedLocationSerials] = useState({}); // State expand/collapse per location scanned serial numbers in Tab 2
 
   // Expandable discrepancy state in Tab 3
   const [expandedDiscrepancySku, setExpandedDiscrepancySku] = useState(null);
@@ -679,6 +747,7 @@ export default function StockOpname({ products = [], documents = [] }) {
   const [sessionSearch, setSessionSearch] = useState('');
   const [discrepancySearch, setDiscrepancySearch] = useState('');
   const [productSummarySearch, setProductSummarySearch] = useState('');
+  const [showZeroStock, setShowZeroStock] = useState(false);
 
   // Camera scanner hook for checkingArea modal (upgraded with native BarcodeDetector, high-res & torch)
   const { cameraActive, hasTorch, isTorchOn, toggleTorch } = useCameraScanner({
@@ -798,7 +867,7 @@ export default function StockOpname({ products = [], documents = [] }) {
   const [isSyncingStock, setIsSyncingStock] = useState(false);
 
   // Live Reconciled Product Summary & Discrepancies
-  // Menyesuaikan stok sistem secara langsung dengan data stok produk terkini gudang aktif
+  // Menyesuaikan stok sistem dan temuan fisik secara langsung dengan data area & nomor seri terkini gudang aktif
   const {
     productSummary,
     discrepancyItems,
@@ -832,6 +901,92 @@ export default function StockOpname({ products = [], documents = [] }) {
       if (p.sku) liveProdBySku.set(String(p.sku).trim().toUpperCase(), p);
     });
 
+    // Satukan daftar area aktif dengan state checkingItems jika modal area sedang dibuka
+    const currentAreas = (activeSession?.areas || []).map((a) => {
+      if (checkingArea && (a.areaId === checkingArea.areaId || a.id === checkingArea.id || a.areaId === checkingArea.id)) {
+        return { ...a, items: checkingItems };
+      }
+      return a;
+    });
+
+    // Helper: agregasi temuan fisik di seluruh area untuk sebuah produk (dengan multiplier unit SN akurat)
+    const aggregateProductPhysicalFromAreas = (pId, skuKey) => {
+      let countedPhysQty = 0;
+      let hasBeenCounted = false;
+      const aggregatedLocations = [];
+      const aggregatedSerials = [];
+
+      currentAreas.forEach((area) => {
+        (area.items || []).forEach((areaIt) => {
+          const match = (areaIt.productId && pId && areaIt.productId === pId) ||
+                        (areaIt.sku && skuKey && String(areaIt.sku).trim().toUpperCase() === skuKey);
+          if (!match) return;
+
+          const hasSerials = Array.isArray(areaIt.scannedSerials) && areaIt.scannedSerials.length > 0;
+          const hasManual = Array.isArray(areaIt.manualEntries) && areaIt.manualEntries.some((e) => String(e.qty ?? '').trim() !== '' && Number(e.qty) > 0);
+          const hasLegacy = areaIt.manualQty !== undefined && areaIt.manualQty !== null && String(areaIt.manualQty).trim() !== '' && Number(areaIt.manualQty) > 0;
+          const hasExplicitPhys = areaIt.physicalQty !== null && areaIt.physicalQty !== undefined && !isNaN(Number(areaIt.physicalQty));
+
+          if (!hasSerials && !hasManual && !hasLegacy && !hasExplicitPhys) return;
+
+          hasBeenCounted = true;
+
+          let serialPcs = 0;
+          if (hasSerials) {
+            areaIt.scannedSerials.forEach((sn) => {
+              const u = getSerialUnit(areaIt, sn);
+              const mult = Number(getMultiplier(u)) || 1;
+              serialPcs += mult;
+              aggregatedSerials.push(sn);
+            });
+          }
+
+          let manualPcs = 0;
+          if (Array.isArray(areaIt.manualEntries) && areaIt.manualEntries.length > 0) {
+            const validEntries = hasSerials
+              ? areaIt.manualEntries.filter((e) => !String(e.id || '').startsWith('m_legacy_') && !String(e.id || '').startsWith('m_init_'))
+              : areaIt.manualEntries;
+            validEntries.forEach((entry) => {
+              const q = Number(entry?.qty);
+              if (!isNaN(q) && q > 0) {
+                const u = entry?.unit || 'pcs';
+                const mult = Number(getMultiplier(u)) || 1;
+                manualPcs += q * mult;
+              }
+            });
+          } else if (hasLegacy && !hasSerials) {
+            const q = Number(areaIt.manualQty);
+            const u = areaIt.manualUnit || areaIt.unit || 'pcs';
+            const mult = Number(getMultiplier(u)) || 1;
+            manualPcs += q * mult;
+          }
+
+          let areaPcs = 0;
+          if (hasSerials || hasManual || (hasLegacy && !hasSerials)) {
+            areaPcs = serialPcs + manualPcs;
+          } else {
+            areaPcs = Number(areaIt.physicalQty) || 0;
+          }
+
+          countedPhysQty += areaPcs;
+          aggregatedLocations.push({
+            areaId: area.areaId || area.id,
+            areaName: area.areaName || area.name,
+            physicalQty: areaPcs,
+            scannedSerials: areaIt.scannedSerials || [],
+            notes: areaIt.notes || '',
+          });
+        });
+      });
+
+      return {
+        hasBeenCounted,
+        totalPhysicalQty: countedPhysQty,
+        locations: aggregatedLocations,
+        scannedSerials: aggregatedSerials,
+      };
+    };
+
     let totalSys = 0;
     let totalPhys = 0;
     const discrepancies = [];
@@ -841,23 +996,12 @@ export default function StockOpname({ products = [], documents = [] }) {
       const skuKey = String(item.sku || item.productId || '').trim().toUpperCase();
       handledSkus.add(skuKey);
 
-      // Ambil seluruh nomor seri yang terdaftar di database untuk produk ini
-      let allSerialsForProd = [];
-      if (item.productId && productSerialsMap.has(item.productId)) {
-        allSerialsForProd = productSerialsMap.get(item.productId) || [];
-      } else if (item.sku) {
-        const skuToken = item.sku.toLowerCase();
-        productSerialsMap.forEach((serials) => {
-          serials.forEach((s) => {
-            if (s.serialNumber && s.serialNumber.toLowerCase().includes(skuToken)) {
-              allSerialsForProd.push(s);
-            }
-          });
-        });
-      }
+      // Ambil seluruh nomor seri yang terdaftar di database untuk produk ini (hanya yang sah terdaftar di produk ini, tanpa substring collision)
+      const allSerialsForProd = getRegisteredSerialsForProduct(item.productId, item.sku);
 
       const availableSerialsForProd = allSerialsForProd.filter(
-        (s) => s.status === 'available' || isSerialFromSoGoodsIn(s.serialNumber, s)
+        (s) => (s.status === 'available' || isSerialFromSoGoodsIn(s.serialNumber, s)) &&
+               (!activeWarehouseId || !s.warehouseId || String(s.warehouseId) === String(activeWarehouseId))
       );
 
       const live = (item.productId && liveProdById.get(item.productId)) || (skuKey && liveProdBySku.get(skuKey));
@@ -874,14 +1018,17 @@ export default function StockOpname({ products = [], documents = [] }) {
         sysQty = live !== undefined && live !== null ? Math.max(0, Number(live.stock) || 0) : Number(item.totalSystemQty) || 0;
       }
 
-      const physQty = Number(item.totalPhysicalQty) || 0;
+      // Deteksi temuan fisik live dari area-area pemeriksaan
+      const areaData = aggregateProductPhysicalFromAreas(item.productId, skuKey);
+      const hasCounted = areaData.hasBeenCounted || Boolean(item.hasBeenCounted);
+      const physQty = areaData.hasBeenCounted ? areaData.totalPhysicalQty : (Number(item.totalPhysicalQty) || 0);
       const diff = physQty - sysQty;
 
       totalSys += sysQty;
       totalPhys += physQty;
 
       let status = 'pending';
-      if (!item.hasBeenCounted) {
+      if (!hasCounted) {
         status = sysQty === 0 ? 'matched' : 'pending';
       } else if (diff === 0) {
         status = 'matched';
@@ -898,6 +1045,11 @@ export default function StockOpname({ products = [], documents = [] }) {
         totalPhysicalQty: physQty,
         difference: diff,
         status,
+        hasBeenCounted: hasCounted,
+        locations: areaData.locations.length > 0 ? areaData.locations : (item.locations || []),
+        scannedSerials: areaData.scannedSerials.length > 0
+          ? Array.from(new Set(areaData.scannedSerials))
+          : (item.scannedSerials || []),
       };
 
       if (status === 'shortage' || status === 'overage' || (status === 'pending' && sysQty > 0)) {
@@ -909,7 +1061,7 @@ export default function StockOpname({ products = [], documents = [] }) {
           systemQty: sysQty,
           physicalQty: physQty,
           difference: diff,
-          status,
+          status: diff < 0 ? 'shortage' : status === 'overage' ? 'overage' : status,
           locations: reconciledItem.locations || [],
           scannedSerials: reconciledItem.scannedSerials || [],
         });
@@ -922,19 +1074,9 @@ export default function StockOpname({ products = [], documents = [] }) {
     products.forEach((lp) => {
       const skuKey = String(lp.sku || lp.id).trim().toUpperCase();
       if (!handledSkus.has(skuKey)) {
-        let allSerialsForProd = [];
-        if (lp.id && productSerialsMap.has(lp.id)) {
-          allSerialsForProd = productSerialsMap.get(lp.id) || [];
-        } else if (lp.sku) {
-          const skuToken = lp.sku.toLowerCase();
-          productSerialsMap.forEach((serials) => {
-            serials.forEach((s) => {
-              if (s.serialNumber && s.serialNumber.toLowerCase().includes(skuToken)) {
-                allSerialsForProd.push(s);
-              }
-            });
-          });
-        }
+        handledSkus.add(skuKey);
+        // Ambil seluruh nomor seri yang terdaftar di database untuk produk ini (hanya yang sah terdaftar di produk ini, tanpa substring collision)
+        const allSerialsForProd = getRegisteredSerialsForProduct(lp.id, lp.sku);
         const availableSerialsForProd = allSerialsForProd.filter(
           (s) => s.status === 'available' || isSerialFromSoGoodsIn(s.serialNumber, s)
         );
@@ -950,9 +1092,25 @@ export default function StockOpname({ products = [], documents = [] }) {
           sysQty = Math.max(0, Number(lp.stock) || 0);
         }
 
+        // Agregasi temuan fisik dari area untuk produk katalog ini
+        const areaData = aggregateProductPhysicalFromAreas(lp.id, skuKey);
+        const physQty = areaData.totalPhysicalQty;
+        const hasCounted = areaData.hasBeenCounted;
+        const diff = hasCounted ? physQty - sysQty : -sysQty;
+
         totalSys += sysQty;
-        const diff = -sysQty;
-        const status = sysQty === 0 ? 'matched' : 'pending';
+        totalPhys += physQty;
+
+        let status = 'pending';
+        if (!hasCounted) {
+          status = sysQty === 0 ? 'matched' : 'pending';
+        } else if (diff === 0) {
+          status = 'matched';
+        } else if (diff < 0) {
+          status = 'shortage';
+        } else {
+          status = 'overage';
+        }
 
         const newItem = {
           productId: lp.id,
@@ -960,30 +1118,88 @@ export default function StockOpname({ products = [], documents = [] }) {
           name: lp.name,
           unit: lp.unitKey || 'pcs',
           totalSystemQty: sysQty,
-          totalPhysicalQty: 0,
+          totalPhysicalQty: physQty,
           difference: diff,
           status,
-          hasBeenCounted: false,
-          locations: [],
-          scannedSerials: [],
+          hasBeenCounted: hasCounted,
+          locations: areaData.locations,
+          scannedSerials: Array.from(new Set(areaData.scannedSerials)),
         };
         summary.push(newItem);
 
-        if (sysQty > 0) {
+        if (status === 'shortage' || status === 'overage' || (status === 'pending' && sysQty > 0)) {
           discrepancies.push({
             productId: lp.id,
             sku: lp.sku,
             name: lp.name,
             unit: lp.unitKey || 'pcs',
             systemQty: sysQty,
-            physicalQty: 0,
+            physicalQty: physQty,
             difference: diff,
-            status,
-            locations: [],
-            scannedSerials: [],
+            status: diff < 0 ? 'shortage' : status === 'overage' ? 'overage' : status,
+            locations: areaData.locations,
+            scannedSerials: Array.from(new Set(areaData.scannedSerials)),
           });
         }
       }
+    });
+
+    // Tambahkan produk temuan baru / unlisted dari area yang belum ada di katalog maupun summary
+    currentAreas.forEach((area) => {
+      (area.items || []).forEach((areaIt) => {
+        const skuKey = String(areaIt.sku || areaIt.productId || '').trim().toUpperCase();
+        if (skuKey && !handledSkus.has(skuKey)) {
+          handledSkus.add(skuKey);
+          const areaData = aggregateProductPhysicalFromAreas(areaIt.productId, skuKey);
+          const physQty = areaData.totalPhysicalQty;
+          const sysQty = Number(areaIt.systemQty) || 0;
+          const diff = physQty - sysQty;
+
+          totalSys += sysQty;
+          totalPhys += physQty;
+
+          let status = 'pending';
+          if (!areaData.hasBeenCounted) {
+            status = sysQty === 0 ? 'matched' : 'pending';
+          } else if (diff === 0) {
+            status = 'matched';
+          } else if (diff < 0) {
+            status = 'shortage';
+          } else {
+            status = 'overage';
+          }
+
+          const newItem = {
+            productId: areaIt.productId || null,
+            sku: areaIt.sku || '',
+            name: areaIt.name || areaIt.sku || 'Item',
+            unit: areaIt.unit || 'pcs',
+            totalSystemQty: sysQty,
+            totalPhysicalQty: physQty,
+            difference: diff,
+            status,
+            hasBeenCounted: areaData.hasBeenCounted,
+            locations: areaData.locations,
+            scannedSerials: Array.from(new Set(areaData.scannedSerials)),
+          };
+          summary.push(newItem);
+
+          if (status === 'shortage' || status === 'overage' || (status === 'pending' && sysQty > 0)) {
+            discrepancies.push({
+              productId: newItem.productId,
+              sku: newItem.sku,
+              name: newItem.name,
+              unit: newItem.unit,
+              systemQty: sysQty,
+              physicalQty: physQty,
+              difference: diff,
+              status,
+              locations: areaData.locations,
+              scannedSerials: Array.from(new Set(areaData.scannedSerials)),
+            });
+          }
+        }
+      });
     });
 
     discrepancies.sort((a, b) => Math.abs(b.difference) - Math.abs(a.difference) || a.name.localeCompare(b.name));
@@ -1003,7 +1219,18 @@ export default function StockOpname({ products = [], documents = [] }) {
       discrepancyItems: discrepancies,
       warehouseReconciliation: reconciliation,
     };
-  }, [sessionDetailResponse, products, isFinalized]);
+  }, [
+    sessionDetailResponse,
+    products,
+    isFinalized,
+    activeSession,
+    checkingArea,
+    checkingItems,
+    getMultiplier,
+    customUnits,
+    serialIndexLookupMap,
+    serialUnitMap,
+  ]);
 
   // Kumpulan seluruh entri temuan fisik non-seri manual di area ini yang belum di-import ke Goods In
   const unimportedNonSerialTargets = useMemo(() => {
@@ -1252,16 +1479,20 @@ export default function StockOpname({ products = [], documents = [] }) {
             // 1. Fisik yang ada serial number-nya
             if (Array.isArray(item.scannedSerials) && item.scannedSerials.length > 0) {
               item.scannedSerials.forEach((sn) => {
-                const u = item.serialUnits?.[sn] || item.serialUnits?.[sn.toLowerCase()] || item.unit || 'pcs';
+                const u = getSerialUnit(item, sn);
                 const mult = Number(getMultiplier(u)) || 1;
                 serialCount += mult;
                 serialNumbersList.push(sn);
               });
             }
 
-            // 2. Fisik non-seri dari input manual
+            // 2. Fisik non-seri dari input manual (hanya hitung entri manual murni jika ber-seri)
+            const hasSerialsInLoc = Array.isArray(item.scannedSerials) && item.scannedSerials.length > 0;
             if (Array.isArray(item.manualEntries) && item.manualEntries.length > 0) {
-              item.manualEntries.forEach((entry) => {
+              const validEntries = hasSerialsInLoc
+                ? item.manualEntries.filter((e) => !String(e.id || '').startsWith('m_legacy_') && !String(e.id || '').startsWith('m_init_'))
+                : item.manualEntries;
+              validEntries.forEach((entry) => {
                 const q = Number(entry?.qty);
                 if (!isNaN(q) && q > 0) {
                   const u = entry?.unit || 'pcs';
@@ -1271,7 +1502,7 @@ export default function StockOpname({ products = [], documents = [] }) {
                   nonSerialBreakdown.push({ qty: q, unit: u, pcs, areaName: area.areaName });
                 }
               });
-            } else if (item.manualQty !== undefined && item.manualQty !== null && String(item.manualQty).trim() !== '') {
+            } else if (!hasSerialsInLoc && item.manualQty !== undefined && item.manualQty !== null && String(item.manualQty).trim() !== '') {
               const q = Number(item.manualQty);
               if (!isNaN(q) && q > 0) {
                 const u = item.manualUnit || item.unit || 'pcs';
@@ -1314,7 +1545,17 @@ export default function StockOpname({ products = [], documents = [] }) {
         missingDbSerials,
       };
     });
-  }, [productSummary, activeSession, getMultiplier, productSerialsMap, allWorkspaceDocs, createdDocBySku]);
+  }, [
+    productSummary,
+    activeSession,
+    getMultiplier,
+    customUnits,
+    serialIndexLookupMap,
+    serialUnitMap,
+    productSerialsMap,
+    allWorkspaceDocs,
+    createdDocBySku,
+  ]);
 
   // Auto-sinkronkan baseline jika sesi belum memiliki baseline seluruh produk gudang
   React.useEffect(() => {
@@ -1504,8 +1745,11 @@ export default function StockOpname({ products = [], documents = [] }) {
             unit: m.unit || it.manualUnit || it.inputUnit || it.unit || 'pcs',
             convertedToGoodsIn: m.convertedToGoodsIn || null,
           }));
-        } else if (it.manualQty !== undefined && it.manualQty !== null && String(it.manualQty).trim() !== '') {
-          // Kompatibilitas data legacy manualQty & manualUnit
+          if (hasSerials) {
+            initManualEntries = initManualEntries.filter((m) => !String(m.id || '').startsWith('m_legacy_'));
+          }
+        } else if (!hasSerials && it.manualQty !== undefined && it.manualQty !== null && String(it.manualQty).trim() !== '') {
+          // Kompatibilitas data legacy manualQty & manualUnit (hanya jika produk non-seri)
           initManualEntries = [
             {
               id: `m_legacy_${Date.now()}`,
@@ -1522,21 +1766,6 @@ export default function StockOpname({ products = [], documents = [] }) {
               unit: it.manualUnit || it.unit || 'pcs',
             },
           ];
-        } else if (hasSerials && it.physicalQty !== null && it.physicalQty !== undefined) {
-          // Automatic recovery jika physicalQty lebih besar dari akumulasi nomor seri
-          const serialPcs = (it.scannedSerials || []).reduce((acc, sn) => {
-            const u = getSerialUnit(it, sn);
-            return acc + (Number(getMultiplier(u)) || 1);
-          }, 0);
-          if (it.physicalQty > serialPcs) {
-            initManualEntries = [
-              {
-                id: `m_legacy_${Date.now()}`,
-                qty: String(it.physicalQty - serialPcs),
-                unit: it.manualUnit || it.unit || 'pcs',
-              },
-            ];
-          }
         }
 
         // Minimal selalu miliki 1 entry default
@@ -1604,9 +1833,10 @@ export default function StockOpname({ products = [], documents = [] }) {
   const otherAreasSerialMap = useMemo(() => {
     const map = new Map();
     if (!activeSession || !Array.isArray(activeSession.areas)) return map;
-    const currentAreaId = checkingArea?.areaId;
+    const currentAreaId = checkingArea?.areaId || checkingArea?.id;
     for (const a of activeSession.areas) {
-      if (a.areaId === currentAreaId) continue;
+      const thisAreaId = a.areaId || a.id;
+      if (currentAreaId && thisAreaId && String(thisAreaId) === String(currentAreaId)) continue;
       if (!Array.isArray(a.items)) continue;
       for (const it of a.items) {
         if (!Array.isArray(it.scannedSerials)) continue;
@@ -1621,7 +1851,7 @@ export default function StockOpname({ products = [], documents = [] }) {
       }
     }
     return map;
-  }, [activeSession, checkingArea?.areaId]);
+  }, [activeSession, checkingArea?.areaId, checkingArea?.id]);
 
   // Handler: Proses Barcode / Serial Number secara Seketika (Satset 0ms)
   const handleEnqueueBarcode = async (rawCode, { source = 'input' } = {}) => {
@@ -2451,9 +2681,12 @@ export default function StockOpname({ products = [], documents = [] }) {
     if (!activeSession || !checkingArea || isSavingCount) return;
 
     const payloadItems = checkingItems.map((it) => {
+      const hasSerials = Array.isArray(it.scannedSerials) && it.scannedSerials.length > 0;
       const num = computeItemPcs(it);
-      const entries = Array.isArray(it.manualEntries) ? it.manualEntries : [];
-      const firstNonEmpty = entries.find((e) => String(e.qty ?? '').trim() !== '') || entries[0];
+      const entries = Array.isArray(it.manualEntries)
+        ? (hasSerials ? it.manualEntries.filter((e) => !String(e.id || '').startsWith('m_legacy_')) : it.manualEntries)
+        : [];
+      const firstNonEmpty = entries.find((e) => String(e.qty ?? '').trim() !== '' && Number(e.qty) > 0);
       return {
         id: it.id,
         productId: it.productId,
@@ -2465,8 +2698,9 @@ export default function StockOpname({ products = [], documents = [] }) {
         notes: it.notes || '',
         isUnlisted: Boolean(it.isUnlisted),
         scannedSerials: Array.isArray(it.scannedSerials) ? it.scannedSerials : [],
+        serialUnits: it.serialUnits || {},
         manualEntries: entries,
-        manualQty: firstNonEmpty ? firstNonEmpty.qty : (it.manualQty ?? null),
+        manualQty: firstNonEmpty ? firstNonEmpty.qty : (hasSerials ? null : (it.manualQty ?? null)),
         manualUnit: firstNonEmpty ? firstNonEmpty.unit : (it.manualUnit || 'pcs'),
       };
     });
@@ -3090,14 +3324,75 @@ export default function StockOpname({ products = [], documents = [] }) {
     );
   }, [discrepancyItems, discrepancySearch, discrepancyFilterMode, resolvedDiscrepancyIds, createdDocBySku]);
 
-  // Filtered product summary
-  const filteredProductSummary = useMemo(() => {
-    if (!productSummarySearch.trim()) return productSummary;
-    const q = productSummarySearch.toLowerCase();
-    return productSummary.filter(
-      (p) => p.sku?.toLowerCase().includes(q) || p.name?.toLowerCase().includes(q)
-    );
-  }, [productSummary, productSummarySearch]);
+  // Helper: Pengelompokan Tingkat Urutan Rekap Produk Gudang (Subtab 2)
+  // Tier 1: Terdeteksi dan sudah sesuai totalnya (Total Fisik == Total Sistem > 0) -> Paling atas
+  // Tier 2: Terdeteksi tapi belum sesuai (Total Fisik > 0 & ada selisih) -> Urut dari tersedikit ke banyak
+  // Tier 3: Belum terdeteksi sama sekali tapi ada stok sistem (Fisik 0 & Sistem > 0) -> Urut dari tersedikit ke banyak
+  // Tier 4: Stok sistem 0 & fisik 0 -> Paling bawah (dapat di-collapse / lihat selengkapnya)
+  const getProductSortTier = (p) => {
+    const phys = Number(p.totalPhysicalQty) || 0;
+    const sys = Number(p.totalSystemQty) || 0;
+    const diff = Number(p.difference) || 0;
+
+    if (phys > 0 && diff === 0) return 1;
+    if (phys > 0 && diff !== 0) return 2;
+    if (phys === 0 && sys > 0) return 3;
+    return 4;
+  };
+
+  // Filtered & Tiered Sorted Product Summary (Subtab 2)
+  const { filteredProductSummary, zeroStockCount, totalProductCount } = useMemo(() => {
+    let list = [...(productSummary || [])];
+    const isSearching = Boolean(productSummarySearch.trim());
+
+    if (isSearching) {
+      const q = productSummarySearch.toLowerCase();
+      list = list.filter(
+        (p) => p.sku?.toLowerCase().includes(q) || p.name?.toLowerCase().includes(q)
+      );
+    }
+
+    // Urutkan per kategori tier sesuai permintaan
+    const sorted = [...list].sort((a, b) => {
+      const tierA = getProductSortTier(a);
+      const tierB = getProductSortTier(b);
+      if (tierA !== tierB) return tierA - tierB;
+
+      // Tier 1: Sudah sesuai -> urutkan nama
+      if (tierA === 1) {
+        return (a.name || '').localeCompare(b.name || '');
+      }
+      // Tier 2: Terdeteksi belum sesuai -> urutkan dari yang tersedikit ke yang banyak (totalPhysicalQty)
+      if (tierA === 2) {
+        const physA = Number(a.totalPhysicalQty) || 0;
+        const physB = Number(b.totalPhysicalQty) || 0;
+        if (physA !== physB) return physA - physB;
+        return (a.name || '').localeCompare(b.name || '');
+      }
+      // Tier 3: Belum kescan -> urutkan dari yang tersedikit ke yang banyak (totalSystemQty)
+      if (tierA === 3) {
+        const sysA = Number(a.totalSystemQty) || 0;
+        const sysB = Number(b.totalSystemQty) || 0;
+        if (sysA !== sysB) return sysA - sysB;
+        return (a.name || '').localeCompare(b.name || '');
+      }
+      // Tier 4: Stok 0 -> urutkan nama
+      return (a.name || '').localeCompare(b.name || '');
+    });
+
+    const zeroCount = sorted.filter((p) => getProductSortTier(p) === 4).length;
+
+    // Sembunyikan produk stok 0 jika tidak sedang mencari dan toggle belum dibuka
+    const visible = (!isSearching && !showZeroStock)
+      ? sorted.filter((p) => getProductSortTier(p) !== 4)
+      : sorted;
+
+    return {
+      filteredProductSummary: visible,
+      zeroStockCount: zeroCount,
+      totalProductCount: sorted.length,
+    };
+  }, [productSummary, productSummarySearch, showZeroStock]);
 
   // ─────────────────────────────────────────────────────────
   // RENDER: VIEW 1 — DAFTAR SESI & MASTER AREA
@@ -4298,12 +4593,17 @@ export default function StockOpname({ products = [], documents = [] }) {
                   </tr>
                 ) : (
                   filteredProductSummary.map((p) => {
-                    const isMatched = p.status === 'matched';
-                    const isShort = p.status === 'shortage';
-                    const isOver = p.status === 'overage';
+                    const physVal = Number(p.totalPhysicalQty) || 0;
+                    const sysVal = Number(p.totalSystemQty) || 0;
+                    const diffVal = Number(p.difference) || 0;
+
+                    const isMatched = physVal > 0 && diffVal === 0;
+                    const isShort = physVal > 0 && diffVal < 0;
+                    const isOver = physVal > 0 && diffVal > 0;
+                    const isZeroStock = physVal === 0 && sysVal === 0;
 
                     return (
-                      <tr key={p.sku} className="reports-table-row">
+                      <tr key={p.sku || p.productId || p.id} className="reports-table-row">
                         <td>
                           <div className="text-bold">{p.name}</div>
                           <span className="text-mono" style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>
@@ -4312,36 +4612,130 @@ export default function StockOpname({ products = [], documents = [] }) {
                         </td>
                         <td>pcs</td>
                         <td>
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                             {(!p.locations || p.locations.length === 0) ? (
                               <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', fontStyle: 'italic' }}>
                                 Belum ditemukan di area manapun
                               </span>
                             ) : (
-                              p.locations.map((loc, idx) => (
-                                <div
-                                  key={idx}
-                                  style={{
-                                    fontSize: '11px',
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    gap: '6px',
-                                  }}
-                                >
-                                  <span style={{ fontWeight: 600 }}>📍 {loc.areaName}:</span>
-                                  <span style={{ fontWeight: 700, color: 'var(--color-text-primary)' }}>
-                                    {loc.physicalQty !== null ? renderQty(loc.physicalQty) : '—'}
-                                  </span>
-                                  {Array.isArray(loc.scannedSerials) && loc.scannedSerials.length > 0 ? (
-                                    <span style={{ color: 'var(--color-text-muted)', fontSize: '10px' }}>
-                                      [serial: {formatSerialBreakdown(loc.scannedSerials)}]
-                                    </span>
-                                  ) : null}
-                                  {loc.notes ? (
-                                    <span style={{ color: 'var(--color-text-muted)', fontSize: '10px' }}>({loc.notes})</span>
-                                  ) : null}
-                                </div>
-                              ))
+                              p.locations.map((loc, idx) => {
+                                const serials = Array.isArray(loc.scannedSerials) ? loc.scannedSerials : [];
+                                const hasSerials = serials.length > 0;
+                                const locKey = `${p.sku || p.productId || p.id}_${loc.areaId || idx}`;
+                                const isExpanded = Boolean(expandedLocationSerials[locKey]);
+
+                                return (
+                                  <div
+                                    key={idx}
+                                    style={{
+                                      fontSize: '11px',
+                                      display: 'flex',
+                                      flexDirection: 'column',
+                                      gap: '3px',
+                                      padding: '2px 0',
+                                    }}
+                                  >
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                                      <span style={{ fontWeight: 600 }}>📍 {loc.areaName}:</span>
+                                      <span style={{ fontWeight: 700, color: 'var(--color-text-primary)' }}>
+                                        {loc.physicalQty !== null ? renderQty(loc.physicalQty) : '—'}
+                                      </span>
+                                      {hasSerials && (
+                                        <>
+                                          <span style={{ color: 'var(--color-text-muted)', fontSize: '10px' }}>
+                                            [serial: {formatSerialBreakdown(serials)}]
+                                          </span>
+                                          <button
+                                            type="button"
+                                            className="btn btn-ghost btn-xs"
+                                            onClick={() => setExpandedLocationSerials((prev) => ({ ...prev, [locKey]: !prev[locKey] }))}
+                                            style={{
+                                              padding: '1px 6px',
+                                              fontSize: '10px',
+                                              height: 'auto',
+                                              display: 'inline-flex',
+                                              alignItems: 'center',
+                                              gap: '3px',
+                                              background: isExpanded ? 'var(--color-primary-light, #e0e7ff)' : 'var(--color-surface-hover, #f1f5f9)',
+                                              color: isExpanded ? 'var(--color-primary, #3b82f6)' : 'var(--color-text-secondary)',
+                                              border: '1px solid var(--color-border)',
+                                              borderRadius: '4px',
+                                              cursor: 'pointer',
+                                            }}
+                                            title="Tampilkan / Sembunyikan Nomor Seri yang Berhasil Di-scan"
+                                          >
+                                            <Barcode size={11} />
+                                            <span>{isExpanded ? 'Tutup SN' : `Lihat ${serials.length} SN`}</span>
+                                          </button>
+                                        </>
+                                      )}
+                                      {loc.notes ? (
+                                        <span style={{ color: 'var(--color-text-muted)', fontSize: '10px' }}>({loc.notes})</span>
+                                      ) : null}
+                                    </div>
+
+                                    {/* Panel Daftar Nomor Seri yang Berhasil Di-scan */}
+                                    {hasSerials && isExpanded && (
+                                      <div
+                                        style={{
+                                          marginTop: '3px',
+                                          padding: '6px 8px',
+                                          background: 'var(--color-surface-alt, #f8fafc)',
+                                          border: '1px solid var(--color-border, #e2e8f0)',
+                                          borderRadius: '6px',
+                                          display: 'flex',
+                                          flexDirection: 'column',
+                                          gap: '4px',
+                                          maxWidth: '100%',
+                                        }}
+                                      >
+                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                          <span style={{ fontSize: '10px', fontWeight: 600, color: 'var(--color-text-secondary)' }}>
+                                            Nomor Seri ({serials.length} item):
+                                          </span>
+                                          <button
+                                            type="button"
+                                            className="btn btn-ghost btn-xs"
+                                            onClick={() => {
+                                              navigator.clipboard.writeText(serials.join('\n'));
+                                              alert(`Berhasil menyalin ${serials.length} nomor seri ke clipboard!`);
+                                            }}
+                                            style={{ fontSize: '9.5px', padding: '1px 5px', height: '18px' }}
+                                          >
+                                            📋 Salin Semua
+                                          </button>
+                                        </div>
+                                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '3px', maxHeight: '140px', overflowY: 'auto' }}>
+                                          {serials.map((sn, sIdx) => {
+                                            const u = getSerialUnit(null, sn);
+                                            return (
+                                              <span
+                                                key={sIdx}
+                                                style={{
+                                                  display: 'inline-flex',
+                                                  alignItems: 'center',
+                                                  gap: '4px',
+                                                  background: 'var(--color-surface, #ffffff)',
+                                                  border: '1px solid var(--color-border, #cbd5e1)',
+                                                  borderRadius: '3px',
+                                                  padding: '1px 5px',
+                                                  fontFamily: 'monospace',
+                                                  fontSize: '10px',
+                                                }}
+                                              >
+                                                <span>{sn}</span>
+                                                <span style={{ color: 'var(--color-primary, #2563eb)', fontSize: '9px', fontWeight: 600 }}>
+                                                  ({u})
+                                                </span>
+                                              </span>
+                                            );
+                                          })}
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })
                             )}
                           </div>
                         </td>
@@ -4354,14 +4748,14 @@ export default function StockOpname({ products = [], documents = [] }) {
                         <td className="text-right font-bold text-mono">
                           <span
                             className={
-                              p.difference === 0
+                              diffVal === 0
                                 ? 'so-diff-val--zero'
-                                : p.difference > 0
+                                : diffVal > 0
                                 ? 'so-diff-val--pos'
                                 : 'so-diff-val--neg'
                             }
                           >
-                            {renderQty(p.difference, { signed: true })}
+                            {renderQty(diffVal, { signed: true })}
                           </span>
                         </td>
                         <td>
@@ -4371,14 +4765,18 @@ export default function StockOpname({ products = [], documents = [] }) {
                             </span>
                           ) : isShort ? (
                             <span className="so-badge so-badge--shortage">
-                              <AlertTriangle size={12} /> Kurang ({Math.abs(p.difference)} pcs)
+                              <AlertTriangle size={12} /> Kurang ({Math.abs(diffVal)} pcs)
                             </span>
                           ) : isOver ? (
                             <span className="so-badge so-badge--overage">
-                              <AlertTriangle size={12} /> Lebih (+{p.difference} pcs)
+                              <AlertTriangle size={12} /> Lebih (+{diffVal} pcs)
+                            </span>
+                          ) : isZeroStock ? (
+                            <span className="so-badge so-badge--neutral">
+                              Stok 0 (Kosong)
                             </span>
                           ) : (
-                            <span className="so-badge so-badge--pending">Belum Selesai</span>
+                            <span className="so-badge so-badge--pending">Belum Diperiksa</span>
                           )}
                         </td>
                       </tr>
@@ -4388,6 +4786,46 @@ export default function StockOpname({ products = [], documents = [] }) {
               </tbody>
             </table>
           </div>
+
+          {/* Tombol Lihat Selengkapnya untuk produk stok 0 sistem */}
+          {zeroStockCount > 0 && !productSummarySearch.trim() && (
+            <div
+              style={{
+                marginTop: 'var(--space-2)',
+                padding: 'var(--space-3)',
+                background: 'var(--color-surface, #ffffff)',
+                border: '1px dashed var(--color-border, #e2e8f0)',
+                borderRadius: 'var(--radius-md, 8px)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                flexWrap: 'wrap',
+                gap: '8px',
+              }}
+            >
+              <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)' }}>
+                📦 Terdapat <strong>{zeroStockCount}</strong> produk dengan stok sistem 0 (belum ada temuan fisik).
+              </div>
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                onClick={() => setShowZeroStock((prev) => !prev)}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+              >
+                {showZeroStock ? (
+                  <>
+                    <ChevronUp size={14} />
+                    <span>Sembunyikan {zeroStockCount} Produk Stok 0</span>
+                  </>
+                ) : (
+                  <>
+                    <ChevronDown size={14} />
+                    <span>Lihat Selengkapnya ({zeroStockCount} Produk Stok 0)</span>
+                  </>
+                )}
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -4491,26 +4929,12 @@ export default function StockOpname({ products = [], documents = [] }) {
                   filteredDiscrepancies.map((item) => {
                     const isExpanded = expandedDiscrepancySku === item.sku;
 
-                    // Ambil seluruh nomor seri yang aktif di database untuk produk ini (hanya yang berstatus 'available' atau temuan SO)
-                    let registeredSerials = [];
-                    if (item.productId && productSerialsMap.has(item.productId)) {
-                      registeredSerials = (productSerialsMap.get(item.productId) || []).filter(
-                        (s) => s.status === 'available' || isSerialFromSoGoodsIn(s.serialNumber, s)
-                      );
-                    } else if (item.sku) {
-                      const skuToken = item.sku.toLowerCase();
-                      productSerialsMap.forEach((serials) => {
-                        serials.forEach((s) => {
-                          if (
-                            (s.status === 'available' || isSerialFromSoGoodsIn(s.serialNumber, s)) &&
-                            s.serialNumber &&
-                            s.serialNumber.toLowerCase().includes(skuToken)
-                          ) {
-                            registeredSerials.push(s);
-                          }
-                        });
-                      });
-                    }
+                    // Ambil seluruh nomor seri yang aktif di database untuk produk ini (hanya yang berstatus 'available' atau temuan SO, tanpa substring collision)
+                    const allProdSerials = getRegisteredSerialsForProduct(item.productId, item.sku);
+                    const registeredSerials = allProdSerials.filter(
+                      (s) => (s.status === 'available' || isSerialFromSoGoodsIn(s.serialNumber, s)) &&
+                             (!activeWarehouseId || !s.warehouseId || String(s.warehouseId) === String(activeWarehouseId))
+                    );
 
                     const scannedList = item.scannedSerials || [];
                     const scannedSet = new Set(scannedList.map((s) => s.toLowerCase()));
@@ -4596,9 +5020,9 @@ export default function StockOpname({ products = [], documents = [] }) {
                               <span className="so-badge so-badge--not_found">
                                 <XCircle size={11} /> Tidak Ditemukan
                               </span>
-                            ) : item.status === 'shortage' ? (
+                            ) : item.difference < 0 || item.status === 'shortage' ? (
                               <span className="so-badge so-badge--shortage">
-                                <AlertTriangle size={11} /> Kurang ({Math.abs(item.difference)} pcs)
+                                <AlertTriangle size={11} /> Kurang (-{Math.abs(item.difference)} pcs)
                               </span>
                             ) : (
                               <span className="so-badge so-badge--overage">
@@ -4969,8 +5393,13 @@ export default function StockOpname({ products = [], documents = [] }) {
                                 <div>
                                   <span className="text-accent">{p.serialNumbersList.length} SN</span>
                                   <div style={{ fontSize: '10px', color: 'var(--color-text-muted)', fontWeight: 'normal' }}>
-                                    ({p.serialCount} pcs)
+                                    ({renderQty(p.serialCount)})
                                   </div>
+                                  {p.serialNumbersList.length > 0 && (
+                                    <div style={{ fontSize: '10px', color: 'var(--color-text-secondary)', fontWeight: '500', marginTop: '2px' }}>
+                                      [{formatSerialBreakdown(p.serialNumbersList)}]
+                                    </div>
+                                  )}
                                 </div>
                               ) : (
                                 <span style={{ color: 'var(--color-text-muted)', fontWeight: 'normal' }}>0 SN</span>

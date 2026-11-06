@@ -7,6 +7,7 @@ export const settings = {
   'settings.tab.units': 'Satuan Inventory',
   'settings.tab.documents': 'Dokumen',
   'settings.tab.modules': 'Modul',
+  'settings.tab.dailyReport': 'Laporan Harian',
 
   'settings.profile.title': 'Profil Saya',
   'settings.profile.subtitle': 'Kelola informasi profil, kata sandi, dan preferensi tampilan',

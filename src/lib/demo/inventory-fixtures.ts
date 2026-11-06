@@ -42,7 +42,7 @@ export interface SerialNumberItem {
   productId: string;
   warehouseId: string;
   serialNumber: string;
-  status: "AVAILABLE" | "RESERVED" | "OUT" | "QUARANTINE";
+  status: "AVAILABLE" | "RESERVED" | "OUT" | "QUARANTINE" | "GROUPED";
   location?: string;
   receivedAt: string;
   lastReference?: string;
@@ -200,6 +200,7 @@ export interface CommercialDocument {
 export interface ReturnItem {
   id: string;
   returnNumber: string;
+  returnType?: "CUSTOMER_RETURN" | "SUPPLIER_RETURN";
   sourceReference: string;
   warehouseId: string;
   warehouseName: string;
@@ -207,7 +208,7 @@ export interface ReturnItem {
   partnerName: string;
   reason: "SALAH_KIRIM" | "PEMBATALAN" | "SALAH_INPUT" | "CACAT" | "LAINNYA";
   reopenSourceQty: boolean;
-  status: "PENDING_REVIEW" | "APPROVED" | "REJECTED";
+  status: "DRAFT" | "RECEIVED" | "COMPLETED" | "CANCELLED" | "PENDING_REVIEW" | "APPROVED" | "REJECTED";
   notes?: string;
   items: {
     productId: string;

@@ -50,6 +50,8 @@ export function createDatabaseConnection(customPath?: string): DatabaseClient {
     rawDb.exec("PRAGMA busy_timeout = 5000;");
   }
 
+  let inTransaction = false;
+
   const client: DatabaseClient = {
     exec(sql: string) {
       rawDb.exec(sql);
@@ -72,6 +74,10 @@ export function createDatabaseConnection(customPath?: string): DatabaseClient {
       rawDb.close();
     },
     transaction<T>(fn: () => T): T {
+      if (inTransaction) {
+        return fn();
+      }
+      inTransaction = true;
       rawDb.exec("BEGIN IMMEDIATE;");
       try {
         const result = fn();
@@ -80,6 +86,8 @@ export function createDatabaseConnection(customPath?: string): DatabaseClient {
       } catch (error) {
         rawDb.exec("ROLLBACK;");
         throw error;
+      } finally {
+        inTransaction = false;
       }
     },
   };

@@ -5,6 +5,8 @@ import { Button } from "@/components/ui/button";
 import { Badge, Alert } from "@/components/ui/feedback";
 import { SearchIcon, RotateCcwIcon, FilterIcon } from "@/components/ui/icons";
 import { StockOpnameInvestigationDialog } from "./stock-opname-investigation-dialog";
+import { StockOpnameFinalizeDialog } from "./stock-opname-finalize-dialog";
+import { useActiveContext } from "@/lib/demo/active-context-provider";
 import { evaluateStockOpnameReconciliationAction } from "@/lib/inventory/actions";
 import type {
   StockOpnameReconciliationItem,
@@ -22,6 +24,7 @@ export function StockOpnameReconciliationView({
   isReadOnly,
   onReconciliationUpdated,
 }: StockOpnameReconciliationViewProps) {
+  const { currentRole } = useActiveContext();
   const [data, setData] = useState<StockOpnameReconciliationSummary | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -35,6 +38,44 @@ export function StockOpnameReconciliationView({
   // Dialog State
   const [selectedItem, setSelectedItem] = useState<StockOpnameReconciliationItem | null>(null);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
+  const [isFinalizeOpen, setIsFinalizeOpen] = useState(false);
+  const [finalizedMessage, setFinalizedMessage] = useState<string | null>(null);
+  const [isExporting, setIsExporting] = useState(false);
+
+  // Download Excel Workbook Handler (Phase 7)
+  async function handleExportExcel() {
+    if (isExporting) return;
+    setIsExporting(true);
+    setErrorMsg(null);
+
+    try {
+      const res = await fetch(`/api/inventory/stock-opname/${sessionId}/export`);
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.error || "Gagal mengunduh file Excel.");
+      }
+      const disposition = res.headers.get("Content-Disposition");
+      let filename = `Stock_Opname_${sessionId}.xlsx`;
+      if (disposition) {
+        const match = disposition.match(/filename="?([^"]+)"?/);
+        if (match && match[1]) filename = match[1];
+      }
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Terjadi kesalahan saat mengekspor file Excel.";
+      setErrorMsg(msg);
+    } finally {
+      setIsExporting(false);
+    }
+  }
 
   // Fetch / Evaluate reconciliation
   async function loadReconciliation(refresh: boolean = false) {
@@ -310,6 +351,19 @@ export function StockOpnameReconciliationView({
             <RotateCcwIcon className={`h-3 w-3 ${isRefreshing ? "animate-spin" : ""}`} />
             <span>{isRefreshing ? "Menghitung..." : "Hitung Ulang"}</span>
           </Button>
+
+          {/* Ekspor Excel Button (Phase 7) */}
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={handleExportExcel}
+            disabled={isExporting || isLoading}
+            className="flex items-center gap-1.5 text-xs whitespace-nowrap font-medium text-text-primary"
+            title="Unduh laporan audit rekonsiliasi lengkap 5-sheet (.xlsx)"
+          >
+            <span>{isExporting ? "Mengekspor..." : "Ekspor Excel"}</span>
+          </Button>
         </div>
       </div>
 
@@ -555,29 +609,61 @@ export function StockOpnameReconciliationView({
         </div>
       </div>
 
-      {/* 4. Panel Informasi Phase 6 Guard */}
-      <div className="rounded-lg border border-border-default bg-surface-card p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-        <div className="space-y-0.5">
-          <span className="text-xs font-bold text-text-primary uppercase tracking-wide block">
-            Posting Penyesuaian ke Ledger (Phase 6)
-          </span>
-          <p className="text-xs text-text-muted">
-            Proses posting mutasi penyesuaian stok ke inventory ledger resmi dilindungi oleh otorisasi role Owner
-            dan transaksi atomik pada Phase 6.
-          </p>
-        </div>
+      {/* 4. Panel Persetujuan & Finalisasi Penyesuaian (Phase 6) */}
+      {finalizedMessage && (
+        <Alert variant="success" title="Sesi Berhasil Difinalisasi" description={finalizedMessage} />
+      )}
 
-        <Button
-          type="button"
-          variant="primary"
-          size="sm"
-          disabled={true}
-          className="opacity-50 cursor-not-allowed whitespace-nowrap"
-          title="Fitur ini akan aktif pada Phase 6 (Otorisasi Khusus Owner)"
-        >
-          Posting Penyesuaian ke Ledger
-        </Button>
-      </div>
+      {data.session.status === "ADJUSTED" || data.session.status === "COMPLETED" ? (
+        <div className="rounded-lg border border-success/40 bg-success/5 p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="space-y-0.5">
+            <div className="flex items-center gap-2">
+              <Badge variant="success" size="sm" className="font-semibold">
+                TERKUNCI: {data.session.status}
+              </Badge>
+              <span className="text-xs font-bold text-text-primary uppercase tracking-wide">
+                Penyesuaian Stok Resmi Telah Diposting
+              </span>
+            </div>
+            <p className="text-xs text-text-muted">
+              Sesi Stock Opname ini telah disetujui dan mutasi stok telah dibukukan ke inventory ledger. Sesi
+              terkunci permanen dan tidak dapat menerima perubahan hitungan fisik atau pemindaian barcode lagi.
+            </p>
+          </div>
+          <Badge variant="neutral" size="sm" className="font-mono text-[11px] self-start sm:self-auto">
+            Diposting oleh Owner
+          </Badge>
+        </div>
+      ) : (
+        <div className="rounded-lg border border-border-default bg-surface-card p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="space-y-0.5">
+            <span className="text-xs font-bold text-text-primary uppercase tracking-wide block">
+              Persetujuan & Posting Penyesuaian ke Ledger (Phase 6)
+            </span>
+            <p className="text-xs text-text-muted">
+              {currentRole === "OWNER"
+                ? "Sebagai Owner, Anda berwenang menyetujui hasil rekonsiliasi dan memposting mutasi STOCK_ADJUSTMENT_POSTED secara atomik."
+                : "Hanya pengguna dengan peran Owner yang berwenang menyetujui dan memposting penyesuaian stok ke buku besar."}
+            </p>
+          </div>
+
+          <Button
+            type="button"
+            variant="primary"
+            size="sm"
+            onClick={() => setIsFinalizeOpen(true)}
+            disabled={isReadOnly || currentRole !== "OWNER"}
+            className="whitespace-nowrap"
+            title={
+              currentRole !== "OWNER"
+                ? "Hanya Owner yang berwenang menyetujui penyesuaian"
+                : "Buka dialog konfirmasi persetujuan penyesuaian"
+            }
+          >
+            Setujui & Posting Penyesuaian
+          </Button>
+        </div>
+      )}
 
       {/* Modal Dialog Investigasi Selisih */}
       <StockOpnameInvestigationDialog
@@ -590,6 +676,22 @@ export function StockOpnameReconciliationView({
           setSelectedItem(null);
         }}
         onSaved={handleInvestigationSaved}
+      />
+
+      {/* Modal Dialog Finalisasi & Persetujuan (Phase 6) */}
+      <StockOpnameFinalizeDialog
+        open={isFinalizeOpen}
+        sessionId={sessionId}
+        summary={data}
+        currentRole={currentRole}
+        onClose={() => setIsFinalizeOpen(false)}
+        onSuccess={(result) => {
+          setFinalizedMessage(
+            `Sesi berhasil disetujui dan berstatus '${result.status}'. ${result.totalAdjustedLines} produk disesuaikan (${result.ledgerEntriesCreated} entri ledger dibuat).`
+          );
+          loadReconciliation(true);
+          onReconciliationUpdated?.();
+        }}
       />
     </div>
   );

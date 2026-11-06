@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { useClickOutside } from '../../hooks/useClickOutside.js';
-import { Trash2, Search, Plus, ChevronDown } from 'lucide-react';
+import { Trash2, Search, Plus, ChevronDown, AlertTriangle } from 'lucide-react';
 import { useApp } from '../../context/AppContext.jsx';
 import { useUnits } from '../../hooks/useUnits.js';
 import { api } from '../../utils/api.js';
@@ -22,6 +22,7 @@ export default function GoodsOutLineItem({
   layout = 'table',
   inputRef,
   documentId = null,
+  allowUnrecorded = true,
 }) {
   const { t } = useApp();
   const { units, customUnits, formatUnitOption } = useUnits();
@@ -49,7 +50,7 @@ export default function GoodsOutLineItem({
 
   // Auto-focus blank rows on mount
   useEffect(() => {
-    if (!item.productId && !item.serialNumber) {
+    if (!item.productId && !item.serialNumber && !item.isUnrecorded) {
       const timer = setTimeout(() => {
         inputElRef.current?.focus();
       }, 30);
@@ -111,10 +112,38 @@ export default function GoodsOutLineItem({
     const next = !item.isSerial;
     onChange({
       isSerial: next,
+      isUnrecorded: false,
       qty: 1,
       qtyUnit: 'pcs',
       serialNumber: '',
     });
+  };
+
+  const handleUnrecordedToggle = (checked) => {
+    if (checked) {
+      onChange({
+        isUnrecorded: true,
+        isSerial: false,
+        serialNumber: '',
+        qty: item.qty || 1,
+        qtyUnit: item.qtyUnit || 'pcs',
+      });
+      setSerialLookupState('idle');
+      setTimeout(() => {
+        if (searchRef.current) {
+          searchRef.current.focus();
+        }
+      }, 50);
+    } else {
+      onChange({
+        isUnrecorded: false,
+        isSerial: false,
+        serialNumber: '',
+        qty: item.qty || 1,
+        qtyUnit: item.qtyUnit || 'pcs',
+      });
+      setSerialLookupState('idle');
+    }
   };
 
   const handleQtyChange = (e) => {
@@ -155,8 +184,16 @@ export default function GoodsOutLineItem({
     }
   };
 
-  const detectUnit = (serialObj, prodObj) => {
+  const detectQtyAndUnit = (serialObj, prodObj) => {
+    const isGroup = Boolean(
+      serialObj?.metadata?.isGroup ??
+      serialObj?.isGroup ??
+      false
+    );
+
     const raw =
+      serialObj?.metadata?.targetUnit ||
+      serialObj?.targetUnit ||
       serialObj?.metadata?.serialUnit ||
       serialObj?.metadata?.unit ||
       serialObj?.metadata?.qtyUnit ||
@@ -164,54 +201,80 @@ export default function GoodsOutLineItem({
       serialObj?.serialUnit ||
       '';
 
+    let qtyUnit = 'pcs';
     const cleanRaw = String(raw).toLowerCase().trim();
     if (cleanRaw && cleanRaw !== 'pcs' && cleanRaw !== 'piece') {
       if (Array.isArray(customUnits) && customUnits.length > 0) {
         const found = customUnits.find((u) => u.key && String(u.key).toLowerCase().trim() === cleanRaw);
-        if (found) return found.key;
+        if (found) qtyUnit = found.key;
+        else qtyUnit = cleanRaw;
+      } else {
+        qtyUnit = cleanRaw;
       }
-      if (cleanRaw.includes('bal10') || cleanRaw.includes('10bl')) return 'bal10';
-      if (cleanRaw.includes('bal15') || cleanRaw.includes('15bl')) return 'bal15';
-      if (cleanRaw.includes('bal20') || cleanRaw.includes('20bl')) return 'bal20';
-      if (cleanRaw.includes('bal25') || cleanRaw.includes('25bl')) return 'bal25';
-      if (cleanRaw.includes('bal5') || cleanRaw.includes('5bl')) return 'bal5';
-      if (cleanRaw.includes('pack3') || cleanRaw.includes('pk3')) return 'pack3';
-      if (cleanRaw.includes('pack6') || cleanRaw.includes('pk6')) return 'pack6';
-      if (cleanRaw.includes('bal') || cleanRaw.includes('bl')) return 'bal';
-      if (cleanRaw.includes('pack') || cleanRaw.includes('pk')) return 'pack';
-      if (cleanRaw.includes('lusin') || cleanRaw.includes('dozen') || cleanRaw.includes('doz')) return 'lusin';
-      return cleanRaw;
-    }
-    if (cleanRaw === 'pcs' || cleanRaw === 'piece') {
-      return 'pcs';
-    }
-
-    // Fallback: only if no explicit unit is found on the serial object, guess from serial string pattern
-    const sn = String(serialObj?.serialNumber ?? serialObj?.serial_number ?? '').toLowerCase();
-    if (Array.isArray(customUnits) && customUnits.length > 0) {
-      const sorted = [...customUnits].sort((a, b) => (b.key?.length || 0) - (a.key?.length || 0));
-      for (const u of sorted) {
-        const k = String(u.key).toLowerCase().trim();
-        if (!k || k === 'pcs') continue;
-        if (sn.includes(k)) return k;
+      if (qtyUnit === cleanRaw) {
+        if (cleanRaw.includes('bal10') || cleanRaw.includes('10bl')) qtyUnit = 'bal10';
+        else if (cleanRaw.includes('bal15') || cleanRaw.includes('15bl')) qtyUnit = 'bal15';
+        else if (cleanRaw.includes('bal20') || cleanRaw.includes('20bl')) qtyUnit = 'bal20';
+        else if (cleanRaw.includes('bal25') || cleanRaw.includes('25bl')) qtyUnit = 'bal25';
+        else if (cleanRaw.includes('bal5') || cleanRaw.includes('5bl')) qtyUnit = 'bal5';
+        else if (cleanRaw.includes('pack3') || cleanRaw.includes('pk3')) qtyUnit = 'pack3';
+        else if (cleanRaw.includes('pack6') || cleanRaw.includes('pk6')) qtyUnit = 'pack6';
+        else if (cleanRaw.includes('bal') || cleanRaw.includes('bl')) qtyUnit = 'bal';
+        else if (cleanRaw.includes('pack') || cleanRaw.includes('pk')) qtyUnit = 'pack';
+        else if (cleanRaw.includes('lusin') || cleanRaw.includes('dozen') || cleanRaw.includes('doz')) qtyUnit = 'lusin';
+      }
+    } else if (cleanRaw === 'pcs' || cleanRaw === 'piece') {
+      qtyUnit = 'pcs';
+    } else {
+      // Fallback: guess from serial string pattern
+      const sn = String(serialObj?.serialNumber ?? serialObj?.serial_number ?? '').toLowerCase();
+      if (Array.isArray(customUnits) && customUnits.length > 0) {
+        const sorted = [...customUnits].sort((a, b) => (b.key?.length || 0) - (a.key?.length || 0));
+        for (const u of sorted) {
+          const k = String(u.key).toLowerCase().trim();
+          if (!k || k === 'pcs') continue;
+          if (sn.includes(k)) {
+            qtyUnit = k;
+            break;
+          }
+        }
+      }
+      if (qtyUnit === 'pcs') {
+        if (sn.includes('10bl') || sn.includes('bl10') || sn.includes('bal10')) qtyUnit = 'bal10';
+        else if (sn.includes('15bl') || sn.includes('bl15') || sn.includes('bal15')) qtyUnit = 'bal15';
+        else if (sn.includes('20bl') || sn.includes('bl20') || sn.includes('bal20')) qtyUnit = 'bal20';
+        else if (sn.includes('25bl') || sn.includes('bl25') || sn.includes('bal25')) qtyUnit = 'bal25';
+        else if (sn.includes('5bl') || sn.includes('bl5') || sn.includes('bal5')) qtyUnit = 'bal5';
+        else if (sn.includes('pack3') || sn.includes('pk3')) qtyUnit = 'pack3';
+        else if (sn.includes('pack6') || sn.includes('pk6')) qtyUnit = 'pack6';
+        else if (sn.includes('bal') || sn.includes('bl')) qtyUnit = 'bal';
+        else if (sn.includes('pack') || sn.includes('pk')) qtyUnit = 'pack';
+        else if (sn.includes('lusin') || sn.includes('dozen')) qtyUnit = 'lusin';
+        else {
+          const prodRaw = prodObj?.metadata?.qtyUnit || prodObj?.metadata?.unit || '';
+          if (prodRaw) qtyUnit = String(prodRaw).toLowerCase().trim();
+        }
       }
     }
-    if (sn.includes('10bl') || sn.includes('bl10') || sn.includes('bal10')) return 'bal10';
-    if (sn.includes('15bl') || sn.includes('bl15') || sn.includes('bal15')) return 'bal15';
-    if (sn.includes('20bl') || sn.includes('bl20') || sn.includes('bal20')) return 'bal20';
-    if (sn.includes('25bl') || sn.includes('bl25') || sn.includes('bal25')) return 'bal25';
-    if (sn.includes('5bl') || sn.includes('bl5') || sn.includes('bal5')) return 'bal5';
-    if (sn.includes('pack3') || sn.includes('pk3')) return 'pack3';
-    if (sn.includes('pack6') || sn.includes('pk6')) return 'pack6';
-    if (sn.includes('bal') || sn.includes('bl')) return 'bal';
-    if (sn.includes('pack') || sn.includes('pk')) return 'pack';
-    if (sn.includes('lusin') || sn.includes('dozen')) return 'lusin';
 
-    const prodRaw = prodObj?.metadata?.qtyUnit || prodObj?.metadata?.unit || '';
-    if (prodRaw) return String(prodRaw).toLowerCase().trim();
+    let qty = 1;
+    if (isGroup) {
+      const rawGroupQty = Number(
+        serialObj?.metadata?.targetQty ??
+        serialObj?.metadata?.unitQty ??
+        serialObj?.targetQty ??
+        serialObj?.unitQty ??
+        1
+      );
+      if (Number.isFinite(rawGroupQty) && rawGroupQty > 0) {
+        qty = rawGroupQty;
+      }
+    }
 
-    return 'pcs';
+    return { qty, qtyUnit, isGroup };
   };
+
+  const detectUnit = (serialObj, prodObj) => detectQtyAndUnit(serialObj, prodObj).qtyUnit;
 
   // Moves focus to the next row after a serial resolves. Guarded by the serial
   // itself so the instant resolution and the scanner's trailing Enter can both
@@ -242,16 +305,15 @@ export default function GoodsOutLineItem({
     if (serialCacheRef.current.has(cleanLower)) {
       const cached = serialCacheRef.current.get(cleanLower);
       if (cached.matched && cached.product) {
-        // Entries seeded by bulk paste carry no qtyUnit, so derive it here.
-        const cachedUnit = cached.qtyUnit || detectUnit(cached.matched, cached.product);
+        const { qty, qtyUnit } = detectQtyAndUnit(cached.matched, cached.product);
         onChange({
           productId: cached.product.id,
           productName: cached.product.name,
           sku: cached.product.sku || '',
           isSerial: true,
           serialNumber: cached.matched.serialNumber ?? cached.matched.serial_number ?? clean,
-          qty: 1,
-          qtyUnit: cachedUnit,
+          qty: cached.qty || qty,
+          qtyUnit: cached.qtyUnit || qtyUnit,
         });
         setSerialLookupState('valid');
         resolvedSerialRef.current = cleanLower;
@@ -283,8 +345,8 @@ export default function GoodsOutLineItem({
       let product = matched.product || products.find((p) => p.id === matchedProductId);
 
       if (product) {
-        const qtyUnit = detectUnit(matched, product);
-        serialCacheRef.current.set(cleanLower, { matched, product, qtyUnit });
+        const { qty, qtyUnit } = detectQtyAndUnit(matched, product);
+        serialCacheRef.current.set(cleanLower, { matched, product, qtyUnit, qty });
 
         onChange({
           productId: product.id,
@@ -292,8 +354,8 @@ export default function GoodsOutLineItem({
           sku: product.sku || '',
           isSerial: true,
           serialNumber: matched.serialNumber ?? matched.serial_number ?? clean,
-          qty: 1,
-          qtyUnit: qtyUnit,
+          qty,
+          qtyUnit,
         });
         setSerialLookupState('valid');
         resolvedSerialRef.current = cleanLower;
@@ -350,14 +412,24 @@ export default function GoodsOutLineItem({
       const product = products.find((p) => p.id === indexHit.productId);
       if (product) {
         serialLookupSequence.current++; // cancel any in-flight lookup
-        const qtyUnit = detectUnit({ serial_number: indexHit.serial, metadata: { serialUnit: indexHit.unit } }, product);
+        const { qty, qtyUnit } = detectQtyAndUnit({
+          serial_number: indexHit.serial,
+          isGroup: indexHit.isGroup,
+          targetQty: indexHit.targetQty,
+          metadata: {
+            serialUnit: indexHit.unit,
+            targetUnit: indexHit.unit,
+            isGroup: indexHit.isGroup,
+            targetQty: indexHit.targetQty,
+          },
+        }, product);
         onChange({
           productId: product.id,
           productName: product.name,
           sku: product.sku || '',
           isSerial: true,
           serialNumber: indexHit.serial,
-          qty: 1,
+          qty,
           qtyUnit,
         });
         setSerialLookupState('valid');
@@ -426,8 +498,18 @@ export default function GoodsOutLineItem({
         const product = products.find((p) => p.id === indexHit.productId);
         if (product) {
           serialLookupSequence.current++;
-          const qtyUnit = detectUnit(
-            { serial_number: indexHit.serial, metadata: { serialUnit: indexHit.unit } },
+          const { qty, qtyUnit } = detectQtyAndUnit(
+            {
+              serial_number: indexHit.serial,
+              isGroup: indexHit.isGroup,
+              targetQty: indexHit.targetQty,
+              metadata: {
+                serialUnit: indexHit.unit,
+                targetUnit: indexHit.unit,
+                isGroup: indexHit.isGroup,
+                targetQty: indexHit.targetQty,
+              },
+            },
             product
           );
           onChange({
@@ -436,7 +518,7 @@ export default function GoodsOutLineItem({
             sku: product.sku || '',
             isSerial: true,
             serialNumber: indexHit.serial,
-            qty: 1,
+            qty,
             qtyUnit,
           });
           setSerialLookupState('valid');
@@ -457,17 +539,18 @@ export default function GoodsOutLineItem({
 
   // Validate serial number: duplicate check within the form
   const isDuplicateSerial = useMemo(() => {
+    if (item.isUnrecorded) return false;
     if (!item.serialNumber?.trim()) return false;
     const sn = item.serialNumber.trim().toLowerCase();
     return (allLines || []).some(
-      (l) => l.id !== item.id && String(l.serialNumber || '').trim().toLowerCase() === sn
+      (l) => l.id !== item.id && !l.isUnrecorded && String(l.serialNumber || '').trim().toLowerCase() === sn
     );
-  }, [item.id, item.serialNumber, allLines]);
+  }, [item.id, item.serialNumber, item.isUnrecorded, allLines]);
 
   // Validate serial number exists and is available in inventory
-  const isUnavailableSerial = !!item.serialNumber?.trim() && serialLookupState === 'invalid';
+  const isUnavailableSerial = !item.isUnrecorded && !!item.serialNumber?.trim() && serialLookupState === 'invalid';
 
-  const isInvalidSerial = isDuplicateSerial || isUnavailableSerial || serialLookupState === 'loading';
+  const isInvalidSerial = !item.isUnrecorded && (isDuplicateSerial || isUnavailableSerial || serialLookupState === 'loading');
 
   // Render Product Selector
   const renderProductSelector = () => {
@@ -520,6 +603,12 @@ export default function GoodsOutLineItem({
             )}
           </div>
         )}
+        {item.isUnrecorded && item.productId && (
+          <div className="go-line-item__unrecorded-hint" title={t('goodsOut.line.unrecordedWarning')}>
+            <AlertTriangle size={12} className="go-line-item__unrecorded-hint-icon" />
+            <span>{t('goodsOut.line.unrecordedWarning')}</span>
+          </div>
+        )}
       </div>
     );
   };
@@ -527,40 +616,71 @@ export default function GoodsOutLineItem({
   // Render Table Layout (Desktop)
   if (layout === 'table') {
     return (
-      <tr className="go-table-row hover:bg-slate-50/40 align-middle">
+      <tr className={`go-table-row hover:bg-slate-50/40 align-middle ${item.isUnrecorded ? 'go-table-row--unrecorded' : ''}`}>
         {/* Row number */}
         <td style={{ textAlign: 'center', verticalAlign: 'middle', color: 'var(--color-text-muted)', fontFamily: 'var(--font-mono)', fontSize: '11px', padding: 'var(--space-3)' }}>{rowIndex + 1}</td>
         {/* Serial Number (Typed/Scanned first on the left) */}
         <td className="px-3 py-3 align-top">
-          <input
-            type="text"
-            className={`input ${isInvalidSerial ? 'go-line-item__sn-input--error' : ''}`}
-            placeholder={t('goodsOut.line.serialPlaceholder')}
-            value={item.serialNumber || ''}
-            onChange={(e) => handleSerialInputChange(e.target.value)}
-            onKeyDown={handleSerialKeyDown}
-            onPaste={(e) => {
-              const text = e.clipboardData.getData('text');
-              const lineCount = text.split(/[\r\n\t]+/).map((s) => s.trim()).filter(Boolean).length;
-              if (lineCount > 1 && onPasteSerials) {
-                e.preventDefault();
-                onPasteSerials(text);
-              }
-            }}
-            ref={(el) => {
-              inputElRef.current = el;
-              if (inputRef) inputRef(el);
-            }}
-          />
-          {isDuplicateSerial && (
-            <span className="go-line-item__sn-msg go-line-item__sn-msg--error">
-              Nomor seri duplikat
-            </span>
-          )}
-          {!isDuplicateSerial && isUnavailableSerial && (
-            <span className="go-line-item__sn-msg go-line-item__sn-msg--error">
-              Nomor seri tidak tersedia
-            </span>
+          {item.isUnrecorded ? (
+            <div className="go-line-item__unrecorded-sn-box">
+              <div className="go-line-item__unrecorded-badge-pill">
+                <AlertTriangle size={12} className="text-warning flex-shrink-0" />
+                <span>{t('goodsOut.line.unrecordedPlaceholder')}</span>
+              </div>
+              {allowUnrecorded && (
+                <label className="go-line-item__unrecorded-checkbox" title="Klik untuk mematikan mode barang belum terdata">
+                  <input
+                    type="checkbox"
+                    checked={true}
+                    onChange={(e) => handleUnrecordedToggle(e.target.checked)}
+                  />
+                  <span>{t('goodsOut.line.unrecordedLabel')}</span>
+                </label>
+              )}
+            </div>
+          ) : (
+            <>
+              <input
+                type="text"
+                className={`input ${isInvalidSerial ? 'go-line-item__sn-input--error' : ''}`}
+                placeholder={t('goodsOut.line.serialPlaceholder')}
+                value={item.serialNumber || ''}
+                onChange={(e) => handleSerialInputChange(e.target.value)}
+                onKeyDown={handleSerialKeyDown}
+                onPaste={(e) => {
+                  const text = e.clipboardData.getData('text');
+                  const lineCount = text.split(/[\r\n\t]+/).map((s) => s.trim()).filter(Boolean).length;
+                  if (lineCount > 1 && onPasteSerials) {
+                    e.preventDefault();
+                    onPasteSerials(text);
+                  }
+                }}
+                ref={(el) => {
+                  inputElRef.current = el;
+                  if (inputRef) inputRef(el);
+                }}
+              />
+              {isDuplicateSerial && (
+                <span className="go-line-item__sn-msg go-line-item__sn-msg--error">
+                  Nomor seri duplikat
+                </span>
+              )}
+              {!isDuplicateSerial && isUnavailableSerial && (
+                <span className="go-line-item__sn-msg go-line-item__sn-msg--error">
+                  Nomor seri tidak tersedia
+                </span>
+              )}
+              {allowUnrecorded && (
+                <label className="go-line-item__unrecorded-checkbox" title="Tandai jika barang fisik belum ada label nomor seri atau belum masuk data stok">
+                  <input
+                    type="checkbox"
+                    checked={false}
+                    onChange={(e) => handleUnrecordedToggle(e.target.checked)}
+                  />
+                  <span>{t('goodsOut.line.unrecordedLabel')}</span>
+                </label>
+              )}
+            </>
           )}
         </td>
 
@@ -582,23 +702,34 @@ export default function GoodsOutLineItem({
 
         {/* Tracking badge */}
         <td className="px-3 py-3 align-top">
-          <button
-            type="button"
-            className={`go-line-item__tracking-btn badge-tracking ${item.isSerial ? 'badge-tracking--serial' : ''}`}
-            disabled
-          >
-            {item.isSerial ? t('goodsOut.line.trackingSerial') : t('goodsOut.line.trackingNormal')}
-          </button>
+          {item.isUnrecorded ? (
+            <button
+              type="button"
+              className="go-line-item__tracking-btn badge-tracking badge-tracking--unrecorded"
+              disabled
+              title={t('goodsOut.line.unrecordedBadge')}
+            >
+              {t('goodsOut.line.unrecordedShort')}
+            </button>
+          ) : (
+            <button
+              type="button"
+              className={`go-line-item__tracking-btn badge-tracking ${item.isSerial ? 'badge-tracking--serial' : ''}`}
+              disabled
+            >
+              {item.isSerial ? t('goodsOut.line.trackingSerial') : t('goodsOut.line.trackingNormal')}
+            </button>
+          )}
         </td>
 
         {/* Quantity / Unit */}
         <td className="px-3 py-3 align-top">
-          {item.isSerial ? (
+          {item.isSerial && !item.isUnrecorded ? (
             <div className="go-line-item__qty-select-wrap">
               <input
                 type="text"
                 className="input go-line-item__sku-disabled go-line-item__qty-num-input"
-                value="1"
+                value={item.qty ?? 1}
                 disabled
               />
               <select className="input select go-line-item__sku-disabled go-line-item__qty-unit-select" value={item.qtyUnit || 'pcs'} disabled>
@@ -668,38 +799,59 @@ export default function GoodsOutLineItem({
         </button>
       )}
 
-      {/* Serial Number */}
+      {/* Serial Number & Unrecorded Toggle */}
       <div className="go-line-item-card__field">
-        <label className="go-line-item-card__label">{t('goodsOut.line.serial')}</label>
-        <input
-          type="text"
-          className={`input ${isInvalidSerial ? 'go-line-item__sn-input--error' : ''}`}
-          placeholder={t('goodsOut.line.serialPlaceholder')}
-          value={item.serialNumber || ''}
-          onChange={(e) => handleSerialInputChange(e.target.value)}
-          onKeyDown={handleSerialKeyDown}
-          onPaste={(e) => {
-            const text = e.clipboardData.getData('text');
-            const lineCount = text.split(/[\r\n\t]+/).map((s) => s.trim()).filter(Boolean).length;
-            if (lineCount > 1 && onPasteSerials) {
-              e.preventDefault();
-              onPasteSerials(text);
-            }
-          }}
-          ref={(el) => {
-            inputElRef.current = el;
-            if (inputRef) inputRef(el);
-          }}
-        />
-        {isDuplicateSerial && (
-          <span className="go-line-item__sn-msg go-line-item__sn-msg--error">
-            Nomor seri duplikat
-          </span>
-        )}
-        {!isDuplicateSerial && isUnavailableSerial && (
-          <span className="go-line-item__sn-msg go-line-item__sn-msg--error">
-            Nomor seri tidak tersedia
-          </span>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--space-1)' }}>
+          <label className="go-line-item-card__label" style={{ margin: 0 }}>{t('goodsOut.line.serial')}</label>
+          {allowUnrecorded && (
+            <label className="go-line-item__unrecorded-checkbox" style={{ margin: 0 }}>
+              <input
+                type="checkbox"
+                checked={Boolean(item.isUnrecorded)}
+                onChange={(e) => handleUnrecordedToggle(e.target.checked)}
+              />
+              <span>{t('goodsOut.line.unrecordedLabel')}</span>
+            </label>
+          )}
+        </div>
+        {item.isUnrecorded ? (
+          <div className="go-line-item__unrecorded-badge-pill" style={{ height: 38, padding: '0 12px' }}>
+            <AlertTriangle size={13} className="text-warning flex-shrink-0" />
+            <span>{t('goodsOut.line.unrecordedBadge')}</span>
+          </div>
+        ) : (
+          <>
+            <input
+              type="text"
+              className={`input ${isInvalidSerial ? 'go-line-item__sn-input--error' : ''}`}
+              placeholder={t('goodsOut.line.serialPlaceholder')}
+              value={item.serialNumber || ''}
+              onChange={(e) => handleSerialInputChange(e.target.value)}
+              onKeyDown={handleSerialKeyDown}
+              onPaste={(e) => {
+                const text = e.clipboardData.getData('text');
+                const lineCount = text.split(/[\r\n\t]+/).map((s) => s.trim()).filter(Boolean).length;
+                if (lineCount > 1 && onPasteSerials) {
+                  e.preventDefault();
+                  onPasteSerials(text);
+                }
+              }}
+              ref={(el) => {
+                inputElRef.current = el;
+                if (inputRef) inputRef(el);
+              }}
+            />
+            {isDuplicateSerial && (
+              <span className="go-line-item__sn-msg go-line-item__sn-msg--error">
+                Nomor seri duplikat
+              </span>
+            )}
+            {!isDuplicateSerial && isUnavailableSerial && (
+              <span className="go-line-item__sn-msg go-line-item__sn-msg--error">
+                Nomor seri tidak tersedia
+              </span>
+            )}
+          </>
         )}
       </div>
 
@@ -723,26 +875,37 @@ export default function GoodsOutLineItem({
         </div>
         <div>
           <label className="go-line-item-card__label">{t('goodsOut.line.serialMode')}</label>
-          <button
-            type="button"
-            className={`go-line-item__tracking-btn badge-tracking ${item.isSerial ? 'badge-tracking--serial' : ''}`}
-            disabled
-            style={{ width: '100%', height: 36, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-          >
-            {item.isSerial ? t('goodsOut.line.trackingSerial') : t('goodsOut.line.trackingNormal')}
-          </button>
+          {item.isUnrecorded ? (
+            <button
+              type="button"
+              className="go-line-item__tracking-btn badge-tracking badge-tracking--unrecorded"
+              disabled
+              style={{ width: '100%', height: 36, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+            >
+              {t('goodsOut.line.unrecordedShort')}
+            </button>
+          ) : (
+            <button
+              type="button"
+              className={`go-line-item__tracking-btn badge-tracking ${item.isSerial ? 'badge-tracking--serial' : ''}`}
+              disabled
+              style={{ width: '100%', height: 36, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+            >
+              {item.isSerial ? t('goodsOut.line.trackingSerial') : t('goodsOut.line.trackingNormal')}
+            </button>
+          )}
         </div>
       </div>
 
       {/* Quantity / Unit */}
       <div className="go-line-item-card__field">
         <label className="go-line-item-card__label">{t('goodsOut.line.qty')}</label>
-        {item.isSerial ? (
+        {item.isSerial && !item.isUnrecorded ? (
           <div className="go-line-item__qty-select-wrap">
             <input
               type="text"
               className="input go-line-item__sku-disabled go-line-item__qty-num-input"
-              value="1"
+              value={item.qty ?? 1}
               disabled
             />
             <select className="input select go-line-item__sku-disabled go-line-item__qty-unit-select" value={item.qtyUnit || 'pcs'} disabled>

@@ -1,13 +1,18 @@
 import React, { useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Plus, Barcode, History, Printer } from 'lucide-react';
+import { Plus, Barcode, History, Printer, Layers, PackageOpen } from 'lucide-react';
 import { useApp } from '../../context/AppContext.jsx';
 import { useUnits } from '../../hooks/useUnits.js';
+import { api } from '../../utils/api.js';
 import AddSerialInline from './AddSerialInline.jsx';
 import HistoryModal from './HistoryModal.jsx';
+import SerialGroupModal from './SerialGroupModal.jsx';
+import SerialCompositionModal from './SerialCompositionModal.jsx';
+import UngroupConfirmModal from './UngroupConfirmModal.jsx';
 import LabelSizePicker from '../../components/LabelSizePicker.jsx';
 import { openLabelPrintWindow, DEFAULT_LABEL_SIZE } from '../../utils/labelPrint.js';
 import { describeUnitQty } from '../../utils/reportUnits.js';
+import { filterDisplaySerials } from '../../utils/stockCalculation.js';
 import './SerialNumberTable.css';
 
 const SERIAL_STATUS_CONFIG = {
@@ -16,6 +21,8 @@ const SERIAL_STATUS_CONFIG = {
   out:       { label: 'productDetail.out',        chip: 'chip-danger-light' },
   damaged:   { label: 'productDetail.damaged',    chip: 'chip-danger-light' },
 };
+
+const EMPTY_ARRAY = [];
 
 export default function SerialNumberTable({
   serials,
@@ -34,57 +41,19 @@ export default function SerialNumberTable({
   const [searchQuery, setSearchQuery] = useState('');
   const [historyModalOpen, setHistoryModalOpen] = useState(false);
   const [historyModalType, setHistoryModalType] = useState('goods_in');
+  const [selectedSerialIds, setSelectedSerialIds] = useState(new Set());
+  const [groupModalOpen, setGroupModalOpen] = useState(false);
+  const [compositionModalOpen, setCompositionModalOpen] = useState(false);
+  const [selectedCompositionSerial, setSelectedCompositionSerial] = useState(null);
+  const [ungroupModalOpen, setUngroupModalOpen] = useState(false);
+  const [ungroupTarget, setUngroupTarget] = useState(null);
   const [labelSize, setLabelSize] = useState(() => {
     if (typeof window === 'undefined') return DEFAULT_LABEL_SIZE;
     return window.localStorage.getItem('docuflow_label_size') || DEFAULT_LABEL_SIZE;
   });
 
   const activeSerials = useMemo(() => {
-    if (!serials) return [];
-
-    // Build set of serial numbers that have been dispatched in completed/processing Goods Out / Invoice / Delivery documents
-    const outSerialSet = new Set();
-    (rawDocuments || []).forEach((doc) => {
-      const status = doc.status || 'draft';
-      const docType = doc.document_type || doc.type;
-      if (
-        (docType === 'goods_out' || docType === 'invoice' || docType === 'delivery_note') &&
-        (status === 'completed' || status === 'processing')
-      ) {
-        (doc.items || []).forEach((item) => {
-          const sn = item.metadata?.serialNumber || item.serialNumber || item.serial_number;
-          if (sn) {
-            outSerialSet.add(String(sn).trim().toLowerCase());
-          }
-        });
-      }
-    });
-
-    return serials.filter((s) => {
-      const goodsInDocId = s.goodsInDocumentId || s.goods_in_document_id;
-      if (!goodsInDocId) return false;
-      const linkedDoc = (rawDocuments ?? []).find((d) => d.id === goodsInDocId);
-      if (!linkedDoc || (linkedDoc.document_type !== 'goods_in' && linkedDoc.type !== 'goods_in') || linkedDoc.status === 'cancelled') {
-        return false;
-      }
-
-      const statusClean = String(s.status || '').toLowerCase();
-      if (statusClean === 'out' || statusClean === 'dispatched' || statusClean === 'sold') {
-        return false;
-      }
-      if (s.goodsOutDocumentId || s.goods_out_document_id) {
-        return false;
-      }
-      const snStr = String(s.serialNumber || s.serial_number || '').trim().toLowerCase();
-      if (snStr && outSerialSet.has(snStr)) {
-        // Check if this serial was returned â€” if so, show it despite doc history
-        if (s.metadata?.returnedAt) {
-          return true;
-        }
-        return false;
-      }
-      return true;
-    });
+    return filterDisplaySerials(serials, rawDocuments);
   }, [serials, rawDocuments]);
 
   const isSerial = trackingMode === 'serial' || activeSerials.length > 0 || stock > 0;
@@ -193,15 +162,36 @@ export default function SerialNumberTable({
     }
   };
 
-  const filteredSerials = activeSerials.filter((s) =>
-    (s.serialNumber || s.serial_number || '').toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const filteredSerials = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return activeSerials;
+
+    return activeSerials.filter((s) => {
+      const selfSn = String(s.serialNumber || s.serial_number || '').toLowerCase();
+      if (selfSn.includes(query)) return true;
+
+      // Jika serial adalah Group, cari juga apakah ada anggota / serial anak di dalamnya yang cocok dengan query
+      if (s.metadata?.isGroup) {
+        const composition = Array.isArray(s.metadata?.composition) ? s.metadata.composition : [];
+        const directMembers = Array.isArray(s.metadata?.directMembers) ? s.metadata.directMembers : [];
+        const hasMemberMatch =
+          composition.some((c) => String(c.serialNumber || '').toLowerCase().includes(query)) ||
+          directMembers.some((m) => String(m.serialNumber || '').toLowerCase().includes(query));
+        if (hasMemberMatch) return true;
+      }
+
+      return false;
+    });
+  }, [activeSerials, searchQuery]);
 
   const displayRows = useMemo(() => {
     const list = [...filteredSerials];
 
     // Calculate non-serial stock using dynamic multipliers
     const serialsPieces = activeSerials.reduce((sum, s) => {
+      if (s.metadata?.isGroup) {
+        return sum + (Number(s.metadata?.totalPcs) || 0);
+      }
       const unit = detectSerialUnit(s);
       const cleanUnit = String(unit).toLowerCase();
       const qty = multipliers[cleanUnit] || 1;
@@ -212,7 +202,7 @@ export default function SerialNumberTable({
     if (nonSerialStock > 0) {
       list.push({
         id: 'non-serial-placeholder',
-        serialNumber: 'â€”',
+        serialNumber: '—',
         status: 'available',
         isNonSerialPlaceholder: true,
         qty: nonSerialStock,
@@ -221,7 +211,7 @@ export default function SerialNumberTable({
       });
     }
     return list;
-  }, [filteredSerials, activeSerials, stock, rawDocuments, multipliers]);
+  }, [filteredSerials, activeSerials, stock, multipliers]);
 
   /* Calculate stock breakdown by unit */
   const unitSummary = useMemo(() => {
@@ -230,6 +220,18 @@ export default function SerialNumberTable({
 
     activeSerials.forEach((s) => {
       if (s.status !== 'available') return;
+      // Jangan hitung nomor seri yang sedang terbungkus dalam group untuk mencegah double-counting
+      if (s.metadata?.isGrouped || s.metadata?.parentGroupId) return;
+
+      if (s.metadata?.isGroup) {
+        const u = 'group';
+        if (!map[u]) {
+          map[u] = { unit: u, count: 0, pcs: 0, mult: 1 };
+        }
+        map[u].count += 1;
+        map[u].pcs += Number(s.metadata?.totalPcs) || 0;
+        return;
+      }
 
       const detected = detectSerialUnit(s);
       let unit = String(detected || 'pcs').toLowerCase();
@@ -248,6 +250,55 @@ export default function SerialNumberTable({
     return Object.values(map);
   }, [activeSerials, rawDocuments, multipliers]);
 
+  /* Selectable serials for grouping (available & not currently packed in a group) */
+  const availableSelectableSerials = useMemo(() => {
+    return displayRows.filter(
+      (s) => !s.isNonSerialPlaceholder && !s.metadata?.isGrouped && s.status === 'available'
+    );
+  }, [displayRows]);
+
+  const isAllSelected =
+    availableSelectableSerials.length > 0 &&
+    availableSelectableSerials.every((s) => selectedSerialIds.has(s.id));
+
+  const handleToggleSelectAll = () => {
+    if (isAllSelected) {
+      setSelectedSerialIds(new Set());
+    } else {
+      setSelectedSerialIds(new Set(availableSelectableSerials.map((s) => s.id)));
+    }
+  };
+
+  const handleToggleSelect = (id) => {
+    setSelectedSerialIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const handleClearSelection = () => {
+    setSelectedSerialIds(new Set());
+  };
+
+  const selectedSerialObjects = useMemo(() => {
+    if (selectedSerialIds.size === 0) return EMPTY_ARRAY;
+    return activeSerials.filter((s) => selectedSerialIds.has(s.id));
+  }, [activeSerials, selectedSerialIds]);
+
+  const handleViewComposition = (sn) => {
+    if (!sn) return;
+    setSelectedCompositionSerial(sn);
+    setCompositionModalOpen(true);
+  };
+
+  const handleOpenUngroup = (groupSerial) => {
+    if (!groupSerial) return;
+    setUngroupTarget(groupSerial);
+    setUngroupModalOpen(true);
+  };
+
   return (
     <div className="serial-panel">
       {/* Panel Header */}
@@ -264,6 +315,15 @@ export default function SerialNumberTable({
 
         {/* Action Buttons */}
         <div className="serial-panel__actions">
+          <button
+            type="button"
+            className="btn btn-secondary btn-sm interactive serial-panel__btn"
+            onClick={() => setGroupModalOpen(true)}
+            title="Kelompokkan nomor seri menjadi satu group"
+          >
+            <Layers size={14} />
+            <span className="serial-panel__btn-text">Grouping Serial</span>
+          </button>
           <button
             type="button"
             className="btn btn-secondary btn-sm interactive serial-panel__btn"
@@ -315,6 +375,7 @@ export default function SerialNumberTable({
               else if (item.unit === 'bal25') label = 'bal25';
               else if (item.unit === 'pack') label = 'pack';
               else if (item.unit === 'bal') label = 'bal';
+              else if (item.unit === 'group') label = 'group';
               else label = 'pcs';
 
               const subDetail = item.unit === 'bal10'
@@ -325,7 +386,7 @@ export default function SerialNumberTable({
                 ? `${item.count * 20} lusin`
                 : (item.unit === 'bal25' || item.unit === 'bal')
                 ? `${item.count * 25} lusin`
-                : null;
+                : (item.unit === 'group' ? `${item.pcs} pcs` : null);
 
               return (
                 <div key={item.unit} className="serial-panel__unit-chip">
@@ -334,6 +395,35 @@ export default function SerialNumberTable({
                 </div>
               );
             })}
+          </div>
+        </div>
+      )}
+
+      {/* Floating Selection Bar for Grouping */}
+      {selectedSerialIds.size > 0 && (
+        <div className="serial-panel__selection-bar">
+          <div className="serial-panel__selection-info">
+            <Layers size={16} />
+            <span>
+              <strong>{selectedSerialIds.size}</strong> nomor seri dipilih
+            </span>
+          </div>
+          <div className="serial-panel__selection-actions">
+            <button
+              type="button"
+              className="btn btn-primary btn-sm interactive"
+              onClick={() => setGroupModalOpen(true)}
+            >
+              <Layers size={14} />
+              <span>Group {selectedSerialIds.size} Serial</span>
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm interactive"
+              onClick={handleClearSelection}
+            >
+              Batal
+            </button>
           </div>
         </div>
       )}
@@ -369,19 +459,28 @@ export default function SerialNumberTable({
           <table className="serial-panel__table">
             <thead>
               <tr>
+                <th style={{ width: '42px', textAlign: 'center' }}>
+                  <input
+                    type="checkbox"
+                    checked={isAllSelected}
+                    onChange={handleToggleSelectAll}
+                    disabled={availableSelectableSerials.length === 0}
+                    aria-label="Pilih semua nomor seri"
+                  />
+                </th>
                 <th>{t('productDetail.no')}</th>
                 <th>{t('productDetail.serialNumber')}</th>
                 <th>{t('productDetail.serialStatus')}</th>
                 <th>{t('productDetail.reference')}</th>
                 <th className="serial-panel__th--right">{t('productDetail.qty')}</th>
-                <th></th>
+                <th style={{ textAlign: 'center', width: '130px' }}>Aksi</th>
               </tr>
             </thead>
             <tbody>
               {displayRows.length === 0 ? (
                 /* Fallback if no serials exist or search yields no matches */
                 <tr className="serial-panel__tr--empty">
-                  <td className="serial-panel__td--empty" colSpan="6">
+                  <td className="serial-panel__td--empty" colSpan="7">
                     <div className="serial-panel__empty-state">
                       <p className="serial-panel__empty-title">
                         {serials.length === 0 
@@ -403,12 +502,32 @@ export default function SerialNumberTable({
                 </tr>
               ) : (
                 displayRows.map((serial, idx) => {
-                  const cfg = SERIAL_STATUS_CONFIG[serial.status] ?? SERIAL_STATUS_CONFIG.available;
+                  const isDissolved = Boolean(serial.metadata?.isDissolved || serial.status === 'dissolved');
+                  const cfg = isDissolved
+                    ? { label: 'Dibongkar', chip: 'chip-muted' }
+                    : (SERIAL_STATUS_CONFIG[serial.status] ?? SERIAL_STATUS_CONFIG.available);
                   const idxStr = String(idx + 1).padStart(2, '0');
-                  const docRef = getDocumentRef(serial.goodsOutDocumentId || serial.goodsInDocumentId);
+                  const docRef = isDissolved ? '—' : getDocumentRef(serial.goodsOutDocumentId || serial.goodsInDocumentId);
+                  const isSelected = selectedSerialIds.has(serial.id);
+                  const isGroup = Boolean(serial.metadata?.isGroup);
+                  const isGrouped = Boolean(serial.metadata?.isGrouped);
+                  const parentSn = serial.metadata?.parentGroupSerialNumber;
 
                   return (
-                    <tr key={serial.id} className="serial-panel__tr">
+                    <tr
+                      key={serial.id}
+                      className={`serial-panel__tr ${isSelected ? 'serial-panel__tr--selected' : ''} ${isDissolved ? 'serial-panel__tr--dissolved' : ''}`}
+                    >
+                      <td style={{ textAlign: 'center' }}>
+                        {serial.isNonSerialPlaceholder || isDissolved ? null : (
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => handleToggleSelect(serial.id)}
+                            aria-label={`Pilih serial ${serial.serialNumber || serial.serial_number}`}
+                          />
+                        )}
+                      </td>
                       <td className="serial-panel__td--num">{idxStr}</td>
                       <td className="serial-panel__td--sn">
                         {serial.isNonSerialPlaceholder ? (
@@ -416,21 +535,61 @@ export default function SerialNumberTable({
                             {t('productDetail.nonSerial')}
                           </span>
                         ) : (
-                          <span className="serial-panel__sn-badge">
-                            {serial.serialNumber || serial.serial_number || 'â€”'}
-                          </span>
+                          <div className="serial-panel__sn-cell">
+                            <span className="serial-panel__sn-badge">
+                              {serial.serialNumber || serial.serial_number || '—'}
+                            </span>
+
+                            {isGroup && (
+                              <span
+                                className={`badge-group-tag ${isDissolved ? 'badge-group-tag--dissolved' : ''}`}
+                                title={isDissolved ? "Group telah dibongkar" : "Nomor seri hasil penggabungan (Group)"}
+                              >
+                                <Layers size={11} />
+                                <span>GROUP {isDissolved ? '• DIBONGKAR' : `• ${serial.metadata.totalPcs || 0} pcs`}</span>
+                              </span>
+                            )}
+
+                          </div>
                         )}
                       </td>
                       <td className="serial-panel__td--status">
                         <span className={`chip-status ${cfg.chip}`}>
-                          {t(cfg.label)}
+                          {String(cfg.label).startsWith('productDetail.') ? t(cfg.label) : cfg.label}
                         </span>
                       </td>
                       <td className="serial-panel__td--ref">{docRef}</td>
                       <td className="serial-panel__td--qty">
-                        {serial.isNonSerialPlaceholder ? `${serial.qty} pcs` : getQtyDisplay(serial)}
+                        {serial.isNonSerialPlaceholder
+                          ? `${serial.qty} pcs`
+                          : (isGroup ? `${serial.metadata?.totalPcs || 1} pcs` : getQtyDisplay(serial))}
                       </td>
-                      <td className="serial-panel__td--action"></td>
+                      <td className="serial-panel__td--action">
+                        {isGroup && (
+                          <div className="serial-panel__action-btns">
+                            <button
+                              type="button"
+                              className="btn btn-secondary btn-xs interactive"
+                              onClick={() => handleViewComposition(serial.serialNumber || serial.serial_number)}
+                              title="Lihat komposisi hierarki serial group ini"
+                            >
+                              <Layers size={12} />
+                              <span>Komposisi</span>
+                            </button>
+                            {serial.status === 'available' && !serial.metadata?.parentGroupId && (
+                              <button
+                                type="button"
+                                className="btn btn-secondary btn-xs text-danger interactive"
+                                onClick={() => handleOpenUngroup(serial)}
+                                title="Bongkar group serial ini kembali ke item anggota"
+                              >
+                                <PackageOpen size={12} />
+                                <span>Bongkar</span>
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </td>
                     </tr>
                   );
                 })
@@ -470,6 +629,7 @@ export default function SerialNumberTable({
         </div>
       )}
 
+      {/* History Modal */}
       <HistoryModal
         isOpen={historyModalOpen}
         onClose={() => setHistoryModalOpen(false)}
@@ -478,7 +638,52 @@ export default function SerialNumberTable({
         documents={rawDocuments}
         serials={serials}
       />
+
+      {/* Serial Grouping Modal */}
+      <SerialGroupModal
+        isOpen={groupModalOpen}
+        onClose={() => {
+          setGroupModalOpen(false);
+          setSelectedSerialIds(new Set());
+        }}
+        product={product}
+        productId={productId || product?.id}
+        warehouseId={serials?.[0]?.warehouseId || serials?.[0]?.warehouse_id || product?.warehouseId || product?.warehouse_id || null}
+        initialSelectedSerials={selectedSerialObjects}
+        onSuccess={() => {
+          setSelectedSerialIds(new Set());
+          onSerialAdded();
+        }}
+      />
+
+      {/* Serial Composition Modal */}
+      <SerialCompositionModal
+        isOpen={compositionModalOpen}
+        onClose={() => {
+          setCompositionModalOpen(false);
+          setSelectedCompositionSerial(null);
+        }}
+        serialNumber={selectedCompositionSerial}
+        onUngroupSuccess={() => {
+          onSerialAdded();
+        }}
+      />
+
+      {/* Ungroup Confirmation Modal */}
+      <UngroupConfirmModal
+        isOpen={ungroupModalOpen}
+        onClose={() => {
+          setUngroupModalOpen(false);
+          setUngroupTarget(null);
+        }}
+        groupSerial={ungroupTarget ? {
+          ...ungroupTarget,
+          productName: product?.name || ungroupTarget.productName,
+        } : null}
+        onSuccess={() => {
+          onSerialAdded();
+        }}
+      />
     </div>
   );
-
 }

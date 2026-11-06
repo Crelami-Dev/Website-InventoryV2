@@ -122,15 +122,28 @@ export default function QuickProductModal({
   };
 
   return (
-    <div className="qpm-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose?.(); }}>
-      <div className="qpm-modal" role="dialog" aria-label="Daftarkan Produk Baru">
+    <div
+      className="qpm-overlay"
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => {
+        e.stopPropagation();
+        if (e.target === e.currentTarget) onClose?.();
+      }}
+    >
+      <div
+        className="qpm-modal"
+        role="dialog"
+        aria-label="Daftarkan Produk Baru"
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
+      >
         {/* Header */}
         <div className="qpm-header">
           <div className="qpm-header__title-wrap">
             <Package size={18} className="qpm-header__icon" />
             <h3 className="qpm-header__title">Daftarkan Produk Baru</h3>
           </div>
-          <button type="button" className="qpm-header__close" onClick={onClose} disabled={saving}>
+          <button type="button" className="qpm-header__close" onClick={(e) => { e.stopPropagation(); onClose?.(); }} disabled={saving}>
             <X size={18} />
           </button>
         </div>

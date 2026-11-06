@@ -9,7 +9,6 @@ import GoodsOutCreateModal from './GoodsOutCreateModal.jsx';
 import GoodsOutEditModal from './GoodsOutEditModal.jsx';
 import GoodsOutDetailModal from './GoodsOutDetailModal.jsx';
 import GoodsOutReviewModal from './GoodsOutReviewModal.jsx';
-import GoodsOutReturnModal from './GoodsOutReturnModal.jsx';
 import GoCancelModal from './GoCancelModal.jsx';
 import './GoodsOutPage.css';
 
@@ -71,7 +70,6 @@ export default function GoodsOutPage() {
   const [selectedDoc, setSelectedDoc] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
   const [cancelTarget, setCancelTarget] = useState(null);
-  const [returnTarget, setReturnTarget] = useState(null);
   const [search, setSearch] = useState('');
   const [activeTab, setActiveTab] = useState('all');
 
@@ -704,6 +702,7 @@ export default function GoodsOutPage() {
           suppliers={rawSuppliers}
           contactsEnabled={contactsEnabled}
           existingDocsThisMonth={existingDocsThisMonth}
+          docs={docs}
         />
       )}
 
@@ -990,10 +989,6 @@ export default function GoodsOutPage() {
           <GoodsOutDetailModal
             doc={selectedDoc}
             onClose={() => setSelectedDoc(null)}
-            onReturn={(doc) => {
-              setSelectedDoc(null);
-              setReturnTarget(doc);
-            }}
             onEdit={(doc) => {
               setSelectedDoc(null);
               setEditTarget(doc);
@@ -1034,25 +1029,6 @@ export default function GoodsOutPage() {
           doc={cancelTarget}
           onClose={() => setCancelTarget(null)}
           onConfirm={handleCancelConfirm}
-        />
-      )}
-
-      {/* Return modal */}
-      {returnTarget && (
-        <GoodsOutReturnModal
-          doc={returnTarget}
-          onClose={() => setReturnTarget(null)}
-          onSuccess={(updatedDoc) => {
-            setReturnTarget(null);
-            setSelectedDoc(updatedDoc);
-            queryClient.invalidateQueries({ queryKey: ['goods-out'] });
-            queryClient.invalidateQueries({ queryKey: ['products'] });
-            queryClient.invalidateQueries({ queryKey: ['product-serials'] });
-            queryClient.invalidateQueries({ queryKey: ['product-serial-index'] });
-            queryClient.invalidateQueries({ queryKey: ['workspace-documents'] });
-            queryClient.invalidateQueries({ queryKey: ['dashboard-stats'] });
-            queryClient.invalidateQueries({ queryKey: ['reports'] });
-          }}
         />
       )}
     </div>

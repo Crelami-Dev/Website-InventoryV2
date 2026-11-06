@@ -2007,3 +2007,86 @@ input[type="date"].go-input {
   border-style: solid;
 }
 
+/* ── Unrecorded Items (Non-SN) ──────────────────────────── */
+.go-table-row--unrecorded {
+  background-color: rgba(245, 158, 11, 0.04) !important;
+}
+
+.go-line-item__unrecorded-sn-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.go-line-item__unrecorded-badge-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(245, 158, 11, 0.12);
+  color: #b45309;
+  border: 1px dashed rgba(245, 158, 11, 0.45);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+}
+
+.go-line-item__unrecorded-chip {
+  background: rgba(245, 158, 11, 0.15) !important;
+  color: #b45309 !important;
+  border-color: rgba(245, 158, 11, 0.3) !important;
+}
+
+.go-line-item__unrecorded-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  margin-top: 4px;
+  user-select: none;
+  transition: color 0.15s ease;
+}
+
+.go-line-item__unrecorded-checkbox:hover {
+  color: var(--color-warning, #d97706);
+}
+
+.go-line-item__unrecorded-checkbox input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+  accent-color: #d97706;
+}
+
+.go-line-item__unrecorded-hint {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: #b45309;
+  background: rgba(245, 158, 11, 0.09);
+  border-left: 2px solid #f59e0b;
+  padding: 3px 6px;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  margin-top: 4px;
+  line-height: 1.3;
+}
+
+.go-line-item__unrecorded-hint-icon {
+  flex-shrink: 0;
+}
+
+.badge-tracking--unrecorded {
+  background: #fef3c7 !important;
+  color: #b45309 !important;
+  border: 1px solid #fde68a !important;
+  font-weight: 700;
+}
+
+

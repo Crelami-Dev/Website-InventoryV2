@@ -813,3 +813,142 @@
     justify-content: center;
   }
 }
+
+/* ==========================================================================
+   Serial Grouping UI Elements
+   ========================================================================== */
+
+.serial-panel__selection-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.08), rgba(79, 70, 229, 0.12));
+  border-bottom: 1px solid rgba(99, 102, 241, 0.25);
+  padding: var(--space-3) var(--space-5);
+  animation: fadeIn 0.15s ease-out;
+}
+
+.serial-panel__selection-info {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2-5);
+  font-size: 13.5px;
+  color: var(--color-primary, #4F46E5);
+}
+
+.serial-panel__selection-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.serial-panel__tr--selected {
+  background-color: rgba(99, 102, 241, 0.04) !important;
+}
+
+.serial-panel__sn-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.badge-group-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.12), rgba(79, 70, 229, 0.18));
+  color: var(--color-primary, #4F46E5);
+  padding: 2px 7px;
+  border-radius: var(--radius-xs);
+  font-size: 11px;
+  font-weight: 700;
+  width: fit-content;
+  letter-spacing: 0.3px;
+}
+
+.badge-group-tag--dissolved {
+  background: rgba(148, 163, 184, 0.18) !important;
+  color: var(--color-text-muted, #64748b) !important;
+  border: 1px dashed rgba(148, 163, 184, 0.45);
+}
+
+.serial-panel__tr--dissolved td {
+  background-color: var(--color-bg, #f8fafc) !important;
+  opacity: 0.72;
+}
+
+.badge-grouped-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background-color: var(--color-surface-hover);
+  border: 1px dashed var(--color-border);
+  color: var(--color-text-secondary);
+  padding: 2px 7px;
+  border-radius: var(--radius-xs);
+  font-size: 11px;
+  font-weight: 500;
+  width: fit-content;
+  cursor: pointer;
+  transition: all 0.15s ease-in-out;
+}
+
+.badge-grouped-tag:hover {
+  background-color: rgba(99, 102, 241, 0.08);
+  color: var(--color-primary, #4F46E5);
+  border-color: var(--color-primary, #4F46E5);
+}
+
+.serial-panel__action-btns {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  justify-content: center;
+}
+
+.btn-xs {
+  padding: 2px 8px;
+  font-size: 11.5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: var(--radius-xs);
+}
+
+/* ==========================================================================
+   Responsive Selection Bar & Actions on Smartphone/Tablet
+   ========================================================================== */
+@media (max-width: 640px) {
+  .serial-panel__selection-bar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-2-5, 10px);
+    padding: var(--space-3, 12px) var(--space-4, 16px);
+  }
+
+  .serial-panel__selection-actions {
+    width: 100%;
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2, 8px);
+  }
+
+  .serial-panel__selection-actions .btn {
+    flex: 1;
+    justify-content: center;
+    min-height: 36px;
+  }
+
+  .serial-panel__action-btns {
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .serial-panel__action-btns .btn-xs {
+    width: 100%;
+    justify-content: center;
+    min-height: 30px;
+    padding: 4px 8px;
+  }
+}
+

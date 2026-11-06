@@ -1,13 +1,28 @@
 import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
-import { X, Camera, Check, AlertCircle, AlertTriangle, Barcode, RotateCcw, CheckSquare, Square } from 'lucide-react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+  X,
+  Camera,
+  Check,
+  AlertCircle,
+  AlertTriangle,
+  Barcode,
+  RotateCcw,
+  Search,
+  FileText,
+  Calendar,
+  User,
+  Warehouse,
+  ChevronRight,
+  RefreshCw,
+} from 'lucide-react';
 import { useCameraScanner } from '../../hooks/useCameraScanner.js';
 import { useApp } from '../../context/AppContext.jsx';
 import { api } from '../../utils/api.js';
 import './GoodsOutReturnModal.css';
 import './GoodsOutCreateModal.css'; // reuse scanner overlay styles
 
-// Audio feedback (reuse pattern from GoodsOutCreateModal)
+// Audio feedback
 function playBeep(type = 'success') {
   try {
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -55,17 +70,38 @@ const RETURN_REASONS = [
   { key: 'lainnya', label: 'Lainnya', desc: 'Alasan lain (wajib isi catatan)' },
 ];
 
-export default function GoodsOutReturnModal({ doc, onClose, onSuccess }) {
+function formatDate(dateStr) {
+  if (!dateStr) return '—';
+  try {
+    return new Date(dateStr).toLocaleDateString('id-ID', {
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric',
+    });
+  } catch {
+    return dateStr;
+  }
+}
+
+export default function GoodsOutReturnModal({ doc: initialDoc = null, onClose, onSuccess }) {
   const { t } = useApp();
   const queryClient = useQueryClient();
 
-  // State
+  // Document selection state
+  const [selectedDoc, setSelectedDoc] = useState(initialDoc);
+  const [docSearch, setDocSearch] = useState('');
+
+  // Form states
   const [reason, setReason] = useState('');
   const [notes, setNotes] = useState('');
-  const [returnToAvailable, setReturnToAvailable] = useState(true);
-  const [returnItems, setReturnItems] = useState({}); // { [key]: { ...item, returnedQty } }
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
+
+  // Worksheet state:
+  // nonSerialQuantities: { [key]: { goodQty: number|string, damagedQty: number|string } }
+  const [nonSerialQuantities, setNonSerialQuantities] = useState({});
+  // serialSelection: { [key]: { selected: boolean, condition: 'available' | 'damaged' } }
+  const [serialSelection, setSerialSelection] = useState({});
 
   // Scanner state
   const [scannerOpen, setScannerOpen] = useState(false);
@@ -74,23 +110,56 @@ export default function GoodsOutReturnModal({ doc, onClose, onSuccess }) {
   const scanCallbackRef = useRef(null);
   const cooldownMapRef = useRef(new Map());
 
-  if (!doc) return null;
+  // Query completed Goods Out documents if no document is initially provided
+  const {
+    data: candidateDocsData,
+    isLoading: candidateDocsLoading,
+    refetch: refetchCandidateDocs,
+  } = useQuery({
+    queryKey: ['goods-out-return-candidates', docSearch],
+    queryFn: async () => {
+      const params = new URLSearchParams({
+        type: 'goods_out',
+        status: 'completed',
+        limit: '20',
+      });
+      if (docSearch.trim()) params.set('search', docSearch.trim());
+      const res = await api.get(`/api/workspace/documents?${params.toString()}`);
+      if (!res.ok) throw new Error('Gagal memuat daftar surat jalan');
+      return res.json();
+    },
+    enabled: !selectedDoc,
+    staleTime: 20000,
+  });
 
-  const items = (doc?.items && doc.items.length > 0) ? doc.items : (doc?.metadata?.items ?? []);
-  const existingReturns = doc.metadata?.returns ?? [];
+  const candidateDocs = candidateDocsData?.data || [];
 
-  // Build a lookup of returnable items from the document
+  // Parse items & returns from currently selected document
+  const items = useMemo(() => {
+    if (!selectedDoc) return [];
+    if (selectedDoc.items && selectedDoc.items.length > 0) return selectedDoc.items;
+    return selectedDoc.metadata?.items ?? [];
+  }, [selectedDoc]);
+
+  const existingReturns = useMemo(() => {
+    return selectedDoc?.metadata?.returns ?? [];
+  }, [selectedDoc]);
+
+  // Build lookup of returnable items from document
   const docItemsMap = useMemo(() => {
+    if (!selectedDoc) return {};
     const map = {};
+
     items.forEach((item, idx) => {
       const itemId = item.id;
       const productId = item.product_id ?? item.productId;
       const isSerial = item.metadata?.isSerial === true;
+      const isGroup = item.metadata?.isGroup === true || item.metadata?.targetQty != null;
       const serialNumber = item.metadata?.serialNumber || '';
-      let qtyUnit = item.metadata?.qtyUnit || item.unit || 'pcs';
+      let qtyUnit = item.metadata?.targetUnit || item.metadata?.qtyUnit || item.unit || 'pcs';
       const snLower = String(serialNumber).toLowerCase();
 
-      if (isSerial) {
+      if (isSerial && !isGroup) {
         if (snLower.includes('10bl') || snLower.includes('bal10')) qtyUnit = 'bal10';
         else if (snLower.includes('15bl') || snLower.includes('bal15')) qtyUnit = 'bal15';
         else if (snLower.includes('20bl') || snLower.includes('bal20')) qtyUnit = 'bal20';
@@ -100,27 +169,33 @@ export default function GoodsOutReturnModal({ doc, onClose, onSuccess }) {
         else if (snLower.includes('lusin') || snLower.includes('lsn')) qtyUnit = 'lusin';
       }
 
-      const qtyInput = isSerial ? 1 : Number(item.metadata?.qtyInput ?? item.quantity ?? 1);
+      const qtyInput = isSerial
+        ? (isGroup ? Number(item.metadata?.targetQty ?? item.metadata?.qtyInput ?? 1) || 1 : 1)
+        : Number(item.metadata?.qtyInput ?? item.quantity ?? 1);
 
-      // Calculate previously returned qty for this item
+      // Calculate previously returned qty for this item from non-restored returns
       const previouslyReturned = existingReturns.reduce((sum, r) => {
-        return sum + (r.items ?? [])
-          .filter((ri) => {
-            if (isSerial) {
-              if (ri.isSerial) return String(ri.serialNumber || '').trim().toLowerCase() === serialNumber.trim().toLowerCase();
+        if (r.status === 'restored') return sum;
+        return (
+          sum +
+          (r.items ?? [])
+            .filter((ri) => {
+              if (isSerial) {
+                if (ri.isSerial) {
+                  return String(ri.serialNumber || '').trim().toLowerCase() === serialNumber.trim().toLowerCase();
+                }
+                return false;
+              }
+              if (ri.isSerial) return false;
+              if (itemId && ri.itemId) return ri.itemId === itemId;
+              if (!itemId && !ri.itemId && productId && ri.productId) return ri.productId === productId;
               return false;
-            }
-            if (ri.isSerial) return false;
-            if (itemId && ri.itemId) return ri.itemId === itemId;
-            if (!itemId && !ri.itemId && productId && ri.productId) return ri.productId === productId;
-            return false;
-          })
-          .reduce((s, ri) => s + (ri.returnedQty || 0), 0);
+            })
+            .reduce((s, ri) => s + Number(ri.returnedQty || 0), 0)
+        );
       }, 0);
 
-      const key = isSerial
-        ? `serial_${serialNumber || idx}`
-        : `item_${itemId || productId || idx}`;
+      const key = isSerial ? `serial_${serialNumber || idx}` : `item_${itemId || productId || idx}`;
 
       map[key] = {
         key,
@@ -129,187 +204,225 @@ export default function GoodsOutReturnModal({ doc, onClose, onSuccess }) {
         productName: item.item_name || item.itemName || 'Produk Tanpa Nama',
         sku: item.sku || '—',
         isSerial,
+        isGroup,
         serialNumber,
         qtyUnit,
         originalQty: qtyInput,
         previouslyReturned,
-        remainingQty: Math.max(0, qtyInput - previouslyReturned),
+        remainingQty: isGroup && previouslyReturned > 0
+          ? 0
+          : Math.max(0, qtyInput - previouslyReturned),
       };
     });
-    return map;
-  }, [items, existingReturns]);
 
+    return map;
+  }, [selectedDoc, items, existingReturns]);
+
+  // List of returnable items (remainingQty > 0)
   const returnableItems = useMemo(() => {
     return Object.entries(docItemsMap)
       .filter(([, v]) => v.remainingQty > 0)
       .map(([key, v]) => ({ key, ...v }));
   }, [docItemsMap]);
 
-  // Handle selection toggles
-  const isAllSelected = returnableItems.length > 0 && returnableItems.every((it) => !!returnItems[it.key]);
-  const isSomeSelected = returnableItems.some((it) => !!returnItems[it.key]) && !isAllSelected;
+  const serialItems = useMemo(() => returnableItems.filter((it) => it.isSerial), [returnableItems]);
+  const nonSerialItems = useMemo(() => returnableItems.filter((it) => !it.isSerial), [returnableItems]);
 
-  const handleToggleItem = (key) => {
-    const item = docItemsMap[key];
-    if (!item) return;
+  // Check if worksheet has any active input
+  const isWorksheetDirty = useMemo(() => {
+    const hasSerial = Object.values(serialSelection).some((s) => s?.selected);
+    const hasNonSerial = Object.values(nonSerialQuantities).some(
+      (q) => (Number(q?.goodQty) || 0) > 0 || (Number(q?.damagedQty) || 0) > 0
+    );
+    return hasSerial || hasNonSerial;
+  }, [serialSelection, nonSerialQuantities]);
 
-    setReturnItems((prev) => {
-      const next = { ...prev };
-      if (next[key]) {
-        delete next[key];
-        if (item.serialNumber) {
-          cooldownMapRef.current.delete(String(item.serialNumber).trim().toLowerCase());
-        }
-      } else {
-        next[key] = {
-          ...item,
-          returnedQty: item.isSerial ? 1 : item.remainingQty,
-        };
-      }
-      return next;
-    });
-  };
-
-  const handleToggleAll = () => {
-    if (isAllSelected) {
-      setReturnItems({});
-      cooldownMapRef.current.clear();
-    } else {
-      const next = {};
-      returnableItems.forEach((it) => {
-        next[it.key] = {
-          ...it,
-          returnedQty: it.isSerial ? 1 : it.remainingQty,
-        };
-      });
-      setReturnItems(next);
+  // Handle changing document with confirmation
+  const handleChangeDoc = () => {
+    if (isWorksheetDirty) {
+      const confirmChange = window.confirm(
+        'Worksheet retur yang sudah Anda isi akan dikosongkan jika Anda mengganti surat jalan. Lanjutkan?'
+      );
+      if (!confirmChange) return;
     }
+    setNonSerialQuantities({});
+    setSerialSelection({});
+    cooldownMapRef.current.clear();
+    setError(null);
+    setSelectedDoc(null);
   };
 
-  const handleSelectAll = () => {
-    const next = {};
-    returnableItems.forEach((it) => {
-      next[it.key] = {
-        ...it,
-        returnedQty: it.isSerial ? 1 : it.remainingQty,
+  // Handle selecting candidate document
+  const handleSelectDoc = (docCandidate) => {
+    setSelectedDoc(docCandidate);
+    setNonSerialQuantities({});
+    setSerialSelection({});
+    cooldownMapRef.current.clear();
+    setError(null);
+  };
+
+  // Toggle single serial item
+  const handleToggleSerial = (key) => {
+    setSerialSelection((prev) => {
+      const current = prev[key];
+      const isSelected = !!current?.selected;
+      return {
+        ...prev,
+        [key]: {
+          selected: !isSelected,
+          condition: current?.condition || 'available',
+        },
       };
     });
-    setReturnItems(next);
   };
 
-  const handleClearAll = () => {
-    setReturnItems({});
-    cooldownMapRef.current.clear();
+  // Set condition for single serial item
+  const handleSerialCondition = (key, condition) => {
+    setSerialSelection((prev) => ({
+      ...prev,
+      [key]: {
+        selected: true,
+        condition,
+      },
+    }));
   };
 
-  const handleRemoveItem = (key) => {
-    setReturnItems((prev) => {
-      const removed = prev[key];
-      if (removed?.serialNumber) {
-        cooldownMapRef.current.delete(String(removed.serialNumber).trim().toLowerCase());
-      }
-      const next = { ...prev };
-      delete next[key];
-      return next;
-    });
+  // Toggle all serial items
+  const isAllSerialSelected =
+    serialItems.length > 0 && serialItems.every((it) => !!serialSelection[it.key]?.selected);
+
+  const handleToggleAllSerials = () => {
+    if (isAllSerialSelected) {
+      setSerialSelection({});
+    } else {
+      const next = {};
+      serialItems.forEach((it) => {
+        next[it.key] = {
+          selected: true,
+          condition: serialSelection[it.key]?.condition || 'available',
+        };
+      });
+      setSerialSelection(next);
+    }
   };
 
-  const handleQtyChange = (key, newQty) => {
+  // Handle quantity changes for non-serial items
+  const handleNonSerialQtyChange = (key, conditionType, val) => {
     const item = docItemsMap[key];
     if (!item) return;
-    const clampedQty = Math.max(0, Math.min(newQty, item.remainingQty));
-    if (clampedQty === 0) {
-      handleRemoveItem(key);
-    } else {
-      setReturnItems((prev) => ({
+
+    const numVal = val === '' ? '' : Math.max(0, parseFloat(val) || 0);
+
+    setNonSerialQuantities((prev) => {
+      const current = prev[key] || { goodQty: 0, damagedQty: 0 };
+      return {
         ...prev,
-        [key]: { ...item, returnedQty: clampedQty },
-      }));
-    }
+        [key]: {
+          ...current,
+          [conditionType === 'good' ? 'goodQty' : 'damagedQty']: numVal,
+        },
+      };
+    });
   };
 
-  // Handle QR scan result
-  const handleScanResult = useCallback((code) => {
-    if (!code) return;
-    const cleanCode = code.trim();
-    if (!cleanCode) return;
-    const cleanCodeLower = cleanCode.toLowerCase();
-
-    // Cooldown: suppress duplicate triggers of the same barcode within 2.5 seconds
-    const now = Date.now();
-    const lastScan = cooldownMapRef.current.get(cleanCodeLower);
-    if (lastScan && now - lastScan < 2500) {
-      return;
-    }
-    cooldownMapRef.current.set(cleanCodeLower, now);
-
-    // Try to match against document items
-    const matchedEntry = returnableItems.find((item) => {
-      if (item.isSerial) {
-        return String(item.serialNumber).trim().toLowerCase() === cleanCodeLower;
-      }
-      // For non-serial, match by SKU
-      return String(item.sku || '').trim().toLowerCase() === cleanCodeLower;
+  // Fill all non-serial remaining into Good Condition
+  const handleFillAllNonSerialGood = () => {
+    const next = {};
+    nonSerialItems.forEach((it) => {
+      next[it.key] = {
+        goodQty: it.remainingQty,
+        damagedQty: 0,
+      };
     });
+    setNonSerialQuantities(next);
+  };
 
-    if (!matchedEntry) {
-      playBeep('error');
-      setScanFeedback({
-        type: 'error',
-        message: `QR Code / SKU "${cleanCode}" tidak ditemukan dalam Surat Jalan ini`,
+  // Clear all non-serial quantities
+  const handleClearNonSerial = () => {
+    setNonSerialQuantities({});
+  };
+
+  // Scanner detection logic
+  const handleScanResult = useCallback(
+    (code) => {
+      if (!code) return;
+      const cleanCode = code.trim();
+      if (!cleanCode) return;
+      const cleanCodeLower = cleanCode.toLowerCase();
+
+      // Cooldown: suppress duplicate triggers within 2.5s
+      const now = Date.now();
+      const lastScan = cooldownMapRef.current.get(cleanCodeLower);
+      if (lastScan && now - lastScan < 2500) return;
+      cooldownMapRef.current.set(cleanCodeLower, now);
+
+      // Match against returnable items in this document
+      const matchedEntry = returnableItems.find((item) => {
+        if (item.isSerial) {
+          return String(item.serialNumber).trim().toLowerCase() === cleanCodeLower;
+        }
+        return String(item.sku || '').trim().toLowerCase() === cleanCodeLower;
       });
-      return;
-    }
 
-    const key = matchedEntry.key;
-    const existing = returnItems[key];
-
-    // For serial items, check if already added
-    if (matchedEntry.isSerial) {
-      if (existing) {
-        playBeep('warning');
+      if (!matchedEntry) {
+        playBeep('error');
         setScanFeedback({
-          type: 'warning',
-          message: `⚠️ Nomor seri "${cleanCode}" SUDAH dipilih untuk return!`,
+          type: 'error',
+          message: `QR / SKU "${cleanCode}" tidak ditemukan dalam Surat Jalan ini`,
         });
         return;
       }
-      setReturnItems((prev) => ({
-        ...prev,
-        [key]: { ...matchedEntry, returnedQty: 1 },
-      }));
-      playBeep('success');
-      setScanFeedback({
-        type: 'success',
-        message: `✓ Serial ${matchedEntry.serialNumber} (${matchedEntry.productName}) dipilih`,
-      });
-      return;
-    }
 
-    // For non-serial items
-    const currentQty = existing?.returnedQty || 0;
-    if (currentQty >= matchedEntry.remainingQty) {
-      playBeep('error');
-      setScanFeedback({
-        type: 'error',
-        message: `Qty return untuk "${matchedEntry.productName}" sudah maksimal (${matchedEntry.remainingQty} ${matchedEntry.qtyUnit})`,
-      });
-      return;
-    }
+      if (matchedEntry.isSerial) {
+        const isSelected = !!serialSelection[matchedEntry.key]?.selected;
+        if (isSelected) {
+          playBeep('warning');
+          setScanFeedback({
+            type: 'warning',
+            message: `Nomor seri "${cleanCode}" SUDAH dipilih!`,
+          });
+          return;
+        }
 
-    const nextQty = currentQty + 1;
-    setReturnItems((prev) => ({
-      ...prev,
-      [key]: { ...matchedEntry, returnedQty: nextQty },
-    }));
-    playBeep('success');
-    setScanFeedback({
-      type: 'success',
-      message: `${matchedEntry.productName} — return: ${nextQty} ${matchedEntry.qtyUnit}`,
-    });
-  }, [returnableItems, returnItems]);
+        setSerialSelection((prev) => ({
+          ...prev,
+          [matchedEntry.key]: { selected: true, condition: 'available' },
+        }));
+        playBeep('success');
+        setScanFeedback({
+          type: 'success',
+          message: `Serial ${matchedEntry.serialNumber} (${matchedEntry.productName}) dipilih (Kondisi Baik)`,
+        });
+      } else {
+        // Non-serial SKU matched: increment goodQty
+        const current = nonSerialQuantities[matchedEntry.key] || { goodQty: 0, damagedQty: 0 };
+        const curGood = Number(current.goodQty) || 0;
+        const curDamaged = Number(current.damagedQty) || 0;
 
-  // Keep ref in sync
+        if (curGood + curDamaged >= matchedEntry.remainingQty) {
+          playBeep('error');
+          setScanFeedback({
+            type: 'error',
+            message: `Qty return untuk "${matchedEntry.productName}" sudah mencapai batas sisa (${matchedEntry.remainingQty} ${matchedEntry.qtyUnit})`,
+          });
+          return;
+        }
+
+        const nextGood = curGood + 1;
+        setNonSerialQuantities((prev) => ({
+          ...prev,
+          [matchedEntry.key]: { ...current, goodQty: nextGood },
+        }));
+        playBeep('success');
+        setScanFeedback({
+          type: 'success',
+          message: `${matchedEntry.productName} — Qty Baik: ${nextGood} ${matchedEntry.qtyUnit}`,
+        });
+      }
+    },
+    [returnableItems, serialSelection, nonSerialQuantities]
+  );
+
   useEffect(() => {
     scanCallbackRef.current = handleScanResult;
   }, [handleScanResult]);
@@ -318,10 +431,9 @@ export default function GoodsOutReturnModal({ doc, onClose, onSuccess }) {
     if (scannerOpen) setScanFeedback(null);
   }, [scannerOpen]);
 
-  const handleScannerError = useCallback(
-    (message) => setScanFeedback({ type: 'error', message }),
-    []
-  );
+  const handleScannerError = useCallback((message) => {
+    setScanFeedback({ type: 'error', message });
+  }, []);
 
   const { cameraActive, frameHit } = useCameraScanner({
     elementId: 'go-return-scanner-reader',
@@ -343,10 +455,88 @@ export default function GoodsOutReturnModal({ doc, onClose, onSuccess }) {
     setManualInput('');
   };
 
-  const selectedItems = Object.entries(returnItems);
-  const serialCount = selectedItems.filter(([, it]) => it.isSerial).length;
-  const nonSerialCount = selectedItems.filter(([, it]) => !it.isSerial).length;
-  const canSubmit = reason && selectedItems.length > 0 && (reason !== 'lainnya' || notes.trim().length >= 3);
+  // Calculate return payload & validation checks
+  const { payloadItems, hasExceededLimit, totalReturnUnits, selectedSerialCount, selectedNonSerialCount } =
+    useMemo(() => {
+      const itemsList = [];
+      let exceeded = false;
+      let totalUnits = 0;
+      let sCount = 0;
+      let nsCount = 0;
+
+      // 1. Process Serials
+      serialItems.forEach((it) => {
+        const sel = serialSelection[it.key];
+        if (sel?.selected) {
+          sCount++;
+          totalUnits += it.originalQty;
+          itemsList.push({
+            productId: it.productId || null,
+            itemId: it.itemId || null,
+            isSerial: true,
+            isGroup: it.isGroup,
+            serialNumber: it.serialNumber || null,
+            returnedQty: it.originalQty,
+            qtyUnit: it.qtyUnit,
+            targetQty: it.isGroup ? it.originalQty : undefined,
+            targetUnit: it.isGroup ? it.qtyUnit : undefined,
+            targetStatus: sel.condition === 'damaged' ? 'damaged' : 'available',
+          });
+        }
+      });
+
+      // 2. Process Non-Serials
+      nonSerialItems.forEach((it) => {
+        const q = nonSerialQuantities[it.key] || { goodQty: 0, damagedQty: 0 };
+        const gQty = Number(q.goodQty) || 0;
+        const dQty = Number(q.damagedQty) || 0;
+
+        if (gQty < 0 || dQty < 0 || gQty + dQty > it.remainingQty) {
+          exceeded = true;
+        }
+
+        if (gQty > 0) {
+          totalUnits += gQty;
+          nsCount++;
+          itemsList.push({
+            productId: it.productId || null,
+            itemId: it.itemId || null,
+            isSerial: false,
+            returnedQty: gQty,
+            qtyUnit: it.qtyUnit,
+            targetStatus: 'available',
+          });
+        }
+
+        if (dQty > 0) {
+          totalUnits += dQty;
+          nsCount++;
+          itemsList.push({
+            productId: it.productId || null,
+            itemId: it.itemId || null,
+            isSerial: false,
+            returnedQty: dQty,
+            qtyUnit: it.qtyUnit,
+            targetStatus: 'damaged',
+          });
+        }
+      });
+
+      return {
+        payloadItems: itemsList,
+        hasExceededLimit: exceeded,
+        totalReturnUnits: totalUnits,
+        selectedSerialCount: sCount,
+        selectedNonSerialCount: nsCount,
+      };
+    }, [serialItems, nonSerialItems, serialSelection, nonSerialQuantities]);
+
+  const canSubmit =
+    !!selectedDoc &&
+    !!reason &&
+    payloadItems.length > 0 &&
+    !hasExceededLimit &&
+    (reason !== 'lainnya' || notes.trim().length >= 3);
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
@@ -354,24 +544,19 @@ export default function GoodsOutReturnModal({ doc, onClose, onSuccess }) {
     setError(null);
 
     try {
-      const targetStatus = returnToAvailable ? 'available' : 'damaged';
+      const hasDamaged = payloadItems.some((it) => it.targetStatus === 'damaged');
+      const hasAvailable = payloadItems.some((it) => it.targetStatus === 'available');
+      const overallTargetStatus = hasAvailable ? 'available' : 'damaged';
+
       const payload = {
         reason,
         notes: notes.trim() || null,
-        targetStatus,
-        markAsDamaged: !returnToAvailable,
-        items: selectedItems.map(([, item]) => ({
-          productId: item.productId || null,
-          itemId: item.itemId || null,
-          isSerial: item.isSerial,
-          serialNumber: item.serialNumber || null,
-          returnedQty: item.returnedQty,
-          qtyUnit: item.qtyUnit,
-          targetStatus,
-        })),
+        targetStatus: overallTargetStatus,
+        markAsDamaged: hasDamaged,
+        items: payloadItems,
       };
 
-      const res = await api.post(`/api/workspace/documents/${doc.id}/return`, payload);
+      const res = await api.post(`/api/workspace/documents/${selectedDoc.id}/return`, payload);
       if (!res.ok) {
         const errJson = await res.json().catch(() => ({}));
         throw new Error(errJson?.error?.message || errJson?.message || 'Gagal memproses return');
@@ -380,6 +565,7 @@ export default function GoodsOutReturnModal({ doc, onClose, onSuccess }) {
       const json = await res.json();
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['goods-out'] }),
+        queryClient.invalidateQueries({ queryKey: ['returns-list'] }),
         queryClient.invalidateQueries({ queryKey: ['products'] }),
         queryClient.invalidateQueries({ queryKey: ['product-serials'] }),
         queryClient.invalidateQueries({ queryKey: ['product-serial-index'] }),
@@ -387,6 +573,7 @@ export default function GoodsOutReturnModal({ doc, onClose, onSuccess }) {
         queryClient.invalidateQueries({ queryKey: ['dashboard-stats'] }),
         queryClient.invalidateQueries({ queryKey: ['reports'] }),
       ]);
+
       onSuccess?.(json.data);
     } catch (err) {
       setError(err.message || 'Gagal memproses return');
@@ -401,9 +588,11 @@ export default function GoodsOutReturnModal({ doc, onClose, onSuccess }) {
       role="dialog"
       aria-modal="true"
       aria-labelledby="go-return-title"
-      onClick={(e) => { if (e.target === e.currentTarget && !submitting) onClose(); }}
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !submitting) onClose();
+      }}
     >
-      <div className="go-return-modal">
+      <div className="go-return-modal" style={{ maxWidth: selectedDoc ? '840px' : '640px' }}>
         {/* Header */}
         <div className="go-return__header">
           <div className="go-return__header-icon">
@@ -411,335 +600,452 @@ export default function GoodsOutReturnModal({ doc, onClose, onSuccess }) {
           </div>
           <div className="go-return__header-text">
             <h2 id="go-return-title" className="go-return__title">
-              Return Barang Keluar
+              {selectedDoc ? 'Buat Retur Barang Keluar' : 'Pilih Surat Jalan Sumber Retur'}
             </h2>
-            <p className="go-return__ref">{doc.document_number}</p>
+            <p className="go-return__ref">
+              {selectedDoc ? selectedDoc.document_number : 'Langkah 1: Tentukan dokumen Goods Out yang dikembalikan'}
+            </p>
           </div>
-          <button
-            type="button"
-            className="go-return__close-btn"
-            onClick={onClose}
-            disabled={submitting}
-          >
+          <button type="button" className="go-return__close-btn" onClick={onClose} disabled={submitting}>
             <X size={18} />
           </button>
         </div>
 
         {/* Body */}
         <div className="go-return__body">
-          {/* Step 1: Reason */}
-          <fieldset className="go-return__reasons">
-            <legend className="go-return__reasons-label">
-              1. Pilih Alasan Return
-            </legend>
-            <div className="go-return__reason-options">
-              {RETURN_REASONS.map((r) => (
-                <label
-                  key={r.key}
-                  className={`go-return__reason-option${reason === r.key ? ' go-return__reason-option--selected' : ''}`}
-                >
+          {/* SCENARIO A: Document Picker (If no document selected) */}
+          {!selectedDoc ? (
+            <div className="go-return__doc-picker">
+              <div className="go-return__doc-picker-header">
+                <div style={{ fontSize: '13px', color: 'var(--color-text-secondary)' }}>
+                  Hanya surat jalan berstatus <strong>Selesai (Completed)</strong> yang dapat diproses retur.
+                </div>
+                <div className="returns-search" style={{ marginTop: '8px' }}>
+                  <Search size={15} className="returns-search__icon" />
                   <input
-                    type="radio"
-                    name="return-reason"
-                    value={r.key}
-                    checked={reason === r.key}
-                    onChange={() => setReason(r.key)}
-                    className="go-return__reason-radio"
+                    type="text"
+                    className="returns-search__input"
+                    placeholder="Cari nomor surat jalan, nama customer / penerima..."
+                    value={docSearch}
+                    onChange={(e) => setDocSearch(e.target.value)}
+                    autoFocus
                   />
-                  <span>{r.label}</span>
-                </label>
-              ))}
-            </div>
-
-            {reason === 'lainnya' && (
-              <div className="go-return__note-wrap">
-                <label className="go-return__note-label">Jelaskan alasan return</label>
-                <textarea
-                  className="input go-return__note"
-                  placeholder="Contoh: customer ingin tukar dengan produk lain..."
-                  value={notes}
-                  onChange={(e) => setNotes(e.target.value)}
-                  rows={3}
-                  autoFocus
-                />
-              </div>
-            )}
-
-            {/* Target Status Option */}
-            <div style={{ marginTop: '12px', padding: '10px 14px', background: 'var(--color-bg-subtle, #f8fafc)', borderRadius: '8px', border: '1px solid var(--color-border, #e2e8f0)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
-              <div>
-                <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--color-text, #1e293b)' }}>
-                  Kembalikan Stok & Nomor Seri ke Sistem
-                </div>
-                <div style={{ fontSize: '11px', color: 'var(--color-text-secondary, #64748b)' }}>
-                  {returnToAvailable 
-                    ? 'Stok dan nomor seri akan kembali aktif (Available) di sistem sehingga langsung dapat discan dan dikeluarkan lagi.'
-                    : 'Nomor seri akan ditandai rusak (Damaged) dan kuantitas tidak dimasukkan ke stok aktif.'}
                 </div>
               </div>
-              <label style={{ display: 'inline-flex', alignItems: 'center', cursor: 'pointer', gap: '6px', userSelect: 'none' }}>
-                <input
-                  type="checkbox"
-                  checked={returnToAvailable}
-                  onChange={(e) => setReturnToAvailable(e.target.checked)}
-                  style={{ width: '18px', height: '18px', cursor: 'pointer' }}
-                />
-                <span style={{ fontSize: '12px', fontWeight: 600, color: returnToAvailable ? 'var(--color-success, #16a34a)' : 'var(--color-danger, #dc2626)' }}>
-                  {returnToAvailable ? 'Tersedia' : 'Rusak'}
-                </span>
-              </label>
-            </div>
-          </fieldset>
 
-          {/* Step 2: Scan / Pick Items */}
-          <div className="go-return__scan-section">
-            <div className="go-return__scan-header">
-              <h4 className="go-return__scan-title">
-                2. Pilih Item / Scan QR yang Di-Return
-                {selectedItems.length > 0 && (
-                  <span className="go-return__scan-badge">
-                    {selectedItems.length} item dipilih
-                  </span>
-                )}
-              </h4>
-              <button
-                type="button"
-                className="go-return__scan-btn"
-                onClick={handleOpenScanner}
-              >
-                <Camera size={14} />
-                <span>Scan QR</span>
-              </button>
-            </div>
-
-            {/* Manual Input */}
-            <form onSubmit={handleManualAdd} className="go-return__manual-form">
-              <input
-                type="text"
-                className="input go-return__manual-input"
-                placeholder="Ketik serial number / SKU manual..."
-                value={manualInput}
-                onChange={(e) => setManualInput(e.target.value)}
-              />
-              <button type="submit" className="btn btn-secondary go-return__manual-btn">
-                Tambah
-              </button>
-            </form>
-
-            {/* Selection Toolbar (Select All / Clear All) */}
-            {returnableItems.length > 0 && (
-              <div className="go-return__selection-toolbar">
-                <div className="go-return__toolbar-info">
-                  Total sisa kirim: <strong>{returnableItems.length} baris</strong>
-                  {selectedItems.length > 0 && (
-                    <span> • Terpilih: <strong>{selectedItems.length} item</strong> ({serialCount > 0 ? `${serialCount} serial` : ''}{serialCount > 0 && nonSerialCount > 0 ? ', ' : ''}{nonSerialCount > 0 ? `${nonSerialCount} non-seri` : ''})</span>
-                  )}
+              {candidateDocsLoading ? (
+                <div style={{ textAlign: 'center', padding: '36px 0', color: 'var(--color-text-muted)' }}>
+                  <RefreshCw size={20} className="gi-detail__spin" style={{ marginBottom: '8px' }} />
+                  <div>Memuat daftar surat jalan...</div>
                 </div>
-                <div className="go-return__toolbar-actions">
-                  <button
-                    type="button"
-                    className="go-return__toolbar-btn"
-                    onClick={handleSelectAll}
-                    disabled={isAllSelected}
-                  >
-                    Pilih Semua ({returnableItems.length})
-                  </button>
-                  <button
-                    type="button"
-                    className="go-return__toolbar-btn"
-                    onClick={handleClearAll}
-                    disabled={selectedItems.length === 0}
-                  >
-                    Kosongkan
-                  </button>
+              ) : candidateDocs.length === 0 ? (
+                <div className="go-return__empty">
+                  <FileText size={32} className="go-return__empty-icon" />
+                  <p>Tidak ditemukan surat jalan selesai yang cocok.</p>
                 </div>
-              </div>
-            )}
+              ) : (
+                <div className="go-return__doc-list">
+                  {candidateDocs.map((cand) => {
+                    const itemCount = (cand.items?.length || cand.metadata?.items?.length || 0);
+                    const contactName =
+                      cand.contact_name ||
+                      cand.contactName ||
+                      cand.metadata?.contactName ||
+                      cand.metadata?.recipientName ||
+                      '—';
+                    const warehouseName =
+                      cand.warehouse_name || cand.warehouseName || cand.metadata?.warehouseName || 'Gudang Utama';
 
-            {/* Returnable Items Table (Desktop) */}
-            {returnableItems.length > 0 ? (
-              <>
-                <div className="go-return__items-desktop">
-                  <table className="go-return__items-table">
-                    <thead>
-                      <tr>
-                        <th style={{ width: '44px', textAlign: 'center' }}>
-                          <input
-                            type="checkbox"
-                            className="go-return__check"
-                            checked={isAllSelected}
-                            ref={(el) => { if (el) el.indeterminate = isSomeSelected; }}
-                            onChange={handleToggleAll}
-                            title="Pilih Semua / Batal Semua"
-                          />
-                        </th>
-                        <th style={{ width: '28%' }}>Produk</th>
-                        <th style={{ width: '14%' }}>SKU</th>
-                        <th style={{ width: '12%' }}>Jenis</th>
-                        <th style={{ width: '18%' }}>Serial / QR</th>
-                        <th style={{ width: '10%', textAlign: 'right' }}>Sisa Kirim</th>
-                        <th style={{ width: '18%', textAlign: 'right' }}>Qty Return</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {returnableItems.map((item) => {
-                        const isSelected = !!returnItems[item.key];
-                        const currentQty = returnItems[item.key]?.returnedQty || 0;
-                        return (
-                          <tr
-                            key={item.key}
-                            className={isSelected ? 'go-return__item--selected' : ''}
-                            onClick={(e) => {
-                              if (e.target.tagName === 'INPUT') return;
-                              handleToggleItem(item.key);
-                            }}
-                            style={{ cursor: 'pointer' }}
-                          >
-                            <td className="go-return__td-check" onClick={(e) => e.stopPropagation()}>
-                              <input
-                                type="checkbox"
-                                className="go-return__check"
-                                checked={isSelected}
-                                onChange={() => handleToggleItem(item.key)}
-                              />
-                            </td>
-                            <td className="go-return__td-product">
-                              <span style={{ fontWeight: 600 }}>{item.productName}</span>
-                            </td>
-                            <td>{item.sku || '—'}</td>
-                            <td>
-                              <span className={`chip chip-sm ${item.isSerial ? 'chip-success' : ''}`}>
-                                {item.isSerial ? 'Serial' : 'Normal'}
-                              </span>
-                            </td>
-                            <td className="go-return__td-serial">
-                              {item.isSerial ? (
-                                <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 600, color: 'var(--color-text-primary)' }}>
-                                  {item.serialNumber}
-                                </span>
-                              ) : (
-                                <span style={{ color: 'var(--color-text-muted)' }}>—</span>
-                              )}
-                            </td>
-                            <td className="go-return__td-qty">
-                              {item.remainingQty} {item.qtyUnit}
-                            </td>
-                            <td className="go-return__td-return-qty" onClick={(e) => e.stopPropagation()}>
-                              {item.isSerial ? (
-                                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '6px' }}>
-                                  {isSelected ? (
-                                    <span className="chip chip-sm chip-success" style={{ fontWeight: 700 }}>
-                                      1 {item.qtyUnit}
-                                    </span>
-                                  ) : (
-                                    <span style={{ fontSize: '12px', color: 'var(--color-text-muted)' }}>
-                                      (Belum dipilih)
-                                    </span>
-                                  )}
-                                </div>
-                              ) : (
-                                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '6px' }}>
-                                  <input
-                                    type="number"
-                                    className="go-return__qty-input"
-                                    min={0}
-                                    max={item.remainingQty}
-                                    value={currentQty}
-                                    placeholder="0"
-                                    onChange={(e) => handleQtyChange(item.key, parseInt(e.target.value) || 0)}
-                                  />
-                                  <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)' }}>
-                                    {item.qtyUnit}
-                                  </span>
-                                </div>
-                              )}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-
-                {/* Mobile Cards */}
-                <div className="go-return__items-mobile">
-                  {returnableItems.map((item) => {
-                    const isSelected = !!returnItems[item.key];
-                    const currentQty = returnItems[item.key]?.returnedQty || 0;
                     return (
                       <div
-                        key={item.key}
-                        className={`go-return__item-card${isSelected ? ' go-return__item-card--selected' : ''}`}
-                        onClick={() => handleToggleItem(item.key)}
-                        style={{ cursor: 'pointer' }}
+                        key={cand.id}
+                        className="go-return__doc-item"
+                        onClick={() => handleSelectDoc(cand)}
                       >
-                        <div className="go-return__item-card-header">
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                            <input
-                              type="checkbox"
-                              className="go-return__check"
-                              checked={isSelected}
-                              onChange={() => handleToggleItem(item.key)}
-                              onClick={(e) => e.stopPropagation()}
-                            />
-                            <span className="go-return__item-card-name">{item.productName}</span>
-                          </div>
-                          <span className={`chip chip-sm ${item.isSerial ? 'chip-success' : ''}`}>
-                            {item.isSerial ? 'Serial' : 'Normal'}
-                          </span>
-                        </div>
-                        <div className="go-return__item-card-grid">
-                          <div>
-                            <div className="go-return__item-card-label">SKU</div>
-                            <div>{item.sku || '—'}</div>
-                          </div>
-                          <div>
-                            <div className="go-return__item-card-label">Sisa Qty</div>
-                            <div><strong>{item.remainingQty}</strong> {item.qtyUnit}</div>
-                          </div>
-                          {item.isSerial && (
-                            <div>
-                              <div className="go-return__item-card-label">Serial</div>
-                              <div style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', fontWeight: 600 }}>{item.serialNumber}</div>
-                            </div>
-                          )}
-                          <div onClick={(e) => e.stopPropagation()}>
-                            <div className="go-return__item-card-label">Qty Return</div>
-                            {item.isSerial ? (
-                              <div style={{ fontWeight: 600, color: isSelected ? 'var(--color-success)' : 'var(--color-text-muted)' }}>
-                                {isSelected ? `1 ${item.qtyUnit}` : 'Belum dipilih'}
-                              </div>
-                            ) : (
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                <input
-                                  type="number"
-                                  className="go-return__qty-input"
-                                  min={0}
-                                  max={item.remainingQty}
-                                  value={currentQty}
-                                  onChange={(e) => handleQtyChange(item.key, parseInt(e.target.value) || 0)}
-                                />
-                                <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)' }}>
-                                  {item.qtyUnit}
-                                </span>
-                              </div>
-                            )}
+                        <div className="go-return__doc-info">
+                          <span className="go-return__doc-num">{cand.document_number}</span>
+                          <div className="go-return__doc-meta">
+                            <span>
+                              <Calendar size={12} style={{ display: 'inline', verticalAlign: '-1px' }} />{' '}
+                              {formatDate(cand.created_at)}
+                            </span>
+                            <span>•</span>
+                            <span>
+                              <User size={12} style={{ display: 'inline', verticalAlign: '-1px' }} /> {contactName}
+                            </span>
+                            <span>•</span>
+                            <span>
+                              <Warehouse size={12} style={{ display: 'inline', verticalAlign: '-1px' }} />{' '}
+                              {warehouseName}
+                            </span>
+                            <span>•</span>
+                            <span className="chip chip-neutral chip-sm">{itemCount} jenis item</span>
                           </div>
                         </div>
+                        <button type="button" className="btn btn-secondary btn-sm" style={{ pointerEvents: 'none' }}>
+                          <span>Pilih</span>
+                          <ChevronRight size={14} />
+                        </button>
                       </div>
                     );
                   })}
                 </div>
-              </>
-            ) : (
-              <div className="go-return__empty">
-                <Barcode size={32} className="go-return__empty-icon" />
-                <p>Semua item sudah di-return sebelumnya.</p>
+              )}
+            </div>
+          ) : (
+            /* SCENARIO B: Return Worksheet */
+            <>
+              {/* Selected Document Banner */}
+              <div className="go-return__selected-banner">
+                <div className="go-return__selected-info">
+                  <span className="go-return__selected-badge">{selectedDoc.document_number}</span>
+                  <span style={{ fontSize: '12px', color: 'var(--color-text-secondary)' }}>
+                    {formatDate(selectedDoc.created_at)} •{' '}
+                    <strong>
+                      {selectedDoc.contact_name ||
+                        selectedDoc.metadata?.contactName ||
+                        selectedDoc.metadata?.recipientName ||
+                        'Customer'}
+                    </strong>{' '}
+                    ({selectedDoc.warehouse_name || 'Gudang'})
+                  </span>
+                </div>
+                {!initialDoc && (
+                  <button type="button" className="go-return__change-doc-btn" onClick={handleChangeDoc}>
+                    Ganti Surat Jalan
+                  </button>
+                )}
               </div>
-            )}
-          </div>
 
-          {/* Error */}
+              {/* Step 1: Reason */}
+              <fieldset className="go-return__reasons">
+                <legend className="go-return__reasons-label">1. Pilih Alasan Return</legend>
+                <div className="go-return__reason-options">
+                  {RETURN_REASONS.map((r) => (
+                    <label
+                      key={r.key}
+                      className={`go-return__reason-option${
+                        reason === r.key ? ' go-return__reason-option--selected' : ''
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        name="return-reason"
+                        value={r.key}
+                        checked={reason === r.key}
+                        onChange={() => setReason(r.key)}
+                        className="go-return__reason-radio"
+                      />
+                      <span>{r.label}</span>
+                    </label>
+                  ))}
+                </div>
+
+                {reason === 'lainnya' && (
+                  <div className="go-return__note-wrap">
+                    <label className="go-return__note-label">Jelaskan alasan return (wajib diisi)</label>
+                    <textarea
+                      className="input go-return__note"
+                      placeholder="Contoh: Barang cacat dari pengiriman ekspedisi..."
+                      value={notes}
+                      onChange={(e) => setNotes(e.target.value)}
+                      rows={2}
+                      autoFocus
+                    />
+                  </div>
+                )}
+              </fieldset>
+
+              {/* Step 2: Worksheet Items */}
+              <div className="go-return__scan-section">
+                <div className="go-return__scan-header">
+                  <h4 className="go-return__scan-title">
+                    2. Worksheet Retur (Tentukan Kondisi per Produk)
+                    {payloadItems.length > 0 && (
+                      <span className="go-return__scan-badge">
+                        {totalReturnUnits} unit dipilih ({payloadItems.length} baris payload)
+                      </span>
+                    )}
+                  </h4>
+                  <button type="button" className="go-return__scan-btn" onClick={handleOpenScanner}>
+                    <Camera size={14} />
+                    <span>Scan QR</span>
+                  </button>
+                </div>
+
+                {/* Manual Input */}
+                <form onSubmit={handleManualAdd} className="go-return__manual-form">
+                  <input
+                    type="text"
+                    className="input go-return__manual-input"
+                    placeholder="Scan QR / ketik nomor seri / SKU manual..."
+                    value={manualInput}
+                    onChange={(e) => setManualInput(e.target.value)}
+                  />
+                  <button type="submit" className="btn btn-secondary go-return__manual-btn">
+                    Pindai
+                  </button>
+                </form>
+
+                {returnableItems.length === 0 ? (
+                  <div className="go-return__empty">
+                    <Barcode size={32} className="go-return__empty-icon" />
+                    <p>Semua item pada surat jalan ini sudah diretur sebelumnya.</p>
+                  </div>
+                ) : (
+                  <>
+                    {/* SECTION 2A: NON-SERIAL ITEMS */}
+                    {nonSerialItems.length > 0 && (
+                      <div style={{ marginTop: '8px' }}>
+                        <div
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            marginBottom: '6px',
+                          }}
+                        >
+                          <span style={{ fontSize: '12px', fontWeight: 700, color: 'var(--color-text-primary)' }}>
+                            Barang Non-Serial ({nonSerialItems.length} produk)
+                          </span>
+                          <div style={{ display: 'flex', gap: '8px' }}>
+                            <button
+                              type="button"
+                              className="go-return__toolbar-btn"
+                              onClick={handleFillAllNonSerialGood}
+                            >
+                              Semua Kondisi Baik
+                            </button>
+                            <button
+                              type="button"
+                              className="go-return__toolbar-btn"
+                              onClick={handleClearNonSerial}
+                            >
+                              Kosongkan
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="go-return__items-desktop">
+                          <table className="go-return__items-table">
+                            <thead>
+                              <tr>
+                                <th style={{ width: '28%' }}>Produk</th>
+                                <th style={{ width: '14%' }}>SKU</th>
+                                <th style={{ width: '12%', textAlign: 'right' }}>Kirim Awal</th>
+                                <th style={{ width: '12%', textAlign: 'right' }}>Retur Lalu</th>
+                                <th style={{ width: '12%', textAlign: 'right' }}>Sisa Kuota</th>
+                                <th style={{ width: '22%', textAlign: 'right' }}>Input Retur (Baik / Rusak)</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {nonSerialItems.map((item) => {
+                                const q = nonSerialQuantities[item.key] || { goodQty: '', damagedQty: '' };
+                                const gQty = q.goodQty === '' ? 0 : Number(q.goodQty);
+                                const dQty = q.damagedQty === '' ? 0 : Number(q.damagedQty);
+                                const rowTotal = gQty + dQty;
+                                const isRowExceeded = rowTotal > item.remainingQty;
+                                const isRowSelected = rowTotal > 0;
+
+                                return (
+                                  <tr
+                                    key={item.key}
+                                    className={isRowSelected ? 'go-return__item--selected' : ''}
+                                    style={isRowExceeded ? { background: 'var(--color-danger-surface)' } : {}}
+                                  >
+                                    <td className="go-return__td-product">
+                                      <span>{item.productName}</span>
+                                      {isRowExceeded && (
+                                        <div style={{ color: 'var(--color-danger)', fontSize: '11px', marginTop: '2px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                          <AlertTriangle size={12} />
+                                          <span>Total ({rowTotal}) melebihi sisa ({item.remainingQty})</span>
+                                        </div>
+                                      )}
+                                    </td>
+                                    <td>{item.sku || '—'}</td>
+                                    <td className="go-return__td-qty" style={{ color: 'var(--color-text-secondary)' }}>
+                                      {item.originalQty} {item.qtyUnit}
+                                    </td>
+                                    <td className="go-return__td-qty" style={{ color: 'var(--color-text-secondary)' }}>
+                                      {item.previouslyReturned > 0 ? `${item.previouslyReturned} ${item.qtyUnit}` : '—'}
+                                    </td>
+                                    <td className="go-return__td-qty">
+                                      <strong style={{ color: 'var(--color-text-primary)' }}>
+                                        {item.remainingQty} {item.qtyUnit}
+                                      </strong>
+                                    </td>
+                                    <td className="go-return__td-return-qty">
+                                      <div className="go-return__dual-qty">
+                                        <div className="go-return__dual-box">
+                                          <span className="go-return__dual-label go-return__dual-label--good">Baik</span>
+                                          <input
+                                            type="number"
+                                            step="any"
+                                            className="go-return__qty-input"
+                                            min={0}
+                                            max={item.remainingQty}
+                                            placeholder="0"
+                                            value={q.goodQty}
+                                            onChange={(e) =>
+                                              handleNonSerialQtyChange(item.key, 'good', e.target.value)
+                                            }
+                                          />
+                                        </div>
+                                        <div className="go-return__dual-box">
+                                          <span className="go-return__dual-label go-return__dual-label--damaged">
+                                            Rusak
+                                          </span>
+                                          <input
+                                            type="number"
+                                            step="any"
+                                            className="go-return__qty-input"
+                                            min={0}
+                                            max={item.remainingQty}
+                                            placeholder="0"
+                                            value={q.damagedQty}
+                                            onChange={(e) =>
+                                              handleNonSerialQtyChange(item.key, 'damaged', e.target.value)
+                                            }
+                                          />
+                                        </div>
+                                        <span style={{ fontSize: '11px', color: 'var(--color-text-secondary)' }}>
+                                          {item.qtyUnit}
+                                        </span>
+                                      </div>
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* SECTION 2B: SERIAL NUMBER ITEMS */}
+                    {serialItems.length > 0 && (
+                      <div style={{ marginTop: '16px' }}>
+                        <div
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            marginBottom: '6px',
+                          }}
+                        >
+                          <span style={{ fontSize: '12px', fontWeight: 700, color: 'var(--color-text-primary)' }}>
+                            Barang Serial ({serialItems.length} nomor seri aktif)
+                          </span>
+                          <button
+                            type="button"
+                            className="go-return__toolbar-btn"
+                            onClick={handleToggleAllSerials}
+                          >
+                            {isAllSerialSelected ? 'Batal Semua' : `Pilih Semua (${serialItems.length})`}
+                          </button>
+                        </div>
+
+                        <div className="go-return__items-desktop">
+                          <table className="go-return__items-table">
+                            <thead>
+                              <tr>
+                                <th style={{ width: '44px', textAlign: 'center' }}>
+                                  <input
+                                    type="checkbox"
+                                    className="go-return__check"
+                                    checked={isAllSerialSelected}
+                                    onChange={handleToggleAllSerials}
+                                    title="Pilih Semua Serial"
+                                  />
+                                </th>
+                                <th style={{ width: '28%' }}>Produk</th>
+                                <th style={{ width: '16%' }}>SKU</th>
+                                <th style={{ width: '24%' }}>Nomor Seri</th>
+                                <th style={{ width: '28%', textAlign: 'right' }}>Kondisi Saat Diretur</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {serialItems.map((item) => {
+                                const sel = serialSelection[item.key] || { selected: false, condition: 'available' };
+                                const isSelected = !!sel.selected;
+
+                                return (
+                                  <tr
+                                    key={item.key}
+                                    className={isSelected ? 'go-return__item--selected' : ''}
+                                    onClick={() => handleToggleSerial(item.key)}
+                                    style={{ cursor: 'pointer' }}
+                                  >
+                                    <td className="go-return__td-check" onClick={(e) => e.stopPropagation()}>
+                                      <input
+                                        type="checkbox"
+                                        className="go-return__check"
+                                        checked={isSelected}
+                                        onChange={() => handleToggleSerial(item.key)}
+                                      />
+                                    </td>
+                                    <td className="go-return__td-product">
+                                      <span>{item.productName}</span>
+                                    </td>
+                                    <td>{item.sku || '—'}</td>
+                                    <td className="go-return__td-serial">
+                                      <span
+                                        style={{
+                                          fontFamily: 'var(--font-mono)',
+                                          fontWeight: 600,
+                                          color: 'var(--color-text-primary)',
+                                        }}
+                                      >
+                                        {item.serialNumber}
+                                      </span>
+                                    </td>
+                                    <td className="go-return__td-return-qty" onClick={(e) => e.stopPropagation()}>
+                                      {isSelected ? (
+                                        <div className="go-return__serial-condition-toggle">
+                                          <button
+                                            type="button"
+                                            className={`go-return__serial-condition-btn${
+                                              sel.condition === 'available'
+                                                ? ' go-return__serial-condition-btn--active-good'
+                                                : ''
+                                            }`}
+                                            onClick={() => handleSerialCondition(item.key, 'available')}
+                                          >
+                                            Kondisi Baik
+                                          </button>
+                                          <button
+                                            type="button"
+                                            className={`go-return__serial-condition-btn${
+                                              sel.condition === 'damaged'
+                                                ? ' go-return__serial-condition-btn--active-damaged'
+                                                : ''
+                                            }`}
+                                            onClick={() => handleSerialCondition(item.key, 'damaged')}
+                                          >
+                                            Kondisi Rusak
+                                          </button>
+                                        </div>
+                                      ) : (
+                                        <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>
+                                          (Belum dipilih)
+                                        </span>
+                                      )}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </>
+          )}
+
+          {/* Error display */}
           {error && (
             <div className="go-return__error">
               <AlertCircle size={14} />
@@ -750,38 +1056,51 @@ export default function GoodsOutReturnModal({ doc, onClose, onSuccess }) {
 
         {/* Footer */}
         <div className="go-return__footer">
-          <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: 'var(--color-text-secondary)' }}>
-            {selectedItems.length > 0 ? (
-              <span>
-                Dipilih: <strong>{serialCount > 0 ? `${serialCount} serial` : ''}{serialCount > 0 && nonSerialCount > 0 ? ', ' : ''}{nonSerialCount > 0 ? `${nonSerialCount} non-seri` : ''}</strong> ({selectedItems.length} item)
-              </span>
+          <div
+            style={{
+              flex: 1,
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              fontSize: '12px',
+              color: 'var(--color-text-secondary)',
+            }}
+          >
+            {selectedDoc ? (
+              payloadItems.length > 0 ? (
+                <span>
+                  Diretur: <strong>{totalReturnUnits} unit</strong> (
+                  {selectedSerialCount > 0 ? `${selectedSerialCount} serial` : ''}
+                  {selectedSerialCount > 0 && selectedNonSerialCount > 0 ? ', ' : ''}
+                  {selectedNonSerialCount > 0 ? `${selectedNonSerialCount} item non-seri` : ''})
+                </span>
+              ) : (
+                <span>Tentukan minimal 1 item untuk diproses</span>
+              )
             ) : (
-              <span>Pilih minimal 1 item untuk return</span>
+              <span>Pilih satu surat jalan di atas untuk melanjutkan</span>
             )}
           </div>
-          <button
-            type="button"
-            className="btn btn-secondary btn-md"
-            onClick={onClose}
-            disabled={submitting}
-          >
+          <button type="button" className="btn btn-secondary btn-md" onClick={onClose} disabled={submitting}>
             Batal
           </button>
-          <button
-            type="button"
-            className="btn btn-primary btn-md"
-            onClick={handleSubmit}
-            disabled={!canSubmit || submitting}
-          >
-            {submitting ? (
-              'Memproses...'
-            ) : (
-              <>
-                <RotateCcw size={14} />
-                <span>Simpan Return ({selectedItems.length})</span>
-              </>
-            )}
-          </button>
+          {selectedDoc && (
+            <button
+              type="button"
+              className="btn btn-primary btn-md"
+              onClick={handleSubmit}
+              disabled={!canSubmit || submitting}
+            >
+              {submitting ? (
+                'Memproses...'
+              ) : (
+                <>
+                  <RotateCcw size={14} />
+                  <span>Simpan Retur ({totalReturnUnits} unit)</span>
+                </>
+              )}
+            </button>
+          )}
         </div>
       </div>
 
@@ -792,7 +1111,9 @@ export default function GoodsOutReturnModal({ doc, onClose, onSuccess }) {
             <div className="go-scanner-header">
               <div>
                 <h3 className="go-scanner-title">Scan QR Return</h3>
-                <p className="go-scanner-subtitle">Arahkan kamera ke QR Code / Barcode barang yang dikembalikan</p>
+                <p className="go-scanner-subtitle">
+                  Arahkan kamera ke QR Code / Barcode barang dari surat jalan {selectedDoc?.document_number}
+                </p>
               </div>
               <button
                 type="button"
@@ -831,12 +1152,15 @@ export default function GoodsOutReturnModal({ doc, onClose, onSuccess }) {
                 )}
 
                 {/* Manual Input in Scanner */}
-                <form onSubmit={(e) => {
-                  e.preventDefault();
-                  if (!manualInput.trim()) return;
-                  handleScanResult(manualInput.trim());
-                  setManualInput('');
-                }} className="go-scanner-manual-input-form">
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (!manualInput.trim()) return;
+                    handleScanResult(manualInput.trim());
+                    setManualInput('');
+                  }}
+                  className="go-scanner-manual-input-form"
+                >
                   <input
                     type="text"
                     className="input go-scanner-manual-input"
@@ -853,35 +1177,27 @@ export default function GoodsOutReturnModal({ doc, onClose, onSuccess }) {
               <div className="go-scanner-col go-scanner-col--results">
                 <div className="go-scanner-list-section">
                   <h5 className="go-scanner-list-title">
-                    <span>Daftar Return</span>
-                    <span className="go-scanner-list-badge">{selectedItems.length} item</span>
+                    <span>Ringkasan Item Diretur</span>
+                    <span className="go-scanner-list-badge">{payloadItems.length} baris</span>
                   </h5>
 
-                  {selectedItems.length === 0 ? (
+                  {payloadItems.length === 0 ? (
                     <div className="go-scanner-empty">
                       <Barcode size={32} className="go-scanner-empty-icon" />
                       <p>Belum ada item yang dipindai.</p>
                     </div>
                   ) : (
                     <div className="go-scanner-scanned-items">
-                      {selectedItems.map(([key, item]) => (
-                        <div key={key} className="go-scanner-scanned-item">
+                      {payloadItems.map((item, idx) => (
+                        <div key={idx} className="go-scanner-scanned-item">
                           <div className="go-scanner-scanned-info">
                             <span className="go-scanner-scanned-sn">
-                              {item.isSerial ? item.serialNumber : `${item.productName} × ${item.returnedQty}`}
+                              {item.isSerial ? item.serialNumber : `Item Non-Serial (${item.returnedQty} ${item.qtyUnit})`}
                             </span>
                             <span className="go-scanner-scanned-product">
-                              {item.productName} <small>({item.sku})</small>
+                              Kondisi: <strong>{item.targetStatus === 'damaged' ? 'Rusak' : 'Baik'}</strong>
                             </span>
                           </div>
-                          <button
-                            type="button"
-                            className="go-scanner-scanned-remove"
-                            onClick={() => handleRemoveItem(key)}
-                            title="Hapus"
-                          >
-                            <X size={14} />
-                          </button>
                         </div>
                       ))}
                     </div>
@@ -891,11 +1207,7 @@ export default function GoodsOutReturnModal({ doc, onClose, onSuccess }) {
             </div>
 
             <div className="go-scanner-footer">
-              <button
-                type="button"
-                className="btn btn-secondary"
-                onClick={() => setScannerOpen(false)}
-              >
+              <button type="button" className="btn btn-secondary" onClick={() => setScannerOpen(false)}>
                 Tutup Scanner
               </button>
             </div>

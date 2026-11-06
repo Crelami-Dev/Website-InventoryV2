@@ -212,6 +212,10 @@ export function AppProvider({ children }) {
   const logout = () => {
     api.post('/api/auth/sign-out').catch(() => {});
     clearSession();
+    setActiveWarehouseIdState(null);
+    try {
+      queryClient.clear();
+    } catch (_) {}
     setSessionState({ token: null, user: null });
   };
 

@@ -30,7 +30,19 @@ import type {
   LedgerEntry,
   ReservationEntry,
   ReconstructedStockBalance,
+  SerialGroupingRecord,
+  SerialGroupingStatus,
+  CreateSerialGroupsBatchInput,
+  SerialGroupDetailResult,
+  ReturnType,
+  InventoryReturnStatus,
+  GroupReturnMode,
+  DocumentReturnStatus,
+  ReturnLineItemInput,
+  CreateInventoryReturnInput,
+  RevertInventoryReturnInput,
 } from "../../types/inventory-domain.ts";
+import { RETURN_ERROR_CODES } from "../../types/inventory-domain.ts";
 
 export interface ProductRecord {
   id: string;
@@ -51,6 +63,8 @@ export interface ProductRecord {
   physicalStock?: number;
   reservedStock?: number;
   availableStock?: number;
+  availableStandaloneStock?: number; // Stok yang tersedia mandiri (AVAILABLE & bukan anggota group)
+  groupedStock?: number; // Kuantitas fisik yang sedang berada di dalam group (GROUPED)
 }
 
 export interface SerialRecord {
@@ -171,6 +185,8 @@ export interface GoodsOutLineInput {
   unit?: string;
   serials?: string[];
   poLineId?: string;
+  groupId?: string;
+  groupSerialsSnapshotJson?: string;
 }
 
 export interface CreateGoodsOutPendingInput {
@@ -392,6 +408,32 @@ export interface StockOpnameReconciliationSummary {
   investigationCount: number;
   netDiscrepancyQty: number;
   items: StockOpnameReconciliationItem[];
+}
+
+export interface SubmitStockOpnameForReviewResult {
+  success: true;
+  sessionId: string;
+  status: "REVIEW";
+  reviewedAt: string;
+}
+
+export interface ApproveAndPostStockOpnameAdjustmentInput {
+  sessionId: string;
+  notes?: string;
+  autoCompletePendingAreas?: boolean;
+}
+
+export interface ApproveAndPostStockOpnameAdjustmentResult {
+  success: true;
+  sessionId: string;
+  sessionNumber: string;
+  status: "ADJUSTED" | "COMPLETED";
+  totalLines: number;
+  totalAdjustedLines: number;
+  totalVarianceQty: number;
+  ledgerEntriesCreated: number;
+  approvedAt: string;
+  approvedByUserId: string;
 }
 
 export interface StockOpnameSessionDetail {
@@ -646,18 +688,33 @@ export interface DocumentEditOptions {
   purchaseOrders?: Array<{ id: string; poNumber: string; customerId: string; customerName?: string }>;
 }
 
+export type {
+  ReturnType,
+  InventoryReturnStatus,
+  GroupReturnMode,
+  DocumentReturnStatus,
+  ReturnLineItemInput,
+  CreateInventoryReturnInput,
+  RevertInventoryReturnInput,
+};
+export { RETURN_ERROR_CODES };
+
 export interface InventoryReturnRecord {
   id: string;
   ownerId: string;
   warehouseId: string;
   warehouseName?: string;
-  customerId: string;
-  customerName?: string;
+  returnType: ReturnType;
+  customerId: string | null;
+  customerName?: string | null;
+  supplierId: string | null;
+  supplierName?: string | null;
   goodsOutId: string | null;
+  goodsInId: string | null;
   returnNumber: string;
   returnDate: string;
   reason: "SALAH_KIRIM" | "PEMBATALAN" | "SALAH_INPUT" | "CACAT" | "LAINNYA";
-  status: "DRAFT" | "RECEIVED" | "REJECTED" | "CANCELLED";
+  status: InventoryReturnStatus;
   reopenSourceQty: boolean;
   notes: string | null;
   lines: Array<{
@@ -669,23 +726,8 @@ export interface InventoryReturnRecord {
     unit: string;
     condition: "BAIK" | "RUSAK";
     returnedSerials?: string[];
-  }>;
-}
-
-export interface CreateInventoryReturnInput {
-  warehouseId: string;
-  customerId: string;
-  goodsOutId?: string;
-  returnNumber: string;
-  returnDate: string;
-  reason: "SALAH_KIRIM" | "PEMBATALAN" | "SALAH_INPUT" | "CACAT" | "LAINNYA";
-  notes?: string;
-  lines: Array<{
-    productId: string;
-    quantity: number;
-    unit?: string;
-    condition: "BAIK" | "RUSAK";
-    returnedSerials?: string[];
+    groupId?: string | null;
+    groupReturnMode?: GroupReturnMode | null;
   }>;
 }
 
@@ -703,8 +745,716 @@ export class InventoryRepository {
   }
 
   /**
-   * Helper: Memvalidasi izin Owner & Gudang di level server
+   * Mengambil nomor group berikutnya dengan format 'G-0001' (auto-increment dan tidak dipakai ulang)
    */
+  getNextGroupNumber(ownerId?: string, warehouseId?: string): string {
+    const lastRow = this.db.prepare(`
+      SELECT group_number FROM serial_groupings
+      ORDER BY rowid DESC LIMIT 1
+    `).get() as { group_number: string } | undefined;
+
+    let nextIndex = 1;
+    if (lastRow?.group_number && lastRow.group_number.startsWith("G-")) {
+      const parsed = parseInt(lastRow.group_number.replace("G-", ""), 10);
+      if (!isNaN(parsed) && parsed >= 1) {
+        nextIndex = parsed + 1;
+      }
+    }
+
+    // Pastikan nomor benar-benar belum pernah terpakai
+    while (true) {
+      const candidate = `G-${String(nextIndex).padStart(4, "0")}`;
+      const exists = this.db.prepare(`
+        SELECT 1 FROM serial_groupings WHERE group_number = ?
+      `).get(candidate);
+      if (!exists) {
+        return candidate;
+      }
+      nextIndex++;
+    }
+  }
+
+  /**
+   * Service: createGrouping (Mendukung Batch Form Multi-Baris, 1 Transaksi Atomik)
+   * Aturan:
+   * 1. Minimal 2 SN per group.
+   * 2. SN harus AVAILABLE, 1 owner + gudang, belum jadi anggota group lain, tidak dobel di batch.
+   * 3. Semua SN 1 produk: nama group terkunci = nama produk, product_id terisi.
+   *    Ada >1 produk: group_name WAJIB diisi manual, product_id = null.
+   * 4. Satuan Pcs atau Lusin (1 lusin = 12 pcs). Total pcs harus kelipatan satuan; jika tidak lempar UNIT_MISMATCH ("Kurang X pcs").
+   * 5. Anggota diubah ke status GROUPED & parent_group_id terisi.
+   * 6. Header didaftarkan juga di product_serials sebagai is_group = 1 status AVAILABLE.
+   * 7. Ledger TIDAK bergerak saat create/ungroup.
+   */
+  createSerialGroupsBatch(
+    context: ActiveSecurityContext,
+    input: CreateSerialGroupsBatchInput
+  ): { createdGroups: SerialGroupingRecord[] } {
+    this.assertContext(context, input.warehouseId);
+
+    if (!input.groups || input.groups.length === 0) {
+      throw new AppError("ERR_VALIDATION", "Daftar grouping tidak boleh kosong.", 400);
+    }
+
+    return this.db.transaction(() => {
+      const now = new Date().toISOString();
+      const allBatchSerialIds = new Set<string>();
+      const createdGroups: SerialGroupingRecord[] = [];
+
+      for (let gIdx = 0; gIdx < input.groups.length; gIdx++) {
+        const item = input.groups[gIdx];
+        const gLabel = `Baris ke-${gIdx + 1}`;
+
+        if (!item.serialIds || item.serialIds.length < 2) {
+          throw new AppError(
+            "ERR_VALIDATION",
+            `${gLabel}: Minimal 2 nomor seri untuk digabungkan menjadi group.`,
+            400
+          );
+        }
+
+        // Cek duplikasi di batch
+        for (const sId of item.serialIds) {
+          if (allBatchSerialIds.has(sId)) {
+            throw new AppError(
+              "ERR_CONFLICT",
+              `${gLabel}: Nomor seri '${sId}' dipilih lebih dari satu kali dalam batch grouping.`,
+              409
+            );
+          }
+          allBatchSerialIds.add(sId);
+        }
+
+        // Ambil data detail serial anggota
+        const memberSerials: Array<{
+          id: string;
+          owner_id: string;
+          warehouse_id: string;
+          product_id: string;
+          serial_number: string;
+          status: string;
+          is_group: number;
+          parent_group_id: string | null;
+          base_quantity: number;
+          product_name: string;
+          sku: string;
+        }> = [];
+
+        for (const sId of item.serialIds) {
+          const row = this.db.prepare(`
+            SELECT ps.id, ps.owner_id, ps.warehouse_id, ps.product_id,
+                   ps.serial_number, ps.status, ps.is_group, ps.parent_group_id,
+                   ps.unit, ps.unit_quantity, ps.base_quantity, p.name AS product_name, p.sku
+            FROM product_serials ps
+            JOIN products p ON p.id = ps.product_id
+            WHERE ps.id = ? AND ps.owner_id = ?
+          `).get(sId, context.ownerId) as (typeof memberSerials)[0] | undefined;
+
+          if (!row) {
+            throw new AppError(
+              "ERR_NOT_FOUND",
+              `${gLabel}: Nomor seri '${sId}' tidak ditemukan di sistem.`,
+              404
+            );
+          }
+
+          if (row.warehouse_id !== input.warehouseId) {
+            throw new AppError(
+              "ERR_FORBIDDEN_WAREHOUSE",
+              `${gLabel}: Nomor seri '${row.serial_number}' berada di gudang lain. Seluruh nomor seri dalam group wajib berasal dari gudang yang sama.`,
+              403
+            );
+          }
+
+          if (row.is_group === 1) {
+            throw new AppError(
+              "ERR_CONFLICT",
+              `${gLabel}: Nomor seri '${row.serial_number}' adalah group. Group bertingkat (nested) tidak diperbolehkan.`,
+              409
+            );
+          }
+
+          if (row.status === "GROUPED" || row.parent_group_id) {
+            throw new AppError(
+              "ERR_CONFLICT",
+              `${gLabel}: Nomor seri '${row.serial_number}' sudah menjadi anggota group lain.`,
+              409
+            );
+          }
+
+          if (row.status !== "AVAILABLE") {
+            throw new AppError(
+              "ERR_CONFLICT",
+              `${gLabel}: Nomor seri '${row.serial_number}' tidak berstatus AVAILABLE (status: ${row.status}).`,
+              409
+            );
+          }
+
+          memberSerials.push(row);
+        }
+
+        // Hitung total base qty dalam PCS berdasarkan base_quantity masing-masing serial
+        const totalBaseQtyPcs = memberSerials.reduce((sum, m) => {
+          const uQty = Number((m as any).unit_quantity || 1);
+          const bQty = Number(m.base_quantity) > 0 ? Number(m.base_quantity) : uQty * getUnitMultiplier((m as any).unit || "pcs");
+          return sum + bQty;
+        }, 0);
+
+        // Validasi aturan kelipatan satuan
+        const targetUnit = item.unit === "lusin" ? "lusin" : "pcs";
+        const unitMultiplier = targetUnit === "lusin" ? 12 : 1;
+
+        if (totalBaseQtyPcs % unitMultiplier !== 0) {
+          const remainder = totalBaseQtyPcs % unitMultiplier;
+          const kurangPcs = unitMultiplier - remainder;
+          throw new AppError(
+            "UNIT_MISMATCH",
+            `${gLabel}: Total kuantitas (${totalBaseQtyPcs} pcs) tidak pas dengan satuan '${targetUnit}'. Kurang ${kurangPcs} pcs.`,
+            400,
+            { totalBaseQtyPcs, targetUnit, kurangPcs }
+          );
+        }
+
+        const calculatedUnitQty = totalBaseQtyPcs / unitMultiplier;
+
+        // Evaluasi apakah single-product atau multi-product
+        const distinctProductIds = Array.from(new Set(memberSerials.map((m) => m.product_id)));
+        const isSingleProduct = distinctProductIds.length === 1;
+
+        let finalProductName: string | null = null;
+        let finalProductId: string | null = null;
+
+        if (isSingleProduct) {
+          finalProductId = distinctProductIds[0];
+          finalProductName = memberSerials[0].product_name;
+        } else {
+          finalProductId = null;
+          const trimmedName = item.groupName?.trim();
+          if (!trimmedName) {
+            throw new AppError(
+              "ERR_VALIDATION",
+              `${gLabel}: Group lintas produk (>1 macam produk) WAJIB mengisi nama group secara manual.`,
+              400
+            );
+          }
+          finalProductName = trimmedName;
+        }
+
+        const groupingId = crypto.randomUUID();
+        const groupNumber = this.getNextGroupNumber(context.ownerId, input.warehouseId);
+
+        // 1. Simpan Header serial_groupings
+        this.db.prepare(`
+          INSERT INTO serial_groupings (
+            id, owner_id, warehouse_id, group_number, group_name, product_id,
+            unit, unit_qty, total_base_qty_pcs, status, notes, created_by,
+            created_at, dissolved_by, dissolved_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'AVAILABLE', ?, ?, ?, NULL, NULL)
+        `).run(
+          groupingId,
+          context.ownerId,
+          input.warehouseId,
+          groupNumber,
+          finalProductName,
+          finalProductId,
+          targetUnit,
+          calculatedUnitQty,
+          totalBaseQtyPcs,
+          item.notes?.trim() || null,
+          context.userId,
+          now
+        );
+
+        // 2. Daftarkan header group sebagai entri baru di product_serials agar bisa di-scan/dipilih saat Goods Out
+        // Jika single product, pakai product_id tersebut. Jika campur, kaitkan ke produk pertama sebagai anchor fisik
+        const anchorProductId = finalProductId || memberSerials[0].product_id;
+        const groupSerialId = crypto.randomUUID();
+        this.db.prepare(`
+          INSERT INTO product_serials (
+            id, owner_id, warehouse_id, product_id, serial_number, normalized_serial_number,
+            status, unit, unit_quantity, base_quantity, is_group, parent_group_id,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 'AVAILABLE', ?, ?, ?, 1, NULL, ?, ?)
+        `).run(
+          groupSerialId,
+          context.ownerId,
+          input.warehouseId,
+          anchorProductId,
+          groupNumber,
+          groupNumber,
+          targetUnit,
+          calculatedUnitQty,
+          totalBaseQtyPcs,
+          now,
+          now
+        );
+
+        // 3. Simpan detail komponen & perbarui status anggota menjadi GROUPED
+        for (const m of memberSerials) {
+          const compId = crypto.randomUUID();
+          const uQty = Number((m as any).unit_quantity || 1);
+          const bQty = Number(m.base_quantity) > 0 ? Number(m.base_quantity) : uQty * getUnitMultiplier((m as any).unit || "pcs");
+          this.db.prepare(`
+            INSERT INTO serial_grouping_components (
+              id, grouping_id, serial_id, product_id, snapshot_product_name,
+              snapshot_sku, base_qty_pcs, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            compId,
+            groupingId,
+            m.id,
+            m.product_id,
+            m.product_name,
+            m.sku,
+            bQty,
+            now
+          );
+
+          // Update status anggota
+          this.db.prepare(`
+            UPDATE product_serials
+            SET status = 'GROUPED', parent_group_id = ?, updated_at = ?
+            WHERE id = ?
+          `).run(groupingId, now, m.id);
+        }
+
+        createdGroups.push({
+          id: groupingId,
+          ownerId: context.ownerId,
+          warehouseId: input.warehouseId,
+          groupNumber,
+          groupName: finalProductName,
+          productId: finalProductId,
+          unit: targetUnit,
+          unitQuantity: calculatedUnitQty,
+          totalBaseQtyPcs,
+          status: "AVAILABLE",
+          notes: item.notes?.trim() || null,
+          createdBy: context.userId,
+          createdAt: now,
+          dissolvedBy: null,
+          dissolvedAt: null,
+        });
+
+        // Audit log per group
+        this.recordAudit(
+          context.ownerId,
+          input.warehouseId,
+          context.userId,
+          "CREATE_SERIAL_GROUP",
+          "SERIAL_GROUP",
+          groupingId,
+          {
+            groupNumber,
+            groupName: finalProductName,
+            memberCount: memberSerials.length,
+            totalBaseQtyPcs,
+            unit: targetUnit,
+          }
+        );
+      }
+
+      return { createdGroups };
+    });
+  }
+
+  /**
+   * Service: dissolveGrouping (Ungroup Serial)
+   * Aturan:
+   * - Status AVAILABLE: Boleh. Group jadi DISSOLVED, anggota AVAILABLE, parent_group_id null.
+   * - Status RESERVED: Ditolak / diblokir: "Keluarkan dulu dari dokumen DO-xxx".
+   * - Status CONSUMED_OUT: Ditolak (hanya lewat retur).
+   * - Ledger TIDAK bergerak saat ungroup.
+   */
+  dissolveGrouping(
+    context: ActiveSecurityContext,
+    groupingId: string,
+    notes?: string
+  ): { dissolved: boolean; groupNumber: string; restoredCount: number } {
+    return this.db.transaction(() => {
+      const now = new Date().toISOString();
+
+      const grp = this.db.prepare(`
+        SELECT id, owner_id, warehouse_id, group_number, status
+        FROM serial_groupings
+        WHERE id = ? AND owner_id = ?
+      `).get(groupingId, context.ownerId) as {
+        id: string;
+        owner_id: string;
+        warehouse_id: string;
+        group_number: string;
+        status: string;
+      } | undefined;
+
+      if (!grp) {
+        throw new AppError("ERR_NOT_FOUND", "Data Grouping Serial tidak ditemukan.", 404);
+      }
+
+      this.assertContext(context, grp.warehouse_id);
+
+      if (grp.status === "DISSOLVED") {
+        throw new AppError("ERR_CONFLICT", `Group '${grp.group_number}' sudah pernah dibongkar (DISSOLVED).`, 409);
+      }
+
+      if (grp.status === "RESERVED") {
+        // Cari dokumen DO yang sedang mereservasi group ini
+        const activeRes = this.db.prepare(`
+          SELECT go.document_number
+          FROM reservations r
+          JOIN goods_out go ON go.id = r.goods_out_id
+          JOIN product_serials ps ON ps.id = r.product_id OR r.serial_ids_json LIKE '%' || ps.id || '%'
+          WHERE ps.serial_number = ? AND r.status = 'ACTIVE'
+          LIMIT 1
+        `).get(grp.group_number) as { document_number: string } | undefined;
+
+        const docRef = activeRes?.document_number || "Goods Out";
+        throw new AppError("ERR_CONFLICT", `Keluarkan dulu dari dokumen ${docRef}. Group berstatus RESERVED tidak dapat dibongkar.`, 409);
+      }
+
+      if (grp.status === "CONSUMED_OUT") {
+        throw new AppError(
+          "ERR_CONFLICT",
+          `Group '${grp.group_number}' sudah keluar dari gudang (CONSUMED_OUT). Pembongkaran hanya dapat diproses melalui alur Retur.`,
+          409
+        );
+      }
+
+      if (grp.status !== "AVAILABLE") {
+        throw new AppError("ERR_CONFLICT", `Hanya group berstatus AVAILABLE yang dapat dibongkar (status saat ini: ${grp.status}).`, 409);
+      }
+
+      // Ambil seluruh komponen serial
+      const components = this.db.prepare(`
+        SELECT serial_id FROM serial_grouping_components
+        WHERE grouping_id = ?
+      `).all(groupingId) as Array<{ serial_id: string }>;
+
+      // 1. Kembalikan seluruh anggota serial ke status AVAILABLE & hapus parent_group_id
+      for (const c of components) {
+        this.db.prepare(`
+          UPDATE product_serials
+          SET status = 'AVAILABLE', parent_group_id = NULL, updated_at = ?
+          WHERE id = ?
+        `).run(now, c.serial_id);
+      }
+
+      // 2. Update status header serial_groupings ke DISSOLVED
+      this.db.prepare(`
+        UPDATE serial_groupings
+        SET status = 'DISSOLVED', dissolved_by = ?, dissolved_at = ?, notes = COALESCE(?, notes)
+        WHERE id = ?
+      `).run(context.userId, now, notes?.trim() || null, groupingId);
+
+      // 3. Update entri group di product_serials menjadi DECOMMISSIONED / CONSUMED_OUT agar tidak bisa di-scan lagi
+      this.db.prepare(`
+        UPDATE product_serials
+        SET status = 'DECOMMISSIONED', updated_at = ?
+        WHERE owner_id = ? AND serial_number = ? AND is_group = 1
+      `).run(now, context.ownerId, grp.group_number);
+
+      // 4. Audit Log
+      this.recordAudit(
+        context.ownerId,
+        grp.warehouse_id,
+        context.userId,
+        "DISSOLVE_SERIAL_GROUP",
+        "SERIAL_GROUP",
+        groupingId,
+        {
+          groupNumber: grp.group_number,
+          restoredCount: components.length,
+          reason: notes || "Pembongkaran group manual oleh pengguna",
+        }
+      );
+
+      return {
+        dissolved: true,
+        groupNumber: grp.group_number,
+        restoredCount: components.length,
+      };
+    });
+  }
+
+  /**
+   * Mengambil daftar riwayat Grouping Serial Number
+   */
+  getSerialGroupings(
+    context: ActiveSecurityContext,
+    filterWarehouseId?: string,
+    statusFilter?: string
+  ): SerialGroupingRecord[] {
+    this.assertContext(context, filterWarehouseId);
+    const targetWh = filterWarehouseId ?? context.warehouseId;
+
+    let query = `
+      SELECT id, owner_id, warehouse_id, group_number, group_name, product_id,
+             unit, unit_qty, total_base_qty_pcs, status, notes, created_by,
+             created_at, dissolved_by, dissolved_at
+      FROM serial_groupings
+      WHERE owner_id = ?
+    `;
+    const params: unknown[] = [context.ownerId];
+
+    if (targetWh) {
+      query += ` AND warehouse_id = ?`;
+      params.push(targetWh);
+    }
+
+    if (statusFilter && statusFilter !== "ALL") {
+      query += ` AND status = ?`;
+      params.push(statusFilter);
+    }
+
+    query += ` ORDER BY created_at DESC`;
+
+    const rows = this.db.prepare(query).all(...params) as Array<{
+      id: string;
+      owner_id: string;
+      warehouse_id: string;
+      group_number: string;
+      group_name: string | null;
+      product_id: string | null;
+      unit: string;
+      unit_qty: number;
+      total_base_qty_pcs: number;
+      status: string;
+      notes: string | null;
+      created_by: string;
+      created_at: string;
+      dissolved_by: string | null;
+      dissolved_at: string | null;
+    }>;
+
+    return rows.map((r) => ({
+      id: r.id,
+      ownerId: r.owner_id,
+      warehouseId: r.warehouse_id,
+      groupNumber: r.group_number,
+      groupName: r.group_name,
+      productId: r.product_id,
+      unit: r.unit as "pcs" | "lusin",
+      unitQuantity: Number(r.unit_qty),
+      totalBaseQtyPcs: Number(r.total_base_qty_pcs),
+      status: r.status as SerialGroupingStatus,
+      notes: r.notes,
+      createdBy: r.created_by,
+      createdAt: r.created_at,
+      dissolvedBy: r.dissolved_by,
+      dissolvedAt: r.dissolved_at,
+    }));
+  }
+
+  /**
+   * Mengambil detail lengkap suatu group termasuk komponen di dalamnya
+   */
+  getSerialGroupDetail(
+    context: ActiveSecurityContext,
+    groupingId: string
+  ): SerialGroupDetailResult | null {
+    this.assertContext(context);
+
+    const grp = this.db.prepare(`
+      SELECT id, owner_id, warehouse_id, group_number, group_name, product_id,
+             unit, unit_qty, total_base_qty_pcs, status, notes, created_by,
+             created_at, dissolved_by, dissolved_at
+      FROM serial_groupings
+      WHERE id = ? AND owner_id = ?
+    `).get(groupingId, context.ownerId) as {
+      id: string;
+      owner_id: string;
+      warehouse_id: string;
+      group_number: string;
+      group_name: string | null;
+      product_id: string | null;
+      unit: string;
+      unit_qty: number;
+      total_base_qty_pcs: number;
+      status: string;
+      notes: string | null;
+      created_by: string;
+      created_at: string;
+      dissolved_by: string | null;
+      dissolved_at: string | null;
+    } | undefined;
+
+    if (!grp) return null;
+
+    const components = this.db.prepare(`
+      SELECT sgc.id, sgc.serial_id, sgc.product_id, sgc.snapshot_product_name,
+             sgc.snapshot_sku, sgc.base_qty_pcs, ps.serial_number, ps.unit, ps.unit_quantity
+      FROM serial_grouping_components sgc
+      JOIN product_serials ps ON ps.id = sgc.serial_id
+      WHERE sgc.grouping_id = ?
+      ORDER BY sgc.created_at ASC
+    `).all(groupingId) as Array<{
+      id: string;
+      serial_id: string;
+      product_id: string;
+      snapshot_product_name: string;
+      snapshot_sku: string;
+      base_qty_pcs: number;
+      serial_number: string;
+      unit: string;
+      unit_quantity: number;
+    }>;
+
+    return {
+      group: {
+        id: grp.id,
+        ownerId: grp.owner_id,
+        warehouseId: grp.warehouse_id,
+        groupNumber: grp.group_number,
+        groupName: grp.group_name,
+        productId: grp.product_id,
+        unit: grp.unit as "pcs" | "lusin",
+        unitQuantity: Number(grp.unit_qty),
+        totalBaseQtyPcs: Number(grp.total_base_qty_pcs),
+        status: grp.status as SerialGroupingStatus,
+        notes: grp.notes,
+        createdBy: grp.created_by,
+        createdAt: grp.created_at,
+        dissolvedBy: grp.dissolved_by,
+        dissolvedAt: grp.dissolved_at,
+      },
+      components: components.map((c) => ({
+        id: c.id,
+        serialId: c.serial_id,
+        serialNumber: c.serial_number,
+        productId: c.product_id,
+        productName: c.snapshot_product_name,
+        sku: c.snapshot_sku,
+        baseQtyPcs: Number(c.base_qty_pcs),
+        unit: c.unit || "pcs",
+        unitQuantity: Number(c.unit_quantity || 1),
+      })),
+    };
+  }
+
+  /**
+   * Helper: Resolusi pemindaian barcode Group untuk Goods Out
+   * Scan barcode group: validasi AVAILABLE, owner/gudang cocok.
+   * Mengembalikan rincian pemecahan baris per produk (qty = jumlah base_qty_pcs per produk).
+   */
+  resolveGroupForGoodsOut(
+    context: ActiveSecurityContext,
+    groupNumber: string,
+    warehouseId: string
+  ): {
+    group: SerialGroupingRecord;
+    lines: Array<{
+      productId: string;
+      productName: string;
+      sku: string;
+      unit: string;
+      quantity: number;
+      serials: string[];
+      groupId: string;
+      groupSerialsSnapshotJson: string;
+    }>;
+  } {
+    this.assertContext(context, warehouseId);
+
+    const grp = this.db.prepare(`
+      SELECT id, owner_id, warehouse_id, group_number, group_name, product_id,
+             unit, unit_qty, total_base_qty_pcs, status, notes, created_by, created_at
+      FROM serial_groupings
+      WHERE owner_id = ? AND warehouse_id = ? AND group_number = ?
+    `).get(context.ownerId, warehouseId, groupNumber.trim()) as {
+      id: string;
+      owner_id: string;
+      warehouse_id: string;
+      group_number: string;
+      group_name: string | null;
+      product_id: string | null;
+      unit: string;
+      unit_qty: number;
+      total_base_qty_pcs: number;
+      status: string;
+      notes: string | null;
+      created_by: string;
+      created_at: string;
+    } | undefined;
+
+    if (!grp) {
+      throw new AppError("ERR_NOT_FOUND", `Group Serial '${groupNumber}' tidak ditemukan di gudang ini.`, 404);
+    }
+
+    if (grp.status !== "AVAILABLE") {
+      throw new AppError("ERR_CONFLICT", `Group Serial '${groupNumber}' tidak dapat dikeluarkan (status: ${grp.status}).`, 409);
+    }
+
+    const components = this.db.prepare(`
+      SELECT sgc.serial_id, sgc.product_id, sgc.snapshot_product_name,
+             sgc.snapshot_sku, sgc.base_qty_pcs, ps.serial_number, p.unit
+      FROM serial_grouping_components sgc
+      JOIN product_serials ps ON ps.id = sgc.serial_id
+      JOIN products p ON p.id = sgc.product_id
+      WHERE sgc.grouping_id = ?
+    `).all(grp.id) as Array<{
+      serial_id: string;
+      product_id: string;
+      snapshot_product_name: string;
+      snapshot_sku: string;
+      base_qty_pcs: number;
+      serial_number: string;
+      unit: string;
+    }>;
+
+    // Kelompokkan per produk
+    const productMap = new Map<string, {
+      productId: string;
+      productName: string;
+      sku: string;
+      unit: string;
+      quantity: number;
+      serials: string[];
+    }>();
+
+    for (const c of components) {
+      const existing = productMap.get(c.product_id);
+      if (existing) {
+        existing.quantity += Number(c.base_qty_pcs);
+        existing.serials.push(c.serial_number);
+      } else {
+        productMap.set(c.product_id, {
+          productId: c.product_id,
+          productName: c.snapshot_product_name,
+          sku: c.snapshot_sku,
+          unit: "pcs", // kuantitas dasar selalu pcs
+          quantity: Number(c.base_qty_pcs),
+          serials: [c.serial_number],
+        });
+      }
+    }
+
+    const allSerialIds = components.map((c) => c.serial_id);
+    const snapshotJson = JSON.stringify(allSerialIds);
+
+    const lines = Array.from(productMap.values()).map((p) => ({
+      ...p,
+      groupId: grp.id,
+      groupSerialsSnapshotJson: snapshotJson,
+    }));
+
+    return {
+      group: {
+        id: grp.id,
+        ownerId: grp.owner_id,
+        warehouseId: grp.warehouse_id,
+        groupNumber: grp.group_number,
+        groupName: grp.group_name,
+        productId: grp.product_id,
+        unit: grp.unit as "pcs" | "lusin",
+        unitQuantity: Number(grp.unit_qty),
+        totalBaseQtyPcs: Number(grp.total_base_qty_pcs),
+        status: grp.status as SerialGroupingStatus,
+        notes: grp.notes,
+        createdBy: grp.created_by,
+        createdAt: grp.created_at,
+      },
+      lines,
+    };
+  }
   private assertContext(
     context: ActiveSecurityContext,
     targetWarehouseId?: string
@@ -786,6 +1536,29 @@ export class InventoryRepository {
 
     return rows.map((r) => {
       const balance = this.calculateStockBalance(context.ownerId, r.warehouse_id, r.id);
+
+      // Hitung stok mandiri vs stok tergroup (GROUPED) jika barang bertipe SERIAL
+      let groupedStock = 0;
+      let availableStandaloneStock = balance.availableStock;
+
+      if (r.tracking_mode === "SERIAL") {
+        const grpRow = this.db.prepare(`
+          SELECT COALESCE(SUM(base_quantity), 0) AS grouped_qty
+          FROM product_serials
+          WHERE owner_id = ? AND warehouse_id = ? AND product_id = ? AND status = 'GROUPED'
+        `).get(context.ownerId, r.warehouse_id, r.id) as { grouped_qty: number };
+
+        groupedStock = Number(grpRow?.grouped_qty || 0);
+
+        const standaloneRow = this.db.prepare(`
+          SELECT COALESCE(SUM(base_quantity), 0) AS standalone_qty
+          FROM product_serials
+          WHERE owner_id = ? AND warehouse_id = ? AND product_id = ? AND status = 'AVAILABLE' AND (is_group = 0 OR is_group IS NULL)
+        `).get(context.ownerId, r.warehouse_id, r.id) as { standalone_qty: number };
+
+        availableStandaloneStock = Number(standaloneRow?.standalone_qty || 0);
+      }
+
       return {
         id: r.id,
         ownerId: r.owner_id,
@@ -804,6 +1577,8 @@ export class InventoryRepository {
         physicalStock: balance.physicalStock,
         reservedStock: balance.reservedStock,
         availableStock: balance.availableStock,
+        availableStandaloneStock,
+        groupedStock,
       };
     });
   }
@@ -2203,7 +2978,7 @@ export class InventoryRepository {
              p.name AS product_name, p.sku
       FROM product_serials ps
       JOIN products p ON p.id = ps.product_id
-      WHERE ps.owner_id = ? AND ps.product_id = ? AND (? IS NULL OR ps.warehouse_id = ?) AND ps.status = 'AVAILABLE'
+      WHERE ps.owner_id = ? AND ps.product_id = ? AND (? IS NULL OR ps.warehouse_id = ?) AND ps.status = 'AVAILABLE' AND (ps.is_group = 0 OR ps.is_group IS NULL)
       ORDER BY ps.created_at ASC
     `).all(context.ownerId, productId, targetWhId, targetWhId) as Array<{
       id: string;
@@ -2254,7 +3029,7 @@ export class InventoryRepository {
              p.name AS product_name, p.sku
       FROM product_serials ps
       JOIN products p ON p.id = ps.product_id
-      WHERE ps.owner_id = ? AND (? IS NULL OR ps.warehouse_id = ?) AND ps.status = 'AVAILABLE'
+      WHERE ps.owner_id = ? AND (? IS NULL OR ps.warehouse_id = ?) AND ps.status = 'AVAILABLE' AND (ps.is_group = 0 OR ps.is_group IS NULL)
       ORDER BY ps.serial_number ASC
     `).all(context.ownerId, targetWhId, targetWhId) as Array<{
       id: string;
@@ -2270,19 +3045,24 @@ export class InventoryRepository {
       sku: string;
     }>;
 
-    return rows.map((r) => ({
-      id: r.id,
-      productId: r.product_id,
-      productName: r.product_name,
-      sku: r.sku,
-      warehouseId: r.warehouse_id,
-      serialNumber: r.serial_number,
-      unit: r.unit || "pcs",
-      unitQuantity: Number(r.unit_quantity || 1),
-      baseQuantity: Number(r.base_quantity || 1),
-      status: r.status,
-      createdAt: r.created_at,
-    }));
+    return rows.map((r) => {
+      const u = r.unit || "pcs";
+      const uQty = Number(r.unit_quantity || 1);
+      const bQty = Number(r.base_quantity) > 0 ? Number(r.base_quantity) : uQty * getUnitMultiplier(u);
+      return {
+        id: r.id,
+        productId: r.product_id,
+        productName: r.product_name,
+        sku: r.sku,
+        warehouseId: r.warehouse_id,
+        serialNumber: r.serial_number,
+        unit: u,
+        unitQuantity: uQty,
+        baseQuantity: bQty,
+        status: r.status,
+        createdAt: r.created_at,
+      };
+    });
   }
 
   /**
@@ -2322,6 +3102,18 @@ export class InventoryRepository {
 
     if (!row) {
       throw new AppError("ERR_NOT_FOUND", `Serial Number '${serialNumber}' tidak ditemukan di sistem.`, 404);
+    }
+
+    if (row.status === "GROUPED") {
+      const parentGrp = this.db.prepare(`
+        SELECT sg.group_number, sg.group_name
+        FROM product_serials ps
+        JOIN serial_groupings sg ON sg.id = ps.parent_group_id
+        WHERE ps.id = ?
+      `).get(row.id) as { group_number: string; group_name: string | null } | undefined;
+
+      const grpLabel = parentGrp?.group_number || "Group";
+      throw new AppError("ERR_CONFLICT", `SN ini bagian dari ${grpLabel}.`, 409);
     }
 
     if (row.status !== "AVAILABLE") {
@@ -2625,8 +3417,8 @@ export class InventoryRepository {
         this.db.prepare(`
           INSERT INTO goods_out_lines (
             id, goods_out_id, product_id, po_line_id, quantity, unit,
-            allocated_serials_json, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            allocated_serials_json, group_id, group_serials_snapshot_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           lineId,
           goodsOutId,
@@ -2635,6 +3427,8 @@ export class InventoryRepository {
           line.quantity,
           line.unit ?? "pcs",
           allocatedSerialIds ? JSON.stringify(allocatedSerialIds) : null,
+          line.groupId ?? null,
+          line.groupSerialsSnapshotJson ?? null,
           now
         );
 
@@ -2876,8 +3670,8 @@ export class InventoryRepository {
         this.db.prepare(`
           INSERT INTO goods_out_lines (
             id, goods_out_id, product_id, po_line_id, quantity, unit,
-            allocated_serials_json, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            allocated_serials_json, group_id, group_serials_snapshot_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           lineId,
           input.goodsOutId,
@@ -2886,6 +3680,8 @@ export class InventoryRepository {
           line.quantity,
           line.unit ?? "pcs",
           allocatedSerialIds ? JSON.stringify(allocatedSerialIds) : null,
+          line.groupId ?? null,
+          line.groupSerialsSnapshotJson ?? null,
           now
         );
 
@@ -3014,6 +3810,17 @@ export class InventoryRepository {
               SET status = 'CONSUMED_OUT', updated_at = ?
               WHERE id = ?
             `).run(now, sId);
+
+            // Jika serial ini adalah group, update juga status di serial_groupings dan seluruh anak serialnya
+            const snItem = this.db.prepare("SELECT is_group, serial_number FROM product_serials WHERE id = ?").get(sId) as { is_group: number; serial_number: string } | undefined;
+            if (snItem && snItem.is_group === 1) {
+              const grp = this.db.prepare("SELECT id FROM serial_groupings WHERE owner_id = ? AND group_number = ?").get(context.ownerId, snItem.serial_number) as { id: string } | undefined;
+              if (grp) {
+                this.db.prepare("UPDATE serial_groupings SET status = 'CONSUMED_OUT' WHERE id = ?").run(grp.id);
+                // SEMUA anggota jadi CONSUMED_OUT
+                this.db.prepare("UPDATE product_serials SET status = 'CONSUMED_OUT', updated_at = ? WHERE parent_group_id = ?").run(now, grp.id);
+              }
+            }
           }
         }
 
@@ -3114,6 +3921,165 @@ export class InventoryRepository {
   }
 
   /**
+   * Pembatalan Goods Out COMPLETED (Reversal DO Selesai)
+   * Membalikkan mutasi ledger (kuantitas positif), mengembalikan status serial dan group.
+   */
+  cancelCompletedGoodsOutTransaction(
+    context: ActiveSecurityContext,
+    goodsOutId: string,
+    reason: string
+  ): { reversed: boolean; ledgerReversalsCount: number } {
+    return this.db.transaction(() => {
+      const now = new Date().toISOString();
+
+      const goodsOut = this.db.prepare(`
+        SELECT id, owner_id, warehouse_id, document_number, status
+        FROM goods_out
+        WHERE id = ? AND owner_id = ?
+      `).get(goodsOutId, context.ownerId) as {
+        id: string;
+        owner_id: string;
+        warehouse_id: string;
+        document_number: string;
+        status: string;
+      } | undefined;
+
+      if (!goodsOut) {
+        throw new AppError("ERR_NOT_FOUND", "Dokumen Goods Out tidak ditemukan.", 404);
+      }
+
+      this.assertContext(context, goodsOut.warehouse_id);
+
+      if (goodsOut.status !== "COMPLETED") {
+        throw new AppError(
+          "ERR_CONFLICT",
+          `Hanya Goods Out dengan status COMPLETED yang dapat dibatalkan melalui reversal (status saat ini: ${goodsOut.status}).`,
+          409
+        );
+      }
+
+      // Ambil baris-baris goods out
+      const lines = this.db.prepare(`
+        SELECT id, product_id, quantity, unit, allocated_serials_json, group_id, group_serials_snapshot_json
+        FROM goods_out_lines
+        WHERE goods_out_id = ?
+      `).all(goodsOutId) as Array<{
+        id: string;
+        product_id: string;
+        quantity: number;
+        unit: string;
+        allocated_serials_json: string | null;
+        group_id: string | null;
+        group_serials_snapshot_json: string | null;
+      }>;
+
+      // Ambil ledger yang pernah terbit untuk Goods Out ini
+      const originalLedger = this.db.prepare(`
+        SELECT id, sequence_number, product_id, quantity_delta_base, serial_ids_json
+        FROM inventory_ledger
+        WHERE owner_id = ? AND source_doc_id = ? AND entry_type = 'GOODS_OUT_COMPLETED'
+      `).all(context.ownerId, goodsOutId) as Array<{
+        id: string;
+        sequence_number: number;
+        product_id: string;
+        quantity_delta_base: number;
+        serial_ids_json: string | null;
+      }>;
+
+      let ledgerReversalsCount = 0;
+
+      // Terbitkan mutasi pembalik bertanda positif
+      for (const entry of originalLedger) {
+        const nextSeq = this.getNextLedgerSequence(context.ownerId);
+        const ledgerId = crypto.randomUUID();
+        const reversedDelta = Math.abs(Number(entry.quantity_delta_base));
+
+        this.db.prepare(`
+          INSERT INTO inventory_ledger (
+            id, sequence_number, owner_id, warehouse_id, product_id,
+            location_id, entry_type, source_doc_type, source_doc_id,
+            source_line_id, quantity_delta_base, serial_ids_json,
+            actor_user_id, occurred_at, created_at
+          ) VALUES (?, ?, ?, ?, ?, NULL, 'GOODS_IN_POSTED', 'GOODS_OUT', ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          ledgerId,
+          nextSeq,
+          context.ownerId,
+          goodsOut.warehouse_id,
+          entry.product_id,
+          goodsOutId,
+          entry.id,
+          reversedDelta,
+          entry.serial_ids_json,
+          context.userId,
+          now,
+          now
+        );
+
+        ledgerReversalsCount++;
+      }
+
+      // Pulihkan status serial & group
+      for (const l of lines) {
+        if (l.allocated_serials_json) {
+          const sIds: string[] = JSON.parse(l.allocated_serials_json);
+          for (const sId of sIds) {
+            this.db.prepare(`
+              UPDATE product_serials
+              SET status = 'AVAILABLE', updated_at = ?
+              WHERE id = ?
+            `).run(now, sId);
+
+            // Cek apakah group
+            const snItem = this.db.prepare("SELECT is_group, serial_number FROM product_serials WHERE id = ?").get(sId) as { is_group: number; serial_number: string } | undefined;
+            if (snItem && snItem.is_group === 1) {
+              const grp = this.db.prepare("SELECT id FROM serial_groupings WHERE owner_id = ? AND group_number = ?").get(context.ownerId, snItem.serial_number) as { id: string } | undefined;
+              if (grp) {
+                this.db.prepare("UPDATE serial_groupings SET status = 'AVAILABLE' WHERE id = ?").run(grp.id);
+                // Anggota group kembali GROUPED
+                this.db.prepare("UPDATE product_serials SET status = 'GROUPED', updated_at = ? WHERE parent_group_id = ?").run(now, grp.id);
+              }
+            }
+          }
+        }
+
+        // Jika baris ini menyimpan snapshot group
+        if (l.group_id && l.group_serials_snapshot_json) {
+          this.db.prepare("UPDATE serial_groupings SET status = 'AVAILABLE' WHERE id = ?").run(l.group_id);
+          const snapIds: string[] = JSON.parse(l.group_serials_snapshot_json);
+          for (const sId of snapIds) {
+            this.db.prepare("UPDATE product_serials SET status = 'GROUPED', updated_at = ? WHERE id = ?").run(now, sId);
+          }
+        }
+      }
+
+      // Update status Goods Out ke CANCELLED_TOMBSTONE
+      this.db.prepare(`
+        UPDATE goods_out
+        SET status = 'CANCELLED_TOMBSTONE', cancellation_reason = ?,
+            cancelled_by_user_id = ?, cancelled_at = ?, updated_at = ?
+        WHERE id = ?
+      `).run(reason.trim(), context.userId, now, now, goodsOutId);
+
+      this.recordAudit(
+        context.ownerId,
+        goodsOut.warehouse_id,
+        context.userId,
+        "CANCEL_COMPLETED_GOODS_OUT",
+        "GOODS_OUT",
+        goodsOutId,
+        {
+          documentNumber: goodsOut.document_number,
+          reason,
+          ledgerReversalsCount,
+        }
+      );
+
+      return { reversed: true, ledgerReversalsCount };
+    });
+  }
+
+  /**
    * Transaksi Atomik: Soft-Delete Tombstone Goods Out Pending (RPD §7.6 & DB-AUD-009)
    * Melepas reservasi, mengembalikan status SN, dan mempertahankan jejak tanpa hard-delete.
    */
@@ -3178,6 +4144,17 @@ export class InventoryRepository {
               SET status = 'AVAILABLE', updated_at = ?
               WHERE id = ?
             `).run(now, sId);
+
+            // Jika serial ini adalah group, kembalikan status group ke AVAILABLE dan anggota tetap GROUPED
+            const snItem = this.db.prepare("SELECT is_group, serial_number FROM product_serials WHERE id = ?").get(sId) as { is_group: number; serial_number: string } | undefined;
+            if (snItem && snItem.is_group === 1) {
+              const grp = this.db.prepare("SELECT id FROM serial_groupings WHERE owner_id = ? AND group_number = ?").get(context.ownerId, snItem.serial_number) as { id: string } | undefined;
+              if (grp) {
+                this.db.prepare("UPDATE serial_groupings SET status = 'AVAILABLE', updated_at = ? WHERE id = ?").run(now, grp.id);
+                // Anggota group kembali berstatus GROUPED
+                this.db.prepare("UPDATE product_serials SET status = 'GROUPED', updated_at = ? WHERE parent_group_id = ?").run(now, grp.id);
+              }
+            }
           }
         }
       }
@@ -3615,7 +4592,7 @@ export class InventoryRepository {
     return goRows.map((go) => {
       const lineRows = this.db.prepare(`
         SELECT gol.product_id, p.name AS product_name, p.sku, p.tracking_mode,
-               gol.quantity, gol.unit, gol.allocated_serials_json
+               gol.quantity, gol.unit, gol.allocated_serials_json, gol.group_id, gol.group_serials_snapshot_json
         FROM goods_out_lines gol
         JOIN products p ON p.id = gol.product_id
         WHERE gol.goods_out_id = ?
@@ -3627,6 +4604,8 @@ export class InventoryRepository {
         quantity: number;
         unit: string;
         allocated_serials_json: string | null;
+        group_id: string | null;
+        group_serials_snapshot_json: string | null;
       }>;
 
       const mappedStatus = go.status === "CANCELLED_TOMBSTONE" ? "CANCELLED" : go.status;
@@ -3652,6 +4631,8 @@ export class InventoryRepository {
           qty: Number(l.quantity),
           unit: l.unit,
           serials: l.allocated_serials_json ? JSON.parse(l.allocated_serials_json) : undefined,
+          groupId: l.group_id ?? undefined,
+          groupSerialsSnapshot: l.group_serials_snapshot_json ? JSON.parse(l.group_serials_snapshot_json) : undefined,
         })),
       };
     });
@@ -4178,7 +5159,7 @@ export class InventoryRepository {
     context: ActiveSecurityContext,
     input: {
       warehouseId: string;
-      sessionNumber: string;
+      sessionNumber?: string;
       title?: string;
       scope?: "ALL" | "CATEGORY" | "LOCATION";
       scopeConfig?: Record<string, unknown> | string;
@@ -4222,6 +5203,7 @@ export class InventoryRepository {
       ? input.scopeConfig 
       : JSON.stringify(input.scopeConfig ?? { type: scope });
     const sessionTitle = input.title?.trim() || `Stock Opname - ${wh.name}`;
+    const sessionNumber = input.sessionNumber?.trim() || `SO-${Date.now()}`;
 
     return this.db.transaction(() => {
       // 3. Simpan sesi opname
@@ -4235,7 +5217,7 @@ export class InventoryRepository {
         sessionId,
         context.ownerId,
         input.warehouseId,
-        input.sessionNumber,
+        sessionNumber,
         sessionTitle,
         scopeConfigStr,
         now,
@@ -4323,16 +5305,20 @@ export class InventoryRepository {
         );
       }
 
-      // 6. Buat area penghitungan awal jika dispesifikasikan
-      if (input.initialAreas && Array.isArray(input.initialAreas) && input.initialAreas.length > 0) {
-        const areaStmt = this.db.prepare(`
-          INSERT INTO stock_opname_areas (
-            id, owner_id, warehouse_id, session_id, name, location_code,
-            status, assigned_user_id, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
-        `);
+      // 6. Buat area penghitungan awal jika dispesifikasikan (default 'Area Utama')
+      const areasToCreate =
+        input.initialAreas && Array.isArray(input.initialAreas) && input.initialAreas.length > 0
+          ? input.initialAreas
+          : ["Area Utama"];
 
-        for (const areaName of input.initialAreas) {
+      const areaStmt = this.db.prepare(`
+        INSERT INTO stock_opname_areas (
+          id, owner_id, warehouse_id, session_id, name, location_code,
+          status, assigned_user_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
+      `);
+
+      for (const areaName of areasToCreate) {
           const trimmed = areaName.trim();
           if (trimmed) {
             areaStmt.run(
@@ -4348,7 +5334,6 @@ export class InventoryRepository {
             );
           }
         }
-      }
 
       // 7. Catat audit log
       this.recordAudit(
@@ -4359,7 +5344,7 @@ export class InventoryRepository {
         "STOCK_OPNAME",
         sessionId,
         {
-          sessionNumber: input.sessionNumber,
+          sessionNumber,
           scope,
           productCount: products.length,
           serialCount: serialRows.length,
@@ -4371,7 +5356,7 @@ export class InventoryRepository {
         ownerId: context.ownerId,
         warehouseId: input.warehouseId,
         warehouseName: wh.name,
-        sessionNumber: input.sessionNumber,
+        sessionNumber,
         title: sessionTitle,
         scope,
         scopeConfig: scopeConfigStr,
@@ -6137,6 +7122,21 @@ export class InventoryRepository {
       created_at: string;
     }>;
 
+    // Pre-lookup product_serials untuk unregistered scan errors
+    const unregisteredSnProductMap = new Map<string, string>(); // norm -> product_id
+    if (scanErrors.length > 0) {
+      const placeholders = scanErrors.map(() => '?').join(',');
+      const normValues = scanErrors.map(e => normalizeSerialNumber(e.scanned_value));
+      const foundPs = this.db.prepare(`
+        SELECT product_id, normalized_serial_number
+        FROM product_serials
+        WHERE owner_id = ? AND normalized_serial_number IN (${placeholders})
+      `).all(context.ownerId, ...normValues) as Array<{ product_id: string; normalized_serial_number: string }>;
+      for (const fps of foundPs) {
+        unregisteredSnProductMap.set(fps.normalized_serial_number, fps.product_id);
+      }
+    }
+
     const reconItems: StockOpnameReconciliationItem[] = [];
     const updateLineStmt = this.db.prepare(`
       UPDATE stock_opname_lines
@@ -6197,12 +7197,58 @@ export class InventoryRepository {
             }
           }
 
-          // Cek serial keluar pasca snapshot dari ledger (Goods Out)
+          // Cek serial keluar pasca snapshot dari ledger (Goods Out / Scrap / Adjustment Out)
           const postSnapshotOutSerials = new Set<string>();
+          const outSerialDocMap = new Map<string, string>();
           for (const tx of productLedger) {
             if (tx.quantityDeltaBase < 0) {
               for (const sid of tx.serialIds) {
                 postSnapshotOutSerials.add(sid);
+                outSerialDocMap.set(sid, tx.sourceDocId);
+              }
+            }
+          }
+
+          // Cek serial masuk pasca snapshot dari ledger (Goods In / Retur / Adjustment In)
+          const postSnapshotInSerials = new Set<string>();
+          const inSerialDocMap = new Map<string, string>();
+          for (const tx of productLedger) {
+            if (tx.quantityDeltaBase > 0) {
+              for (const sid of tx.serialIds) {
+                postSnapshotInSerials.add(sid);
+                inSerialDocMap.set(sid, tx.sourceDocId);
+              }
+            }
+          }
+
+          // Resolusi serial_number dan normalized untuk UUID yang tersimpan di ledger
+          const allPostSnapshotSerialIds = Array.from(new Set([...postSnapshotOutSerials, ...postSnapshotInSerials]));
+          if (allPostSnapshotSerialIds.length > 0) {
+            const placeholders = allPostSnapshotSerialIds.map(() => '?').join(',');
+            const resolvedPs = this.db.prepare(`
+              SELECT id, serial_number, normalized_serial_number
+              FROM product_serials
+              WHERE id IN (${placeholders})
+            `).all(...allPostSnapshotSerialIds) as Array<{ id: string; serial_number: string; normalized_serial_number: string }>;
+
+            for (const rps of resolvedPs) {
+              if (postSnapshotOutSerials.has(rps.id)) {
+                postSnapshotOutSerials.add(rps.serial_number);
+                postSnapshotOutSerials.add(rps.normalized_serial_number);
+                const doc = outSerialDocMap.get(rps.id);
+                if (doc) {
+                  outSerialDocMap.set(rps.serial_number, doc);
+                  outSerialDocMap.set(rps.normalized_serial_number, doc);
+                }
+              }
+              if (postSnapshotInSerials.has(rps.id)) {
+                postSnapshotInSerials.add(rps.serial_number);
+                postSnapshotInSerials.add(rps.normalized_serial_number);
+                const doc = inSerialDocMap.get(rps.id);
+                if (doc) {
+                  inSerialDocMap.set(rps.serial_number, doc);
+                  inSerialDocMap.set(rps.normalized_serial_number, doc);
+                }
               }
             }
           }
@@ -6221,14 +7267,16 @@ export class InventoryRepository {
                 scannedInArea: foundScanned.areaName,
               });
             } else {
-              // Cek apakah SN ini legal keluar karena transaksi Goods Out pasca-snapshot
+              // Cek apakah SN ini legal keluar karena transaksi operasional pasca-snapshot
               const dispatched = postSnapshotOutSerials.has(sn.id) || postSnapshotOutSerials.has(sn.serialNumber) || postSnapshotOutSerials.has(sn.normalized);
+              const docNum = outSerialDocMap.get(sn.id) || outSerialDocMap.get(sn.serialNumber) || outSerialDocMap.get(sn.normalized);
               missingSerials.push({
                 serialNumber: sn.serialNumber,
                 normalized: sn.normalized,
                 unit: sn.unit,
                 baseQuantity: sn.baseQuantity,
                 dispatchedPostSnapshot: dispatched,
+                postSnapshotDocNumber: docNum,
               });
               if (!dispatched) {
                 hasSerialMismatch = true;
@@ -6239,24 +7287,42 @@ export class InventoryRepository {
           // Cek serial surplus: SN terhitung tetapi tidak ada di snapshot
           const surplusSerials: StockOpnameSerialDetail["surplusSerials"] = [];
           const snapshotNormSet = new Set(snapshotSns.map((s) => s.normalized));
+          const surplusNormSet = new Set<string>();
 
           for (const [norm, sc] of scannedSnsMap.entries()) {
             if (!snapshotNormSet.has(norm)) {
+              const receivedPost = postSnapshotInSerials.has(norm) || postSnapshotInSerials.has(sc.serialNumber);
+              const docNum = inSerialDocMap.get(norm) || inSerialDocMap.get(sc.serialNumber);
               surplusSerials.push({
                 serialNumber: sc.serialNumber,
                 normalized: norm,
                 unit: sc.unit,
                 baseQuantity: sc.baseQuantity,
                 source: "SCANNED",
+                receivedPostSnapshot: receivedPost,
+                postSnapshotDocNumber: docNum,
               });
-              hasSerialMismatch = true;
+              surplusNormSet.add(norm);
+              if (!receivedPost) {
+                hasSerialMismatch = true;
+              }
             }
           }
 
-          // Sertakan scan errors unregistered serials
+          // Sertakan scan errors unregistered serials tanpa duplikasi dan dipetakan akurat
+          const isSingleSerialProduct = lineRows.filter((l) => l.tracking_mode === "SERIAL").length === 1;
           for (const err of scanErrors) {
             const normErr = normalizeSerialNumber(err.scanned_value);
-            if (!snapshotNormSet.has(normErr) && !scannedSnsMap.has(normErr)) {
+            if (snapshotNormSet.has(normErr) || scannedSnsMap.has(normErr) || surplusNormSet.has(normErr)) {
+              continue;
+            }
+
+            const targetProductId = unregisteredSnProductMap.get(normErr);
+            const isRelevantProduct = targetProductId
+              ? targetProductId === line.product_id
+              : (isSingleSerialProduct || normErr.includes(normalizeSerialNumber(line.sku)));
+
+            if (isRelevantProduct) {
               surplusSerials.push({
                 serialNumber: err.scanned_value,
                 normalized: normErr,
@@ -6264,6 +7330,8 @@ export class InventoryRepository {
                 baseQuantity: 1,
                 source: "SCAN_ERROR",
               });
+              surplusNormSet.add(normErr);
+              hasSerialMismatch = true;
             }
           }
 
@@ -6476,6 +7544,563 @@ export class InventoryRepository {
         productId: input.productId,
         discrepancyReason: cleanReason,
         investigationNotes: cleanNotes,
+      };
+    });
+  }
+
+  /**
+   * Mengajukan sesi Stock Opname ke tahap Review (Phase 6)
+   */
+  submitStockOpnameForReview(
+    context: ActiveSecurityContext,
+    sessionId: string
+  ): SubmitStockOpnameForReviewResult {
+    this.assertContext(context);
+
+    const session = this.db.prepare(`
+      SELECT id, owner_id, warehouse_id, session_number, status
+      FROM stock_opname_sessions
+      WHERE id = ? AND owner_id = ?
+    `).get(sessionId, context.ownerId) as {
+      id: string;
+      owner_id: string;
+      warehouse_id: string;
+      session_number: string;
+      status: string;
+    } | undefined;
+
+    if (!session) {
+      throw new AppError("ERR_NOT_FOUND", `Sesi Stock Opname '${sessionId}' tidak ditemukan.`, 404);
+    }
+    this.assertContext(context, session.warehouse_id);
+
+    if (session.status === "ADJUSTED" || session.status === "COMPLETED" || session.status === "CANCELLED") {
+      throw new AppError(
+        "ERR_CONFLICT",
+        `Sesi '${session.session_number}' berstatus '${session.status}' dan tidak dapat diajukan ke review.`,
+        409
+      );
+    }
+
+    const now = new Date().toISOString();
+
+    return this.db.transaction(() => {
+      this.db.prepare(`
+        UPDATE stock_opname_sessions
+        SET status = 'REVIEW', reviewed_at = COALESCE(reviewed_at, ?), updated_at = ?
+        WHERE id = ?
+      `).run(now, now, sessionId);
+
+      this.recordAudit(
+        context.ownerId,
+        session.warehouse_id,
+        context.userId,
+        "STOCK_OPNAME_SUBMITTED_FOR_REVIEW",
+        "STOCK_OPNAME",
+        session.id,
+        {
+          sessionId: session.id,
+          sessionNumber: session.session_number,
+          previousStatus: session.status,
+          newStatus: "REVIEW",
+        }
+      );
+
+      return {
+        success: true,
+        sessionId: session.id,
+        status: "REVIEW",
+        reviewedAt: now,
+      };
+    });
+  }
+
+  /**
+   * Menyetujui dan Memposting Penyesuaian Stok ke Ledger (TASK-SO-06-01 & TASK-SO-06-02)
+   * Dilindungi transaksi atomik:
+   * 1. Validasi otorisasi Owner (403).
+   * 2. Validasi status sesi dan idempotensi (409).
+   * 3. Validasi kelengkapan area dan seluruh selisih diinvestigasi (400).
+   * 4. Evaluasi ulang rekonsiliasi dinamis di dalam transaksi.
+   * 5. Posting mutasi STOCK_ADJUSTMENT_POSTED untuk item selisih non-zero (skip selisih zero).
+   * 6. Transisi status serial number (DECOMMISSIONED untuk hilang, AVAILABLE untuk surplus sah).
+   * 7. Kunci sesi ke ADJUSTED (atau COMPLETED jika selisih 0) dan catat audit_logs.
+   */
+  approveAndPostStockOpnameAdjustment(
+    context: ActiveSecurityContext,
+    input: ApproveAndPostStockOpnameAdjustmentInput
+  ): ApproveAndPostStockOpnameAdjustmentResult {
+    this.assertContext(context);
+
+    // 1. Guard Otorisasi Role Owner
+    if (context.role !== "OWNER" && !context.isSuperAdminOnBehalf) {
+      throw new AppError(
+        "ERR_FORBIDDEN_ROLE",
+        "Hanya pengguna dengan peran Owner yang berwenang menyetujui dan memposting penyesuaian Stock Opname.",
+        403
+      );
+    }
+
+    const session = this.db.prepare(`
+      SELECT id, owner_id, warehouse_id, session_number, title, status, snapshot_at, started_at, reviewed_at, note
+      FROM stock_opname_sessions
+      WHERE id = ? AND owner_id = ?
+    `).get(input.sessionId, context.ownerId) as {
+      id: string;
+      owner_id: string;
+      warehouse_id: string;
+      session_number: string;
+      title: string | null;
+      status: string;
+      snapshot_at: string | null;
+      started_at: string;
+      reviewed_at: string | null;
+      note: string | null;
+    } | undefined;
+
+    if (!session) {
+      throw new AppError("ERR_NOT_FOUND", `Sesi Stock Opname '${input.sessionId}' tidak ditemukan.`, 404);
+    }
+    this.assertContext(context, session.warehouse_id);
+
+    // 2. Guard Status Sesi & Idempotensi (Fast Fail Pre-Check)
+    if (session.status === "ADJUSTED" || session.status === "COMPLETED") {
+      throw new AppError(
+        "ERR_CONFLICT",
+        `Sesi Stock Opname '${session.session_number}' sudah difinalisasi sebelumnya (status: ${session.status}). Penyesuaian ganda ditolak.`,
+        409
+      );
+    }
+
+    if (session.status === "CANCELLED") {
+      throw new AppError(
+        "ERR_CONFLICT",
+        `Sesi Stock Opname '${session.session_number}' telah dibatalkan dan tidak dapat disetujui.`,
+        409
+      );
+    }
+
+    if (session.status !== "COUNTING" && session.status !== "REVIEW") {
+      throw new AppError(
+        "ERR_CONFLICT",
+        `Status sesi '${session.status}' tidak mengizinkan persetujuan penyesuaian.`,
+        409
+      );
+    }
+
+    const now = new Date().toISOString();
+
+    return this.db.transaction(() => {
+      // 2b. Re-query Status Sesi & Idempotensi di Bawah Transaction Lock (Mencegah Race Condition Concurrency)
+      const sessionInTx = this.db.prepare(`
+        SELECT id, owner_id, warehouse_id, session_number, title, status, snapshot_at, started_at, reviewed_at, note
+        FROM stock_opname_sessions
+        WHERE id = ? AND owner_id = ?
+      `).get(input.sessionId, context.ownerId) as typeof session;
+
+      if (!sessionInTx) {
+        throw new AppError("ERR_NOT_FOUND", `Sesi Stock Opname '${input.sessionId}' tidak ditemukan.`, 404);
+      }
+
+      if (sessionInTx.status === "ADJUSTED" || sessionInTx.status === "COMPLETED") {
+        throw new AppError(
+          "ERR_CONFLICT",
+          `Sesi Stock Opname '${sessionInTx.session_number}' sudah difinalisasi sebelumnya (status: ${sessionInTx.status}). Penyesuaian ganda ditolak.`,
+          409
+        );
+      }
+
+      if (sessionInTx.status === "CANCELLED") {
+        throw new AppError(
+          "ERR_CONFLICT",
+          `Sesi Stock Opname '${sessionInTx.session_number}' telah dibatalkan dan tidak dapat disetujui.`,
+          409
+        );
+      }
+
+      if (sessionInTx.status !== "COUNTING" && sessionInTx.status !== "REVIEW") {
+        throw new AppError(
+          "ERR_CONFLICT",
+          `Status sesi '${sessionInTx.status}' tidak mengizinkan persetujuan penyesuaian.`,
+          409
+        );
+      }
+
+      const existingLedgerCount = this.db.prepare(`
+        SELECT COUNT(*) as count
+        FROM inventory_ledger
+        WHERE source_doc_id = ? AND source_doc_type = 'STOCK_OPNAME_ADJUSTMENT'
+      `).get(sessionInTx.id) as { count: number };
+
+      if (Number(existingLedgerCount.count) > 0) {
+        throw new AppError(
+          "ERR_CONFLICT",
+          `Sesi Stock Opname '${sessionInTx.session_number}' sudah memiliki mutasi ledger penyesuaian. Permintaan duplikat ditolak.`,
+          409
+        );
+      }
+
+      // 3. Validasi Area Penghitungan
+      const activeAreas = this.db.prepare(`
+        SELECT id, name, status
+        FROM stock_opname_areas
+        WHERE session_id = ? AND status != 'CANCELLED'
+      `).all(sessionInTx.id) as Array<{ id: string; name: string; status: string }>;
+
+      if (activeAreas.length === 0) {
+        throw new AppError(
+          "ERR_VALIDATION",
+          "Sesi Stock Opname tidak memiliki area penghitungan aktif.",
+          400
+        );
+      }
+
+      const uncompletedAreas = activeAreas.filter((a) => a.status !== "COMPLETED");
+      if (uncompletedAreas.length > 0) {
+        if (input.autoCompletePendingAreas) {
+          this.db.prepare(`
+            UPDATE stock_opname_areas
+            SET status = 'COMPLETED', updated_at = ?
+            WHERE session_id = ? AND status != 'CANCELLED' AND status != 'COMPLETED'
+          `).run(now, session.id);
+        } else {
+          throw new AppError(
+            "ERR_VALIDATION",
+            `Area penghitungan '${uncompletedAreas[0].name}' masih berstatus '${uncompletedAreas[0].status}'. Seluruh area wajib diselesaikan (COMPLETED) sebelum persetujuan final.`,
+            400
+          );
+        }
+      }
+
+      // 4. Evaluasi Ulang Rekonsiliasi Dinamis (Fresh di dalam Transaksi)
+      const reconSummary = this.evaluateStockOpnameReconciliation(context, session.id);
+
+      // Guard: Cek apakah ada produk berstatus REQUIRES_RE_EVALUATION yang belum diinvestigasi
+      const requiresReeval = reconSummary.items.find(
+        (i) => i.reconciliationStatus === "REQUIRES_RE_EVALUATION" && (!i.discrepancyReason || !i.discrepancyReason.trim())
+      );
+      if (requiresReeval) {
+        throw new AppError(
+          "ERR_VALIDATION",
+          `Produk '${requiresReeval.sku} - ${requiresReeval.productName}' berstatus 'REQUIRES_RE_EVALUATION'. Selesaikan investigasi serial atau berikan alasan investigasi sebelum persetujuan final.`,
+          400
+        );
+      }
+
+      // Guard: Cek apakah ada selisih yang belum diinvestigasi
+      const uninvestigated = reconSummary.items.find(
+        (i) => i.varianceQty !== 0 && (!i.discrepancyReason || !i.discrepancyReason.trim())
+      );
+      if (uninvestigated) {
+        throw new AppError(
+          "ERR_VALIDATION",
+          `Produk '${uninvestigated.sku} - ${uninvestigated.productName}' memiliki selisih kuantitas (${
+            uninvestigated.varianceQty > 0 ? `+${uninvestigated.varianceQty}` : uninvestigated.varianceQty
+          } ${uninvestigated.unit}), namun belum memiliki alasan investigasi yang valid.`,
+          400
+        );
+      }
+
+      let ledgerEntriesCreated = 0;
+      let totalAdjustedLines = 0;
+      const adjustmentAuditList: Array<{
+        productId: string;
+        sku: string;
+        productName: string;
+        varianceQty: number;
+        unit: string;
+        ledgerId?: string;
+        sequenceNumber?: number;
+      }> = [];
+      const serialTransitionsList: Array<{
+        serialNumber: string;
+        productId: string;
+        action: "DECOMMISSIONED" | "REGISTERED_AVAILABLE";
+      }> = [];
+
+      // 5. Posting Mutasi ke Inventory Ledger (Hanya untuk selisih != 0)
+      for (const item of reconSummary.items) {
+        if (item.varianceQty === 0) {
+          // Tandai baris tanpa penulisan ledger
+          this.db.prepare(`
+            UPDATE stock_opname_lines
+            SET adjustment_posted = 1
+            WHERE id = ?
+          `).run(item.id);
+          continue;
+        }
+
+        // Kumpulkan affected serial IDs jika produk bertipe SERIAL
+        const affectedSerialIds: string[] = [];
+
+        if (item.trackingMode === "SERIAL" && item.serialDetail) {
+          // a. Serial yang hilang (missing) dan BUKAN legal keluar pasca-snapshot:
+          // Ubah status di product_serials menjadi DECOMMISSIONED
+          const unaccountedMissing = item.serialDetail.missingSerials.filter(
+            (ms) => !ms.dispatchedPostSnapshot
+          );
+
+          for (const ms of unaccountedMissing) {
+            const foundPs = this.db.prepare(`
+              SELECT id, status
+              FROM product_serials
+              WHERE owner_id = ? AND warehouse_id = ? AND (serial_number = ? OR normalized_serial_number = ?)
+            `).get(context.ownerId, sessionInTx.warehouse_id, ms.serialNumber, ms.normalized) as { id: string; status: string } | undefined;
+
+            if (foundPs) {
+              if (foundPs.status === "RESERVED") {
+                throw new AppError(
+                  "ERR_CONFLICT",
+                  `Serial '${ms.serialNumber}' sedang direservasi ('RESERVED') untuk pengeluaran barang. Selesaikan atau batalkan reservasi terlebih dahulu sebelum dekomisi.`,
+                  409
+                );
+              }
+              if (foundPs.status === "CONSUMED_OUT" || foundPs.status === "DECOMMISSIONED") {
+                continue;
+              }
+
+              affectedSerialIds.push(foundPs.id);
+              this.db.prepare(`
+                UPDATE product_serials
+                SET status = 'DECOMMISSIONED', updated_at = ?
+                WHERE id = ?
+              `).run(now, foundPs.id);
+
+              serialTransitionsList.push({
+                serialNumber: ms.serialNumber,
+                productId: item.productId,
+                action: "DECOMMISSIONED",
+              });
+            }
+          }
+
+          // b. Serial surplus fisik (terhitung tapi tidak di snapshot) dan BUKAN legal masuk pasca-snapshot:
+          const unaccountedSurplus = item.serialDetail.surplusSerials.filter(
+            (ss) => !ss.receivedPostSnapshot && ss.source === "SCANNED"
+          );
+
+          for (const ss of unaccountedSurplus) {
+            const existingPs = this.db.prepare(`
+              SELECT id, status, warehouse_id, product_id
+              FROM product_serials
+              WHERE owner_id = ? AND (serial_number = ? OR normalized_serial_number = ?)
+            `).get(context.ownerId, ss.serialNumber, ss.normalized) as {
+              id: string;
+              status: string;
+              warehouse_id: string;
+              product_id: string;
+            } | undefined;
+
+            if (existingPs) {
+              // 1. Validasi Produk: Serial tidak boleh milik produk lain
+              if (existingPs.product_id !== item.productId) {
+                throw new AppError(
+                  "ERR_CONFLICT",
+                  `Serial '${ss.serialNumber}' sudah terdaftar untuk produk lain di sistem. Penyesuaian fisik surplus ditolak.`,
+                  409
+                );
+              }
+
+              // 2. Validasi Lintas Gudang: SN aktif di gudang lain tidak boleh diambil alih tanpa alur transfer
+              if (
+                existingPs.warehouse_id !== sessionInTx.warehouse_id &&
+                (existingPs.status === "AVAILABLE" ||
+                  existingPs.status === "RESERVED" ||
+                  existingPs.status === "QUARANTINE")
+              ) {
+                throw new AppError(
+                  "ERR_CONFLICT",
+                  `Konflik SN Lintas Gudang: Serial '${ss.serialNumber}' sedang aktif di gudang lain (status: ${existingPs.status}). Penyesuaian fisik surplus ditolak; gunakan alur mutasi/transfer resmi.`,
+                  409
+                );
+              }
+
+              // 3. Validasi Status Terdistribusi / Konsumsi
+              if (existingPs.status === "CONSUMED_OUT") {
+                throw new AppError(
+                  "ERR_CONFLICT",
+                  `Serial '${ss.serialNumber}' berstatus 'CONSUMED_OUT' (sudah keluar/terjual). Penyesuaian surplus tidak dapat menghidupkan kembali serial yang sudah terdistribusi tanpa dokumen retur resmi.`,
+                  409
+                );
+              }
+
+              // 4. Validasi Reservasi Aktif
+              if (existingPs.status === "RESERVED") {
+                throw new AppError(
+                  "ERR_CONFLICT",
+                  `Serial '${ss.serialNumber}' sedang direservasi ('RESERVED') untuk pengeluaran barang. Selesaikan atau batalkan reservasi terlebih dahulu.`,
+                  409
+                );
+              }
+
+              // 5. Validasi Karantina / Rusak
+              if (existingPs.status === "QUARANTINE") {
+                throw new AppError(
+                  "ERR_CONFLICT",
+                  `Serial '${ss.serialNumber}' berstatus 'QUARANTINE' (karantina/rusak). Serial rusak tidak dapat disesuaikan otomatis menjadi 'AVAILABLE'.`,
+                  409
+                );
+              }
+
+              affectedSerialIds.push(existingPs.id);
+              this.db.prepare(`
+                UPDATE product_serials
+                SET status = 'AVAILABLE', warehouse_id = ?, updated_at = ?
+                WHERE id = ?
+              `).run(sessionInTx.warehouse_id, now, existingPs.id);
+
+              serialTransitionsList.push({
+                serialNumber: ss.serialNumber,
+                productId: item.productId,
+                action: "REGISTERED_AVAILABLE",
+              });
+            } else {
+              const newPsId = crypto.randomUUID();
+              affectedSerialIds.push(newPsId);
+              this.db.prepare(`
+                INSERT INTO product_serials (
+                  id, owner_id, warehouse_id, product_id, serial_number,
+                  normalized_serial_number, status, unit, unit_quantity, base_quantity,
+                  created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'AVAILABLE', ?, 1, 1, ?, ?)
+              `).run(
+                newPsId,
+                context.ownerId,
+                sessionInTx.warehouse_id,
+                item.productId,
+                ss.serialNumber,
+                ss.normalized,
+                item.unit || "pcs",
+                now,
+                now
+              );
+
+              serialTransitionsList.push({
+                serialNumber: ss.serialNumber,
+                productId: item.productId,
+                action: "REGISTERED_AVAILABLE",
+              });
+            }
+          }
+        }
+
+        // Tulis entri mutasi resmi ke inventory_ledger
+        const nextSeq = this.getNextLedgerSequence(context.ownerId);
+        const ledgerId = crypto.randomUUID();
+
+        this.db.prepare(`
+          INSERT INTO inventory_ledger (
+            id, sequence_number, owner_id, warehouse_id, product_id,
+            location_id, entry_type, source_doc_type, source_doc_id,
+            source_line_id, quantity_delta_base, serial_ids_json,
+            actor_user_id, occurred_at, created_at
+          ) VALUES (?, ?, ?, ?, ?, NULL, 'STOCK_ADJUSTMENT_POSTED', 'STOCK_OPNAME_ADJUSTMENT', ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          ledgerId,
+          nextSeq,
+          context.ownerId,
+          sessionInTx.warehouse_id,
+          item.productId,
+          sessionInTx.id,
+          item.id,
+          item.varianceQty, // Positif jika surplus, negatif jika shortage
+          affectedSerialIds.length > 0 ? JSON.stringify(affectedSerialIds) : null,
+          context.userId,
+          now,
+          now
+        );
+
+        // Tandai baris di stock_opname_lines
+        this.db.prepare(`
+          UPDATE stock_opname_lines
+          SET adjustment_posted = 1
+          WHERE id = ?
+        `).run(item.id);
+
+        ledgerEntriesCreated++;
+        totalAdjustedLines++;
+        adjustmentAuditList.push({
+          productId: item.productId,
+          sku: item.sku,
+          productName: item.productName,
+          varianceQty: item.varianceQty,
+          unit: item.unit,
+          ledgerId,
+          sequenceNumber: nextSeq,
+        });
+      }
+
+      // 6. Kunci Status Sesi Secara Permanen
+      const finalStatus = "ADJUSTED";
+      const cleanNotes = input.notes?.trim() || null;
+
+      this.db.prepare(`
+        UPDATE stock_opname_sessions
+        SET status = ?,
+            reviewed_at = COALESCE(reviewed_at, ?),
+            adjusted_at = ?,
+            approved_by_user_id = ?,
+            finalized_by_user_id = ?,
+            note = CASE 
+              WHEN ? IS NOT NULL THEN COALESCE(note || ' | Persetujuan: ', 'Persetujuan: ') || ?
+              ELSE note 
+            END,
+            updated_at = ?
+        WHERE id = ?
+      `).run(
+        finalStatus,
+        now,
+        now,
+        context.userId,
+        context.userId,
+        cleanNotes,
+        cleanNotes,
+        now,
+        sessionInTx.id
+      );
+
+      // Arsipkan seluruh sisa error scan pada sesi ini
+      this.db.prepare(`
+        UPDATE stock_opname_scan_errors
+        SET is_archived = 1
+        WHERE session_id = ? AND is_archived = 0
+      `).run(sessionInTx.id);
+
+      // 7. Catat Jejak Audit Permanen
+      this.recordAudit(
+        context.ownerId,
+        sessionInTx.warehouse_id,
+        context.userId,
+        "STOCK_OPNAME_FINALIZED",
+        "STOCK_OPNAME",
+        sessionInTx.id,
+        {
+          sessionId: session.id,
+          sessionNumber: session.session_number,
+          approvedByUserId: context.userId,
+          previousStatus: session.status,
+          finalStatus,
+          notes: cleanNotes,
+          totalLines: reconSummary.items.length,
+          totalAdjustedLines,
+          totalVarianceQty: reconSummary.netDiscrepancyQty,
+          ledgerEntriesCreated,
+          adjustments: adjustmentAuditList,
+          serialTransitions: serialTransitionsList,
+        }
+      );
+
+      return {
+        success: true,
+        sessionId: session.id,
+        sessionNumber: session.session_number,
+        status: finalStatus,
+        totalLines: reconSummary.items.length,
+        totalAdjustedLines,
+        totalVarianceQty: reconSummary.netDiscrepancyQty,
+        ledgerEntriesCreated,
+        approvedAt: now,
+        approvedByUserId: context.userId,
       };
     });
   }
@@ -9242,6 +10867,38 @@ export class InventoryRepository {
   // ====================================================================
 
   /**
+   * Helper private: memperbarui return_status ('NONE', 'PARTIAL', 'FULL') pada goods_out / goods_in
+   */
+  private updateDocumentReturnStatus(docType: "GOODS_OUT" | "GOODS_IN", docId: string): void {
+    const table = docType === "GOODS_OUT" ? "goods_out" : "goods_in";
+    const linesTable = docType === "GOODS_OUT" ? "goods_out_lines" : "goods_in_lines";
+    const docIdCol = docType === "GOODS_OUT" ? "goods_out_id" : "goods_in_id";
+
+    const totalDocQtyRow = this.db.prepare(`
+      SELECT COALESCE(SUM(quantity), 0) AS total_qty FROM ${linesTable} WHERE ${docIdCol} = ?
+    `).get(docId) as { total_qty: number };
+
+    const totalRetQtyRow = this.db.prepare(`
+      SELECT COALESCE(SUM(irl.quantity), 0) AS total_ret_qty
+      FROM inventory_return_lines irl
+      JOIN inventory_returns ir ON ir.id = irl.return_id
+      WHERE ir.${docIdCol} = ? AND ir.status = 'RECEIVED'
+    `).get(docId) as { total_ret_qty: number };
+
+    const docQty = Number(totalDocQtyRow?.total_qty || 0);
+    const retQty = Number(totalRetQtyRow?.total_ret_qty || 0);
+
+    let newStatus: "NONE" | "PARTIAL" | "FULL" = "NONE";
+    if (retQty >= docQty && docQty > 0) {
+      newStatus = "FULL";
+    } else if (retQty > 0) {
+      newStatus = "PARTIAL";
+    }
+
+    this.db.prepare(`UPDATE ${table} SET return_status = ?, updated_at = datetime('now') WHERE id = ?`).run(newStatus, docId);
+  }
+
+  /**
    * Mengambil daftar Retur Barang milik Owner
    */
   getInventoryReturns(
@@ -9253,12 +10910,16 @@ export class InventoryRepository {
 
     let query = `
       SELECT ir.id, ir.owner_id, ir.warehouse_id, w.name as warehouse_name,
-             ir.customer_id, c.name as customer_name, ir.goods_out_id,
+             ir.return_type,
+             ir.customer_id, c.name as customer_name,
+             ir.supplier_id, s.name as supplier_name,
+             ir.goods_out_id, ir.goods_in_id,
              ir.return_number, ir.return_date, ir.reason, ir.status,
              ir.reopen_source_qty, ir.notes
       FROM inventory_returns ir
       JOIN warehouses w ON w.id = ir.warehouse_id
-      JOIN customers c ON c.id = ir.customer_id
+      LEFT JOIN customers c ON c.id = ir.customer_id
+      LEFT JOIN suppliers s ON s.id = ir.supplier_id
       WHERE ir.owner_id = ?
     `;
     const params: unknown[] = [context.ownerId];
@@ -9275,20 +10936,25 @@ export class InventoryRepository {
       owner_id: string;
       warehouse_id: string;
       warehouse_name: string;
-      customer_id: string;
-      customer_name: string;
+      return_type: ReturnType | null;
+      customer_id: string | null;
+      customer_name: string | null;
+      supplier_id: string | null;
+      supplier_name: string | null;
       goods_out_id: string | null;
+      goods_in_id: string | null;
       return_number: string;
       return_date: string;
       reason: "SALAH_KIRIM" | "PEMBATALAN" | "SALAH_INPUT" | "CACAT" | "LAINNYA";
-      status: "DRAFT" | "RECEIVED" | "REJECTED" | "CANCELLED";
+      status: InventoryReturnStatus;
       reopen_source_qty: number;
       notes: string | null;
     }>;
 
     const lineStmt = this.db.prepare(`
       SELECT irl.id, irl.product_id, p.name as product_name, p.sku,
-             irl.quantity, irl.unit, irl.condition, irl.returned_serials_json
+             irl.quantity, irl.unit, irl.condition, irl.returned_serials_json,
+             irl.group_id, irl.group_return_mode
       FROM inventory_return_lines irl
       JOIN products p ON p.id = irl.product_id
       WHERE irl.return_id = ?
@@ -9304,6 +10970,8 @@ export class InventoryRepository {
         unit: string;
         condition: "BAIK" | "RUSAK";
         returned_serials_json: string | null;
+        group_id: string | null;
+        group_return_mode: GroupReturnMode | null;
       }>;
 
       return {
@@ -9311,9 +10979,13 @@ export class InventoryRepository {
         ownerId: r.owner_id,
         warehouseId: r.warehouse_id,
         warehouseName: r.warehouse_name,
+        returnType: r.return_type ?? "CUSTOMER_RETURN",
         customerId: r.customer_id,
         customerName: r.customer_name,
+        supplierId: r.supplier_id,
+        supplierName: r.supplier_name,
         goodsOutId: r.goods_out_id,
+        goodsInId: r.goods_in_id,
         returnNumber: r.return_number,
         returnDate: r.return_date,
         reason: r.reason,
@@ -9329,6 +11001,8 @@ export class InventoryRepository {
           unit: l.unit,
           condition: l.condition,
           returnedSerials: l.returned_serials_json ? JSON.parse(l.returned_serials_json) : undefined,
+          groupId: l.group_id ?? undefined,
+          groupReturnMode: l.group_return_mode ?? undefined,
         })),
       };
     });
@@ -9345,8 +11019,16 @@ export class InventoryRepository {
   ): InventoryReturnRecord {
     this.assertContext(context, input.warehouseId);
 
-    if (!input.customerId || !input.returnNumber || !input.lines || input.lines.length === 0) {
-      throw new AppError("ERR_VALIDATION", "Pelanggan, nomor retur, dan minimal 1 produk wajib diisi.", 400);
+    const returnType = input.returnType ?? "CUSTOMER_RETURN";
+
+    if (returnType === "CUSTOMER_RETURN" && !input.customerId) {
+      throw new AppError("ERR_VALIDATION", "Pelanggan wajib dipilih untuk Retur Pelanggan.", 400);
+    }
+    if (returnType === "SUPPLIER_RETURN" && !input.supplierId) {
+      throw new AppError("ERR_VALIDATION", "Pemasok wajib dipilih untuk Retur Supplier.", 400);
+    }
+    if (!input.returnNumber || !input.lines || input.lines.length === 0) {
+      throw new AppError("ERR_VALIDATION", "Nomor retur dan minimal 1 produk wajib diisi.", 400);
     }
 
     // Evaluasi baseline reopen_source_qty LOCKED
@@ -9360,24 +11042,34 @@ export class InventoryRepository {
     const now = new Date().toISOString();
 
     return this.db.transaction(() => {
-      // Validasi kuantitas terhadap pengiriman asal jika Goods Out rujukan disertakan
-      if (input.goodsOutId) {
+      // 1. Validasi Customer Return terhadap Goods Out rujukan jika disertakan
+      if (returnType === "CUSTOMER_RETURN" && input.goodsOutId) {
         const go = this.db.prepare(`
           SELECT id, owner_id, status FROM goods_out WHERE id = ? AND owner_id = ?
         `).get(input.goodsOutId, context.ownerId) as { id: string; owner_id: string; status: string } | undefined;
 
         if (!go) {
-          throw new AppError("ERR_NOT_FOUND", "Dokumen Goods Out rujukan tidak ditemukan.", 404);
+          throw new AppError(RETURN_ERROR_CODES.DOC_NOT_FOUND, "Dokumen Goods Out rujukan tidak ditemukan.", 404);
         }
 
         if (go.status !== "COMPLETED") {
-          throw new AppError("ERR_CONFLICT", `Hanya Goods Out dengan status COMPLETED yang dapat diretur (status saat ini: ${go.status}).`, 409);
+          throw new AppError(
+            RETURN_ERROR_CODES.INVALID_DOC_STATUS,
+            `Hanya Goods Out dengan status COMPLETED yang dapat diretur (status saat ini: ${go.status}).`,
+            409
+          );
         }
 
         for (const l of input.lines) {
           const goLine = this.db.prepare(`
-            SELECT quantity FROM goods_out_lines WHERE goods_out_id = ? AND product_id = ?
-          `).get(input.goodsOutId, l.productId) as { quantity: number } | undefined;
+            SELECT quantity, allocated_serials_json, group_id, group_serials_snapshot_json
+            FROM goods_out_lines WHERE goods_out_id = ? AND product_id = ?
+          `).get(input.goodsOutId, l.productId) as {
+            quantity: number;
+            allocated_serials_json: string | null;
+            group_id: string | null;
+            group_serials_snapshot_json: string | null;
+          } | undefined;
 
           if (!goLine) {
             throw new AppError("ERR_VALIDATION", `Produk '${l.productId}' tidak terdapat pada pengiriman barang keluar rujukan.`, 400);
@@ -9393,10 +11085,134 @@ export class InventoryRepository {
           const remainingReturnable = Number(goLine.quantity) - Number(retLineRow.total_returned);
           if (l.quantity > remainingReturnable) {
             throw new AppError(
-              "ERR_CONFLICT",
+              RETURN_ERROR_CODES.QUANTITY_EXCEEDED,
               `Kuantitas retur (${l.quantity}) melebihi sisa kuantitas pengiriman yang dapat diretur (${remainingReturnable}).`,
               409
             );
+          }
+
+          if (l.returnedSerials && l.returnedSerials.length > 0) {
+            const shippedSerials = new Set<string>();
+            if (goLine.allocated_serials_json) {
+              const ids: string[] = JSON.parse(goLine.allocated_serials_json);
+              ids.forEach((idOrSn) => shippedSerials.add(idOrSn.toUpperCase()));
+            }
+            if (goLine.group_serials_snapshot_json) {
+              const snapIds: string[] = JSON.parse(goLine.group_serials_snapshot_json);
+              snapIds.forEach((id) => shippedSerials.add(id.toUpperCase()));
+            }
+
+            for (const sn of l.returnedSerials) {
+              const snUpper = sn.trim().toUpperCase();
+              const psRow = this.db.prepare(`
+                SELECT id, serial_number FROM product_serials WHERE owner_id = ? AND (serial_number = ? OR id = ?)
+              `).get(context.ownerId, snUpper, snUpper) as { id: string; serial_number: string } | undefined;
+
+              if (psRow) {
+                if (!shippedSerials.has(psRow.serial_number.toUpperCase()) && !shippedSerials.has(psRow.id.toUpperCase())) {
+                  throw new AppError(
+                    RETURN_ERROR_CODES.SERIAL_NOT_IN_SOURCE,
+                    `Nomor seri '${sn}' tidak terdapat dalam pengiriman Goods Out rujukan.`,
+                    400
+                  );
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // 2. Validasi Supplier Return terhadap Goods In rujukan & status serial
+      if (returnType === "SUPPLIER_RETURN") {
+        if (input.goodsInId) {
+          const gi = this.db.prepare(`
+            SELECT id, owner_id, status FROM goods_in WHERE id = ? AND owner_id = ?
+          `).get(input.goodsInId, context.ownerId) as { id: string; owner_id: string; status: string } | undefined;
+
+          if (!gi) {
+            throw new AppError(RETURN_ERROR_CODES.DOC_NOT_FOUND, "Dokumen Goods In rujukan tidak ditemukan.", 404);
+          }
+
+          if (gi.status !== "POSTED") {
+            throw new AppError(
+              RETURN_ERROR_CODES.INVALID_DOC_STATUS,
+              `Hanya Goods In dengan status POSTED yang dapat diretur ke supplier (status saat ini: ${gi.status}).`,
+              409
+            );
+          }
+
+          for (const l of input.lines) {
+            const giLine = this.db.prepare(`
+              SELECT quantity FROM goods_in_lines WHERE goods_in_id = ? AND product_id = ?
+            `).get(input.goodsInId, l.productId) as { quantity: number } | undefined;
+
+            if (!giLine) {
+              throw new AppError("ERR_VALIDATION", `Produk '${l.productId}' tidak terdapat pada penerimaan Goods In rujukan.`, 400);
+            }
+
+            const retLineRow = this.db.prepare(`
+              SELECT COALESCE(SUM(irl.quantity), 0) AS total_returned
+              FROM inventory_return_lines irl
+              JOIN inventory_returns ir ON ir.id = irl.return_id
+              WHERE ir.goods_in_id = ? AND irl.product_id = ? AND ir.status != 'CANCELLED'
+            `).get(input.goodsInId, l.productId) as { total_returned: number };
+
+            const remainingReturnable = Number(giLine.quantity) - Number(retLineRow.total_returned);
+            if (l.quantity > remainingReturnable) {
+              throw new AppError(
+                RETURN_ERROR_CODES.QUANTITY_EXCEEDED,
+                `Kuantitas retur beli (${l.quantity}) melebihi sisa kuantitas penerimaan yang dapat diretur (${remainingReturnable}).`,
+                409
+              );
+            }
+          }
+        }
+
+        // Validasi Serial untuk Supplier Return: WAJIB AVAILABLE dan TIDAK terikat di group aktif!
+        for (const l of input.lines) {
+          if (l.returnedSerials && l.returnedSerials.length > 0) {
+            for (const sn of l.returnedSerials) {
+              const snUpper = sn.trim().toUpperCase();
+              const psRow = this.db.prepare(`
+                SELECT id, serial_number, status, is_group, parent_group_id
+                FROM product_serials
+                WHERE owner_id = ? AND warehouse_id = ? AND (serial_number = ? OR normalized_serial_number = ?)
+              `).get(context.ownerId, input.warehouseId, snUpper, snUpper) as {
+                id: string;
+                serial_number: string;
+                status: string;
+                is_group: number;
+                parent_group_id: string | null;
+              } | undefined;
+
+              if (!psRow) {
+                throw new AppError(
+                  RETURN_ERROR_CODES.DOC_NOT_FOUND,
+                  `Nomor seri '${sn}' tidak ditemukan di gudang.`,
+                  404
+                );
+              }
+
+              if (psRow.parent_group_id || psRow.status === "GROUPED") {
+                const grp = psRow.parent_group_id
+                  ? (this.db.prepare(`SELECT group_number, status FROM serial_groupings WHERE id = ?`).get(psRow.parent_group_id) as { group_number: string; status: string } | undefined)
+                  : undefined;
+
+                throw new AppError(
+                  RETURN_ERROR_CODES.SERIAL_IN_ACTIVE_GROUP,
+                  `Nomor seri '${sn}' terikat dalam group aktif${grp ? ` '${grp.group_number}'` : ''}. Ungroup / dissolve terlebih dahulu sebelum retur ke supplier.`,
+                  409
+                );
+              }
+
+              if (psRow.status !== "AVAILABLE") {
+                throw new AppError(
+                  RETURN_ERROR_CODES.SERIAL_NOT_AVAILABLE,
+                  `Nomor seri '${sn}' tidak dapat diretur ke supplier karena statusnya '${psRow.status}' (Wajib AVAILABLE).`,
+                  409
+                );
+              }
+            }
           }
         }
       }
@@ -9404,16 +11220,20 @@ export class InventoryRepository {
       // 1. Simpan dokumen retur dengan status DRAFT (Belum memotong/menambah stok sebelum diterima fisik)
       this.db.prepare(`
         INSERT INTO inventory_returns (
-          id, owner_id, warehouse_id, customer_id, goods_out_id, return_number, return_date,
+          id, owner_id, warehouse_id, return_type, customer_id, supplier_id,
+          goods_out_id, goods_in_id, return_number, return_date,
           reason, status, reopen_source_qty, notes, created_by_user_id, received_by_user_id,
           received_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, ?, ?, NULL, NULL, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, ?, ?, NULL, NULL, ?, ?)
       `).run(
         returnId,
         context.ownerId,
         input.warehouseId,
-        input.customerId,
+        returnType,
+        input.customerId ?? null,
+        input.supplierId ?? null,
         input.goodsOutId ?? null,
+        input.goodsInId ?? null,
         input.returnNumber.trim().toUpperCase(),
         input.returnDate,
         input.reason,
@@ -9426,8 +11246,9 @@ export class InventoryRepository {
 
       const lineInsert = this.db.prepare(`
         INSERT INTO inventory_return_lines (
-          id, return_id, product_id, quantity, unit, condition, returned_serials_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          id, return_id, product_id, quantity, unit, condition, returned_serials_json,
+          group_id, group_return_mode, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       for (const l of input.lines) {
@@ -9440,6 +11261,8 @@ export class InventoryRepository {
           l.unit ?? "pcs",
           l.condition,
           l.returnedSerials ? JSON.stringify(l.returnedSerials) : null,
+          l.groupId ?? null,
+          l.groupReturnMode ?? null,
           now
         );
       }
@@ -9453,6 +11276,7 @@ export class InventoryRepository {
         returnId,
         {
           returnNumber: input.returnNumber,
+          returnType,
           reason: input.reason,
           status: "DRAFT",
           reopenSourceQty: reopenSourceQty === 1,
@@ -9464,8 +11288,11 @@ export class InventoryRepository {
         id: returnId,
         ownerId: context.ownerId,
         warehouseId: input.warehouseId,
-        customerId: input.customerId,
+        returnType,
+        customerId: input.customerId ?? null,
+        supplierId: input.supplierId ?? null,
         goodsOutId: input.goodsOutId ?? null,
+        goodsInId: input.goodsInId ?? null,
         returnNumber: input.returnNumber,
         returnDate: input.returnDate,
         reason: input.reason,
@@ -9485,26 +11312,34 @@ export class InventoryRepository {
   }
 
   /**
-   * Persetujuan & Penerimaan Fisik Retur Barang (Tahap B.3 - Two-Phase Returns)
-   * Mengubah status dari DRAFT -> RECEIVED, melakukan mutasi ledger fisik RETURN_IN_POSTED,
-   * menempatkan barang rusak ke status QUARANTINE, dan jika reopen_source_qty = true,
-   * membuka kembali kuota pemenuhan PO yang terkait secara atomik.
+   * Persetujuan & Penerimaan Fisik Retur Barang (Customer Return & Supplier Return)
+   * Customer Return:
+   *   - Serial mandiri: CONSUMED_OUT -> AVAILABLE (atau QUARANTINE jika RUSAK).
+   *   - Group Utuh (WHOLE_GROUP): pulihkan wadah group ke AVAILABLE, anak serial ikut GROUPED.
+   *   - Group Eceran (ECERAN_DISSOLVE): wadah group di-DISSOLVED, serial kembali jadi AVAILABLE.
+   *   - Mutasi ledger positif RETURN_IN_POSTED.
+   * Supplier Return:
+   *   - Potong stok fisik via ledger negatif RETURN_OUT_POSTED.
+   *   - Update status serial -> RETURNED_TO_SUPPLIER.
    */
   approveAndReceiveInventoryReturn(
     context: ActiveSecurityContext,
     returnId: string
   ): { received: boolean; returnId: string; ledgerEntriesCount: number } {
     const ret = this.db.prepare(`
-      SELECT id, owner_id, warehouse_id, customer_id, goods_out_id,
-             return_number, reason, status, reopen_source_qty
+      SELECT id, owner_id, warehouse_id, return_type, customer_id, supplier_id,
+             goods_out_id, goods_in_id, return_number, reason, status, reopen_source_qty
       FROM inventory_returns
       WHERE id = ? AND owner_id = ?
     `).get(returnId, context.ownerId) as {
       id: string;
       owner_id: string;
       warehouse_id: string;
-      customer_id: string;
+      return_type: ReturnType | null;
+      customer_id: string | null;
+      supplier_id: string | null;
       goods_out_id: string | null;
+      goods_in_id: string | null;
       return_number: string;
       reason: string;
       status: string;
@@ -9518,6 +11353,9 @@ export class InventoryRepository {
     this.assertContext(context, ret.warehouse_id);
 
     if (ret.status !== "DRAFT") {
+      if (ret.status === "RECEIVED") {
+        throw new AppError(RETURN_ERROR_CODES.ALREADY_RECEIVED, "Dokumen retur sudah disetujui & diterima sebelumnya.", 409);
+      }
       throw new AppError(
         "ERR_CONFLICT",
         `Retur tidak dapat diproses penerimaan fisiknya karena statusnya adalah '${ret.status}' (Hanya DRAFT yang dapat disetujui).`,
@@ -9526,7 +11364,8 @@ export class InventoryRepository {
     }
 
     const lines = this.db.prepare(`
-      SELECT id, product_id, quantity, unit, condition, returned_serials_json
+      SELECT id, product_id, quantity, unit, condition, returned_serials_json,
+             group_id, group_return_mode
       FROM inventory_return_lines
       WHERE return_id = ?
     `).all(returnId) as Array<{
@@ -9536,6 +11375,8 @@ export class InventoryRepository {
       unit: string;
       condition: "BAIK" | "RUSAK";
       returned_serials_json: string | null;
+      group_id: string | null;
+      group_return_mode: GroupReturnMode | null;
     }>;
 
     if (lines.length === 0) {
@@ -9543,103 +11384,272 @@ export class InventoryRepository {
     }
 
     const now = new Date().toISOString();
+    const isSupplierReturn = ret.return_type === "SUPPLIER_RETURN";
 
     return this.db.transaction(() => {
       let ledgerEntriesCount = 0;
 
-      for (const l of lines) {
-        // 1. Tulis mutasi ledger positif secara atomik (RETURN_IN_POSTED)
-        const nextSeq = this.getNextLedgerSequence(context.ownerId);
-        const ledgerId = crypto.randomUUID();
+      if (isSupplierReturn) {
+        // ==========================================
+        // SUPPLIER_RETURN (Retur Beli ke Pemasok)
+        // ==========================================
+        for (const l of lines) {
+          const serialIdsForLedger: string[] = [];
+          if (l.returned_serials_json) {
+            const serials: string[] = JSON.parse(l.returned_serials_json);
+            for (const sn of serials) {
+              const sRow = this.db.prepare(`
+                SELECT id FROM product_serials
+                WHERE owner_id = ? AND warehouse_id = ? AND (serial_number = ? OR normalized_serial_number = ?)
+              `).get(context.ownerId, ret.warehouse_id, sn.trim().toUpperCase(), sn.trim().toUpperCase()) as { id: string } | undefined;
 
-        this.db.prepare(`
-          INSERT INTO inventory_ledger (
-            id, sequence_number, owner_id, warehouse_id, product_id, location_id,
-            entry_type, source_doc_type, source_doc_id, source_line_id,
-            quantity_delta_base, serial_ids_json, actor_user_id, occurred_at, created_at
-          ) VALUES (?, ?, ?, ?, ?, null, 'RETURN_IN_POSTED', 'RETURN', ?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          ledgerId,
-          nextSeq,
-          context.ownerId,
-          ret.warehouse_id,
-          l.product_id,
-          returnId,
-          l.id,
-          l.quantity,
-          l.returned_serials_json,
-          context.userId,
-          now,
-          now
-        );
-
-        ledgerEntriesCount++;
-
-        // 2. Pembaruan status Serial Number yang diretur
-        // Barang rusak wajib masuk QUARANTINE dan TIDAK boleh dijual sebagai stok tersedia!
-        if (l.returned_serials_json) {
-          const serials: string[] = JSON.parse(l.returned_serials_json);
-          const serialTargetStatus = l.condition === "BAIK" ? "AVAILABLE" : "QUARANTINE";
-          const updateSerialStmt = this.db.prepare(`
-            UPDATE product_serials
-            SET status = ?, warehouse_id = ?, updated_at = ?
-            WHERE owner_id = ? AND serial_number = ?
-          `);
-
-          for (const sn of serials) {
-            updateSerialStmt.run(
-              serialTargetStatus,
-              ret.warehouse_id,
-              now,
-              context.ownerId,
-              sn.trim().toUpperCase()
-            );
-          }
-        }
-      }
-
-      // 3. Kebijakan reopen_source_qty: jika true dan ada Goods Out rujukan yang terhubung ke PO
-      if (ret.reopen_source_qty === 1 && ret.goods_out_id) {
-        const go = this.db.prepare(`
-          SELECT po_id FROM goods_out WHERE id = ?
-        `).get(ret.goods_out_id) as { po_id: string | null } | undefined;
-
-        if (go?.po_id) {
-          for (const l of lines) {
-            this.db.prepare(`
-              UPDATE purchase_order_lines
-              SET fulfilled_qty = MAX(0, fulfilled_qty - ?)
-              WHERE po_id = ? AND product_id = ?
-            `).run(l.quantity, go.po_id, l.product_id);
+              if (sRow) {
+                this.db.prepare(`
+                  UPDATE product_serials
+                  SET status = 'RETURNED_TO_SUPPLIER', updated_at = ?
+                  WHERE id = ?
+                `).run(now, sRow.id);
+                serialIdsForLedger.push(sRow.id);
+              }
+            }
           }
 
-          // Rekalkulasi status PO setelah kuota dibuka kembali
-          const poLines = this.db.prepare(`
-            SELECT target_qty, fulfilled_qty
-            FROM purchase_order_lines
-            WHERE po_id = ?
-          `).all(go.po_id) as Array<{ target_qty: number; fulfilled_qty: number }>;
-
-          const allDone = poLines.length > 0 && poLines.every((pl) => Number(pl.fulfilled_qty) >= Number(pl.target_qty));
-          const anyDone = poLines.some((pl) => Number(pl.fulfilled_qty) > 0);
-          const newPoStatus = allDone ? "FULFILLED" : (anyDone ? "PARTIALLY_FULFILLED" : "CONFIRMED");
+          // Potong stok fisik via ledger negatif RETURN_OUT_POSTED
+          const nextSeq = this.getNextLedgerSequence(context.ownerId);
+          const ledgerId = crypto.randomUUID();
 
           this.db.prepare(`
-            UPDATE purchase_orders
-            SET status = ?, updated_at = ?
-            WHERE id = ?
-          `).run(newPoStatus, now, go.po_id);
+            INSERT INTO inventory_ledger (
+              id, sequence_number, owner_id, warehouse_id, product_id, location_id,
+              entry_type, source_doc_type, source_doc_id, source_line_id,
+              quantity_delta_base, serial_ids_json, actor_user_id, occurred_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, null, 'RETURN_OUT_POSTED', 'RETURN', ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            ledgerId,
+            nextSeq,
+            context.ownerId,
+            ret.warehouse_id,
+            l.product_id,
+            returnId,
+            l.id,
+            -Math.abs(Number(l.quantity)),
+            serialIdsForLedger.length > 0 ? JSON.stringify(serialIdsForLedger) : l.returned_serials_json,
+            context.userId,
+            now,
+            now
+          );
+
+          ledgerEntriesCount++;
+        }
+
+        // Update return_status pada Goods In
+        if (ret.goods_in_id) {
+          this.updateDocumentReturnStatus("GOODS_IN", ret.goods_in_id);
+        }
+      } else {
+        // ==========================================
+        // CUSTOMER_RETURN (Retur Barang dari Pelanggan)
+        // ==========================================
+        for (const l of lines) {
+          let ledgerDeltaBase = Number(l.quantity);
+          let serialIdsForLedger: string[] = [];
+
+          // Skenario A: Group Utuh (WHOLE_GROUP)
+          if (l.group_return_mode === "WHOLE_GROUP" && l.group_id) {
+            const grp = this.db.prepare(`
+              SELECT id, group_number, product_id, total_base_qty_pcs, unit_qty, unit
+              FROM serial_groupings WHERE id = ? AND owner_id = ?
+            `).get(l.group_id, context.ownerId) as {
+              id: string;
+              group_number: string;
+              product_id: string | null;
+              total_base_qty_pcs: number;
+              unit_qty: number;
+              unit: string;
+            } | undefined;
+
+            if (grp) {
+              // 1. Pulihkan wadah group ke AVAILABLE
+              this.db.prepare(`
+                UPDATE serial_groupings
+                SET status = 'AVAILABLE', dissolved_by = NULL, dissolved_at = NULL
+                WHERE id = ?
+              `).run(grp.id);
+
+              // 2. Pulihkan serial group di product_serials ke AVAILABLE
+              this.db.prepare(`
+                UPDATE product_serials
+                SET status = 'AVAILABLE', warehouse_id = ?, updated_at = ?
+                WHERE owner_id = ? AND serial_number = ? AND is_group = 1
+              `).run(ret.warehouse_id, now, context.ownerId, grp.group_number);
+
+              // 3. Anak-anak serial ikut GROUPED terikat parent
+              this.db.prepare(`
+                UPDATE product_serials
+                SET status = 'GROUPED', parent_group_id = ?, warehouse_id = ?, updated_at = ?
+                WHERE owner_id = ? AND id IN (
+                  SELECT serial_id FROM serial_grouping_components WHERE grouping_id = ?
+                )
+              `).run(grp.id, ret.warehouse_id, now, context.ownerId, grp.id);
+
+              ledgerDeltaBase = Number(grp.total_base_qty_pcs) || (Number(grp.unit_qty) * getUnitMultiplier(grp.unit));
+
+              const compRows = this.db.prepare(`
+                SELECT serial_id FROM serial_grouping_components WHERE grouping_id = ?
+              `).all(grp.id) as Array<{ serial_id: string }>;
+              serialIdsForLedger = compRows.map((c) => c.serial_id);
+            }
+          }
+          // Skenario B: Group Eceran (ECERAN_DISSOLVE)
+          else if (l.group_return_mode === "ECERAN_DISSOLVE" && l.group_id) {
+            const grp = this.db.prepare(`
+              SELECT id, group_number FROM serial_groupings WHERE id = ? AND owner_id = ?
+            `).get(l.group_id, context.ownerId) as { id: string; group_number: string } | undefined;
+
+            if (grp) {
+              // 1. Wadah group di-DISSOLVED
+              this.db.prepare(`
+                UPDATE serial_groupings
+                SET status = 'DISSOLVED', dissolved_by = ?, dissolved_at = ?, notes = COALESCE(notes || ' | ', '') || 'DISSOLVED akibat retur eceran oleh pelanggan'
+                WHERE id = ?
+              `).run(context.userId, now, grp.id);
+
+              // 2. Serial header group di-DECOMMISSIONED
+              this.db.prepare(`
+                UPDATE product_serials
+                SET status = 'DECOMMISSIONED', updated_at = ?
+                WHERE owner_id = ? AND serial_number = ? AND is_group = 1
+              `).run(now, context.ownerId, grp.group_number);
+
+              // 3. Serial yang fisik kembali jadi AVAILABLE (atau QUARANTINE jika RUSAK)
+              const returnedSns: string[] = l.returned_serials_json ? JSON.parse(l.returned_serials_json) : [];
+              const serialTargetStatus = l.condition === "BAIK" ? "AVAILABLE" : "QUARANTINE";
+
+              for (const sn of returnedSns) {
+                const sRow = this.db.prepare(`
+                  SELECT id FROM product_serials WHERE owner_id = ? AND (serial_number = ? OR id = ?)
+                `).get(context.ownerId, sn.trim().toUpperCase(), sn) as { id: string } | undefined;
+
+                if (sRow) {
+                  this.db.prepare(`
+                    UPDATE product_serials
+                    SET status = ?, parent_group_id = NULL, warehouse_id = ?, updated_at = ?
+                    WHERE id = ?
+                  `).run(serialTargetStatus, ret.warehouse_id, now, sRow.id);
+                  serialIdsForLedger.push(sRow.id);
+                }
+              }
+
+              // 4. Serial dalam group yang TIDAK kembali tetap CONSUMED_OUT, tetapi dilepas keterikatan parent_group_id
+              this.db.prepare(`
+                UPDATE product_serials
+                SET parent_group_id = NULL, updated_at = ?
+                WHERE parent_group_id = ? AND status = 'CONSUMED_OUT'
+              `).run(now, grp.id);
+
+              ledgerDeltaBase = returnedSns.length > 0 ? returnedSns.length : Number(l.quantity);
+            }
+          }
+          // Skenario C: Serial Mandiri (Non-group)
+          else {
+            if (l.returned_serials_json) {
+              const serials: string[] = JSON.parse(l.returned_serials_json);
+              const serialTargetStatus = l.condition === "BAIK" ? "AVAILABLE" : "QUARANTINE";
+
+              for (const sn of serials) {
+                const sRow = this.db.prepare(`
+                  SELECT id FROM product_serials WHERE owner_id = ? AND (serial_number = ? OR id = ?)
+                `).get(context.ownerId, sn.trim().toUpperCase(), sn) as { id: string } | undefined;
+
+                if (sRow) {
+                  this.db.prepare(`
+                    UPDATE product_serials
+                    SET status = ?, warehouse_id = ?, updated_at = ?
+                    WHERE id = ?
+                  `).run(serialTargetStatus, ret.warehouse_id, now, sRow.id);
+                  serialIdsForLedger.push(sRow.id);
+                }
+              }
+            }
+          }
+
+          // Mutasi ledger positif RETURN_IN_POSTED
+          const nextSeq = this.getNextLedgerSequence(context.ownerId);
+          const ledgerId = crypto.randomUUID();
+
+          this.db.prepare(`
+            INSERT INTO inventory_ledger (
+              id, sequence_number, owner_id, warehouse_id, product_id, location_id,
+              entry_type, source_doc_type, source_doc_id, source_line_id,
+              quantity_delta_base, serial_ids_json, actor_user_id, occurred_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, null, 'RETURN_IN_POSTED', 'RETURN', ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            ledgerId,
+            nextSeq,
+            context.ownerId,
+            ret.warehouse_id,
+            l.product_id,
+            returnId,
+            l.id,
+            ledgerDeltaBase,
+            serialIdsForLedger.length > 0 ? JSON.stringify(serialIdsForLedger) : l.returned_serials_json,
+            context.userId,
+            now,
+            now
+          );
+
+          ledgerEntriesCount++;
+        }
+
+        // Buka kembali kuota PO jika reopen_source_qty = 1
+        if (ret.reopen_source_qty === 1 && ret.goods_out_id) {
+          const go = this.db.prepare(`
+            SELECT po_id FROM goods_out WHERE id = ?
+          `).get(ret.goods_out_id) as { po_id: string | null } | undefined;
+
+          if (go?.po_id) {
+            for (const l of lines) {
+              this.db.prepare(`
+                UPDATE purchase_order_lines
+                SET fulfilled_qty = MAX(0, fulfilled_qty - ?)
+                WHERE po_id = ? AND product_id = ?
+              `).run(l.quantity, go.po_id, l.product_id);
+            }
+
+            const poLines = this.db.prepare(`
+              SELECT target_qty, fulfilled_qty
+              FROM purchase_order_lines
+              WHERE po_id = ?
+            `).all(go.po_id) as Array<{ target_qty: number; fulfilled_qty: number }>;
+
+            const allDone = poLines.length > 0 && poLines.every((pl) => Number(pl.fulfilled_qty) >= Number(pl.target_qty));
+            const anyDone = poLines.some((pl) => Number(pl.fulfilled_qty) > 0);
+            const newPoStatus = allDone ? "FULFILLED" : (anyDone ? "PARTIALLY_FULFILLED" : "CONFIRMED");
+
+            this.db.prepare(`
+              UPDATE purchase_orders
+              SET status = ?, updated_at = ?
+              WHERE id = ?
+            `).run(newPoStatus, now, go.po_id);
+          }
         }
       }
 
-      // 4. Update status retur ke RECEIVED
+      // Update status retur ke RECEIVED
       this.db.prepare(`
         UPDATE inventory_returns
         SET status = 'RECEIVED', received_by_user_id = ?, received_at = ?, updated_at = ?
         WHERE id = ?
       `).run(context.userId, now, now, returnId);
 
-      // 5. Audit Log
+      // Update return_status pada dokumen sumber (Goods Out / Goods In) setelah status retur resmi RECEIVED
+      if (ret.goods_out_id) {
+        this.updateDocumentReturnStatus("GOODS_OUT", ret.goods_out_id);
+      }
+      if (ret.goods_in_id) {
+        this.updateDocumentReturnStatus("GOODS_IN", ret.goods_in_id);
+      }
+
       this.recordAudit(
         context.ownerId,
         ret.warehouse_id,
@@ -9649,14 +11659,545 @@ export class InventoryRepository {
         returnId,
         {
           returnNumber: ret.return_number,
+          returnType: ret.return_type ?? "CUSTOMER_RETURN",
           ledgerEntriesCount,
           reopenSourceQty: ret.reopen_source_qty === 1,
           goodsOutId: ret.goods_out_id ?? undefined,
+          goodsInId: ret.goods_in_id ?? undefined,
         }
       );
 
       return { received: true, returnId, ledgerEntriesCount };
     });
+  }
+
+  /**
+   * Batalkan retur DRAFT tanpa mutasi ledger.
+   */
+  cancelDraftInventoryReturn(
+    context: ActiveSecurityContext,
+    returnId: string,
+    reason?: string
+  ): { cancelled: boolean; returnId: string } {
+    const ret = this.db.prepare(`
+      SELECT id, owner_id, warehouse_id, return_number, status
+      FROM inventory_returns
+      WHERE id = ? AND owner_id = ?
+    `).get(returnId, context.ownerId) as {
+      id: string;
+      owner_id: string;
+      warehouse_id: string;
+      return_number: string;
+      status: string;
+    } | undefined;
+
+    if (!ret) {
+      throw new AppError("ERR_NOT_FOUND", "Dokumen retur tidak ditemukan.", 404);
+    }
+
+    this.assertContext(context, ret.warehouse_id);
+
+    if (ret.status !== "DRAFT") {
+      throw new AppError(
+        RETURN_ERROR_CODES.CANNOT_CANCEL,
+        `Hanya retur berstatus DRAFT yang dapat dibatalkan (status saat ini: ${ret.status}).`,
+        409
+      );
+    }
+
+    const now = new Date().toISOString();
+    this.db.prepare(`
+      UPDATE inventory_returns
+      SET status = 'CANCELLED', notes = COALESCE(notes || ' | ', '') || ?, updated_at = ?
+      WHERE id = ?
+    `).run(`[DRAFT DIBATALKAN: ${reason || "Dibatalkan oleh operator"}]`, now, returnId);
+
+    this.recordAudit(
+      context.ownerId,
+      ret.warehouse_id,
+      context.userId,
+      "CANCEL_DRAFT_RETURN",
+      "RETURN",
+      returnId,
+      {
+        returnNumber: ret.return_number,
+        reason,
+      }
+    );
+
+    return { cancelled: true, returnId };
+  }
+
+  /**
+   * Alias kompatibilitas untuk cancelDraftInventoryReturn
+   */
+  cancelInventoryReturn(
+    context: ActiveSecurityContext,
+    returnId: string,
+    reason?: string
+  ): { cancelled: boolean; returnId: string } {
+    return this.cancelDraftInventoryReturn(context, returnId, reason);
+  }
+
+  /**
+   * Revert / Batalkan retur RECEIVED (Restore Transaksi Retur yang Sudah Selesai)
+   * Membalikkan mutasi ledger melalui entri kompensasi RETURN_REVERSAL_POSTED,
+   * memverifikasi bahwa serial yang dulu dikembalikan masih AVAILABLE di gudang,
+   * dan memulihkan status serial & group ke snapshot sebelum retur.
+   */
+  revertReceivedInventoryReturn(
+    context: ActiveSecurityContext,
+    input: RevertInventoryReturnInput
+  ): { reverted: boolean; returnId: string; ledgerEntriesCount: number } {
+    const ret = this.db.prepare(`
+      SELECT id, owner_id, warehouse_id, return_type, customer_id, supplier_id,
+             goods_out_id, goods_in_id, return_number, reason, status, reopen_source_qty
+      FROM inventory_returns
+      WHERE id = ? AND owner_id = ?
+    `).get(input.returnId, context.ownerId) as {
+      id: string;
+      owner_id: string;
+      warehouse_id: string;
+      return_type: ReturnType | null;
+      customer_id: string | null;
+      supplier_id: string | null;
+      goods_out_id: string | null;
+      goods_in_id: string | null;
+      return_number: string;
+      reason: string;
+      status: string;
+      reopen_source_qty: number;
+    } | undefined;
+
+    if (!ret) {
+      throw new AppError("ERR_NOT_FOUND", "Dokumen retur tidak ditemukan.", 404);
+    }
+
+    this.assertContext(context, ret.warehouse_id);
+
+    if (ret.status !== "RECEIVED") {
+      throw new AppError(
+        RETURN_ERROR_CODES.CANNOT_REVERT,
+        `Hanya retur berstatus RECEIVED yang dapat direvert / dibatalkan (status saat ini: ${ret.status}).`,
+        409
+      );
+    }
+
+    const lines = this.db.prepare(`
+      SELECT id, product_id, quantity, unit, condition, returned_serials_json,
+             group_id, group_return_mode
+      FROM inventory_return_lines
+      WHERE return_id = ?
+    `).all(input.returnId) as Array<{
+      id: string;
+      product_id: string;
+      quantity: number;
+      unit: string;
+      condition: "BAIK" | "RUSAK";
+      returned_serials_json: string | null;
+      group_id: string | null;
+      group_return_mode: GroupReturnMode | null;
+    }>;
+
+    const now = new Date().toISOString();
+    const isSupplierReturn = ret.return_type === "SUPPLIER_RETURN";
+
+    return this.db.transaction(() => {
+      let ledgerEntriesCount = 0;
+
+      if (isSupplierReturn) {
+        // ==========================================
+        // SUPPLIER_RETURN REVERSAL
+        // ==========================================
+        for (const l of lines) {
+          if (l.returned_serials_json) {
+            const snList: string[] = JSON.parse(l.returned_serials_json);
+            for (const sn of snList) {
+              this.db.prepare(`
+                UPDATE product_serials
+                SET status = 'AVAILABLE', warehouse_id = ?, updated_at = ?
+                WHERE owner_id = ? AND (serial_number = ? OR id = ?)
+              `).run(ret.warehouse_id, now, context.ownerId, sn.trim().toUpperCase(), sn);
+            }
+          }
+
+          // Balik mutasi ledger dengan entri kompensasi RETURN_REVERSAL_POSTED (kuantitas positif)
+          const nextSeq = this.getNextLedgerSequence(context.ownerId);
+          const ledgerId = crypto.randomUUID();
+
+          this.db.prepare(`
+            INSERT INTO inventory_ledger (
+              id, sequence_number, owner_id, warehouse_id, product_id, location_id,
+              entry_type, source_doc_type, source_doc_id, source_line_id,
+              quantity_delta_base, serial_ids_json, actor_user_id, occurred_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, null, 'RETURN_REVERSAL_POSTED', 'RETURN', ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            ledgerId,
+            nextSeq,
+            context.ownerId,
+            ret.warehouse_id,
+            l.product_id,
+            ret.id,
+            l.id,
+            Math.abs(Number(l.quantity)),
+            l.returned_serials_json,
+            context.userId,
+            now,
+            now
+          );
+
+          ledgerEntriesCount++;
+        }
+
+        // Update return_status pada Goods In
+        if (ret.goods_in_id) {
+          this.db.prepare(`UPDATE inventory_returns SET status = 'CANCELLED' WHERE id = ?`).run(ret.id);
+          this.updateDocumentReturnStatus("GOODS_IN", ret.goods_in_id);
+        }
+      } else {
+        // ==========================================
+        // CUSTOMER_RETURN REVERSAL
+        // ==========================================
+        // 1. Validasi serial: apakah masih AVAILABLE atau QUARANTINE (belum terjual lagi)?
+        for (const l of lines) {
+          if (l.group_return_mode === "WHOLE_GROUP" && l.group_id) {
+            const grp = this.db.prepare(`
+              SELECT status, group_number FROM serial_groupings WHERE id = ?
+            `).get(l.group_id) as { status: string; group_number: string } | undefined;
+
+            if (grp && grp.status !== "AVAILABLE") {
+              throw new AppError(
+                RETURN_ERROR_CODES.CANNOT_REVERT,
+                `Group '${grp.group_number}' tidak lagi berstatus AVAILABLE (status: ${grp.status}). Reversal retur dibatalkan.`,
+                409
+              );
+            }
+          }
+
+          if (l.returned_serials_json) {
+            const snList: string[] = JSON.parse(l.returned_serials_json);
+            for (const sn of snList) {
+              const psRow = this.db.prepare(`
+                SELECT serial_number, status FROM product_serials
+                WHERE owner_id = ? AND (serial_number = ? OR id = ?)
+              `).get(context.ownerId, sn.trim().toUpperCase(), sn) as { serial_number: string; status: string } | undefined;
+
+              if (psRow && psRow.status !== "AVAILABLE" && psRow.status !== "QUARANTINE" && psRow.status !== "GROUPED") {
+                throw new AppError(
+                  RETURN_ERROR_CODES.CANNOT_REVERT,
+                  `Nomor seri '${psRow.serial_number}' tidak dapat direvert karena sudah tidak tersedia di gudang (status: ${psRow.status}).`,
+                  409
+                );
+              }
+            }
+          }
+        }
+
+        // 2. Kembalikan status serial & group ke snapshot sebelum retur (CONSUMED_OUT)
+        for (const l of lines) {
+          let reverseDeltaBase = Number(l.quantity);
+
+          if (l.group_return_mode === "WHOLE_GROUP" && l.group_id) {
+            const grp = this.db.prepare(`
+              SELECT id, group_number, total_base_qty_pcs, unit_qty, unit FROM serial_groupings WHERE id = ?
+            `).get(l.group_id) as { id: string; group_number: string; total_base_qty_pcs: number; unit_qty: number; unit: string } | undefined;
+
+            if (grp) {
+              this.db.prepare(`UPDATE serial_groupings SET status = 'CONSUMED_OUT' WHERE id = ?`).run(grp.id);
+              this.db.prepare(`
+                UPDATE product_serials
+                SET status = 'CONSUMED_OUT', updated_at = ?
+                WHERE owner_id = ? AND serial_number = ? AND is_group = 1
+              `).run(now, context.ownerId, grp.group_number);
+
+              this.db.prepare(`
+                UPDATE product_serials
+                SET status = 'CONSUMED_OUT', updated_at = ?
+                WHERE parent_group_id = ?
+              `).run(now, grp.id);
+
+              reverseDeltaBase = Number(grp.total_base_qty_pcs) || (Number(grp.unit_qty) * getUnitMultiplier(grp.unit));
+            }
+          } else {
+            if (l.returned_serials_json) {
+              const snList: string[] = JSON.parse(l.returned_serials_json);
+              for (const sn of snList) {
+                this.db.prepare(`
+                  UPDATE product_serials
+                  SET status = 'CONSUMED_OUT', updated_at = ?
+                  WHERE owner_id = ? AND (serial_number = ? OR id = ?)
+                `).run(now, context.ownerId, sn.trim().toUpperCase(), sn);
+              }
+            }
+          }
+
+          // Balik mutasi ledger dengan entri kompensasi RETURN_REVERSAL_POSTED (kuantitas negatif)
+          const nextSeq = this.getNextLedgerSequence(context.ownerId);
+          const ledgerId = crypto.randomUUID();
+
+          this.db.prepare(`
+            INSERT INTO inventory_ledger (
+              id, sequence_number, owner_id, warehouse_id, product_id, location_id,
+              entry_type, source_doc_type, source_doc_id, source_line_id,
+              quantity_delta_base, serial_ids_json, actor_user_id, occurred_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, null, 'RETURN_REVERSAL_POSTED', 'RETURN', ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            ledgerId,
+            nextSeq,
+            context.ownerId,
+            ret.warehouse_id,
+            l.product_id,
+            ret.id,
+            l.id,
+            -Math.abs(reverseDeltaBase),
+            l.returned_serials_json,
+            context.userId,
+            now,
+            now
+          );
+
+          ledgerEntriesCount++;
+        }
+
+        // Jika dulu reopen_source_qty = 1 dan ada PO, pulihkan penambahan fulfilled_qty
+        if (ret.reopen_source_qty === 1 && ret.goods_out_id) {
+          const go = this.db.prepare(`SELECT po_id FROM goods_out WHERE id = ?`).get(ret.goods_out_id) as { po_id: string | null } | undefined;
+          if (go?.po_id) {
+            for (const l of lines) {
+              this.db.prepare(`
+                UPDATE purchase_order_lines
+                SET fulfilled_qty = fulfilled_qty + ?
+                WHERE po_id = ? AND product_id = ?
+              `).run(l.quantity, go.po_id, l.product_id);
+            }
+          }
+        }
+
+        // Update return_status pada Goods Out
+        if (ret.goods_out_id) {
+          this.db.prepare(`UPDATE inventory_returns SET status = 'CANCELLED' WHERE id = ?`).run(ret.id);
+          this.updateDocumentReturnStatus("GOODS_OUT", ret.goods_out_id);
+        }
+      }
+
+      // Finalize status retur ke CANCELLED
+      const reversalReasonNote = input.reason ? ` [REVERTED: ${input.reason.trim()}]` : " [REVERTED]";
+      this.db.prepare(`
+        UPDATE inventory_returns
+        SET status = 'CANCELLED', notes = COALESCE(notes || ' | ', '') || ?, updated_at = ?
+        WHERE id = ?
+      `).run(reversalReasonNote, now, ret.id);
+
+      this.recordAudit(
+        context.ownerId,
+        ret.warehouse_id,
+        context.userId,
+        "REVERT_INVENTORY_RETURN",
+        "RETURN",
+        ret.id,
+        {
+          returnNumber: ret.return_number,
+          returnType: ret.return_type ?? "CUSTOMER_RETURN",
+          ledgerEntriesCount,
+          reason: input.reason,
+        }
+      );
+
+      return { reverted: true, returnId: ret.id, ledgerEntriesCount };
+    });
+  }
+
+  /**
+   * Alias kompatibilitas untuk revertReceivedInventoryReturn
+   */
+  revertInventoryReturn(
+    context: ActiveSecurityContext,
+    returnId: string,
+    revertReason: string
+  ): { reverted: boolean; returnId: string; ledgerEntriesCount: number } {
+    return this.revertReceivedInventoryReturn(context, { returnId, reason: revertReason });
+  }
+
+  /**
+   * Mengambil serial yang dapat diretur dari Goods Out tertentu atau Goods In tertentu.
+   */
+  getReturnableSerials(
+    context: ActiveSecurityContext,
+    params: { goodsOutId?: string; goodsInId?: string; productId?: string }
+  ): Array<{
+    serialId: string;
+    serialNumber: string;
+    productId: string;
+    productName: string;
+    sku: string;
+    status: string;
+    isGroup: boolean;
+    parentGroupId: string | null;
+    groupNumber: string | null;
+  }> {
+    if (!params.goodsOutId && !params.goodsInId) {
+      throw new AppError("ERR_VALIDATION", "goodsOutId atau goodsInId wajib disertakan.", 400);
+    }
+
+    if (params.goodsOutId) {
+      const lines = this.db.prepare(`
+        SELECT product_id, allocated_serials_json, group_id, group_serials_snapshot_json
+        FROM goods_out_lines
+        WHERE goods_out_id = ?
+      `).all(params.goodsOutId) as Array<{
+        product_id: string;
+        allocated_serials_json: string | null;
+        group_id: string | null;
+        group_serials_snapshot_json: string | null;
+      }>;
+
+      const serialIds = new Set<string>();
+      for (const l of lines) {
+        if (params.productId && l.product_id !== params.productId) continue;
+
+        if (l.allocated_serials_json) {
+          const ids: string[] = JSON.parse(l.allocated_serials_json);
+          ids.forEach((id) => serialIds.add(id));
+        }
+        if (l.group_serials_snapshot_json) {
+          const snapIds: string[] = JSON.parse(l.group_serials_snapshot_json);
+          snapIds.forEach((id) => serialIds.add(id));
+        }
+      }
+
+      if (serialIds.size === 0) return [];
+
+      const returnedRows = this.db.prepare(`
+        SELECT irl.returned_serials_json
+        FROM inventory_return_lines irl
+        JOIN inventory_returns ir ON ir.id = irl.return_id
+        WHERE ir.goods_out_id = ? AND ir.status IN ('DRAFT', 'RECEIVED') AND irl.returned_serials_json IS NOT NULL
+      `).all(params.goodsOutId) as Array<{ returned_serials_json: string }>;
+
+      const alreadyReturnedSns = new Set<string>();
+      for (const r of returnedRows) {
+        const sns: string[] = JSON.parse(r.returned_serials_json);
+        sns.forEach((sn) => alreadyReturnedSns.add(sn.toUpperCase()));
+      }
+
+      const placeholders = Array.from(serialIds).map(() => "?").join(",");
+      const query = `
+        SELECT ps.id AS serialId, ps.serial_number AS serialNumber, ps.product_id AS productId,
+               p.name AS productName, p.sku AS sku, ps.status, ps.is_group AS isGroup,
+               ps.parent_group_id AS parentGroupId, sg.group_number AS groupNumber
+        FROM product_serials ps
+        JOIN products p ON p.id = ps.product_id
+        LEFT JOIN serial_groupings sg ON sg.id = ps.parent_group_id
+        WHERE ps.owner_id = ? AND (ps.id IN (${placeholders}) OR ps.serial_number IN (${placeholders}))
+      `;
+      const rows = this.db.prepare(query).all(context.ownerId, ...Array.from(serialIds), ...Array.from(serialIds)) as Array<{
+        serialId: string;
+        serialNumber: string;
+        productId: string;
+        productName: string;
+        sku: string;
+        status: string;
+        isGroup: number;
+        parentGroupId: string | null;
+        groupNumber: string | null;
+      }>;
+
+      return rows
+        .filter((r) => !alreadyReturnedSns.has(r.serialNumber.toUpperCase()) && !alreadyReturnedSns.has(r.serialId.toUpperCase()))
+        .map((r) => ({
+          serialId: r.serialId,
+          serialNumber: r.serialNumber,
+          productId: r.productId,
+          productName: r.productName,
+          sku: r.sku,
+          status: r.status,
+          isGroup: r.isGroup === 1,
+          parentGroupId: r.parentGroupId,
+          groupNumber: r.groupNumber,
+        }));
+    } else {
+      const lines = this.db.prepare(`
+        SELECT product_id, received_serials_json
+        FROM goods_in_lines
+        WHERE goods_in_id = ?
+      `).all(params.goodsInId) as Array<{
+        product_id: string;
+        received_serials_json: string | null;
+      }>;
+
+      const serialIds = new Set<string>();
+      for (const l of lines) {
+        if (params.productId && l.product_id !== params.productId) continue;
+        if (l.received_serials_json) {
+          const ids: string[] = JSON.parse(l.received_serials_json);
+          ids.forEach((id) => serialIds.add(id));
+        }
+      }
+
+      const returnedRows = this.db.prepare(`
+        SELECT irl.returned_serials_json
+        FROM inventory_return_lines irl
+        JOIN inventory_returns ir ON ir.id = irl.return_id
+        WHERE ir.goods_in_id = ? AND ir.status IN ('DRAFT', 'RECEIVED') AND irl.returned_serials_json IS NOT NULL
+      `).all(params.goodsInId) as Array<{ returned_serials_json: string }>;
+
+      const alreadyReturnedSns = new Set<string>();
+      for (const r of returnedRows) {
+        const sns: string[] = JSON.parse(r.returned_serials_json);
+        sns.forEach((sn) => alreadyReturnedSns.add(sn.toUpperCase()));
+      }
+
+      let query = `
+        SELECT ps.id AS serialId, ps.serial_number AS serialNumber, ps.product_id AS productId,
+               p.name AS productName, p.sku AS sku, ps.status, ps.is_group AS isGroup,
+               ps.parent_group_id AS parentGroupId, sg.group_number AS groupNumber
+        FROM product_serials ps
+        JOIN products p ON p.id = ps.product_id
+        LEFT JOIN serial_groupings sg ON sg.id = ps.parent_group_id
+        WHERE ps.owner_id = ? AND ps.status = 'AVAILABLE' AND ps.parent_group_id IS NULL
+      `;
+      const queryParams: unknown[] = [context.ownerId];
+
+      if (params.productId) {
+        query += ` AND ps.product_id = ?`;
+        queryParams.push(params.productId);
+      }
+
+      if (serialIds.size > 0) {
+        const placeholders = Array.from(serialIds).map(() => "?").join(",");
+        query += ` AND (ps.source_goods_in_id = ? OR ps.id IN (${placeholders}) OR ps.serial_number IN (${placeholders}))`;
+        queryParams.push(params.goodsInId, ...Array.from(serialIds), ...Array.from(serialIds));
+      } else {
+        query += ` AND ps.source_goods_in_id = ?`;
+        queryParams.push(params.goodsInId);
+      }
+
+      const rows = this.db.prepare(query).all(...queryParams) as Array<{
+        serialId: string;
+        serialNumber: string;
+        productId: string;
+        productName: string;
+        sku: string;
+        status: string;
+        isGroup: number;
+        parentGroupId: string | null;
+        groupNumber: string | null;
+      }>;
+
+      return rows
+        .filter((r) => !alreadyReturnedSns.has(r.serialNumber.toUpperCase()) && !alreadyReturnedSns.has(r.serialId.toUpperCase()))
+        .map((r) => ({
+          serialId: r.serialId,
+          serialNumber: r.serialNumber,
+          productId: r.productId,
+          productName: r.productName,
+          sku: r.sku,
+          status: r.status,
+          isGroup: r.isGroup === 1,
+          parentGroupId: r.parentGroupId,
+          groupNumber: r.groupNumber,
+        }));
+    }
   }
 }
 

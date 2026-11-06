@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { Plus, AlertCircle, PackageOpen, ChevronLeft, ChevronRight, Download } from 'lucide-react';
+import { Plus, AlertCircle, PackageOpen, ChevronLeft, ChevronRight, Download, Layers } from 'lucide-react';
 import { useApp } from '../../context/AppContext.jsx';
 import { api, getWorkspaceSettings, canExportProducts } from '../../utils/api.js';
 import { useUnits } from '../../hooks/useUnits.js';
@@ -11,6 +11,12 @@ import ProductTable from './ProductTable.jsx';
 import ProductCard from './ProductCard.jsx';
 import ProductSkeleton from './ProductSkeleton.jsx';
 import AddProductModal from './AddProductModal.jsx';
+import SerialGroupModal from './SerialGroupModal.jsx';
+import {
+  calculateDocumentStockMovements,
+  calculateAvailableSerialsByProduct,
+  getProductEffectiveStockInPcs,
+} from '../../utils/stockCalculation.js';
 import './ProductsPage.css';
 
 export default function ProductsPage() {
@@ -96,6 +102,7 @@ export default function ProductsPage() {
   const activeViewMode = isMobile ? 'card' : viewMode;
 
   const [showAddModal, setShowAddModal] = useState(false);
+  const [showGroupModal, setShowGroupModal] = useState(false);
 
   // Fetch Products via react-query
   const {
@@ -152,109 +159,42 @@ export default function ProductsPage() {
     refetchSerials();
   };
 
-  // Merge products with available serials & completed Goods In/Out transactions
+  // Merge products with available serials & Goods In/Out transactions
   const productsList = useMemo(() => {
     if (!rawProducts) return [];
-    const serials = rawSerials ?? [];
 
-    // 1. Calculate available serial numbers qty in pcs per product (STRICTLY from active Goods In)
-    const availableSerialCountByProduct = serials.reduce((acc, serial) => {
-      const prodId = serial.product_id || serial.productId;
-      if (serial.status !== 'available' || !prodId) return acc;
+    // 1. Calculate physical available serials per product (scoped to active warehouse)
+    const availableSerialCountByProduct = calculateAvailableSerialsByProduct({
+      serials: rawSerials ?? [],
+      documents: rawDocuments ?? [],
+      multipliers,
+      customUnits,
+      activeWarehouseId,
+    });
 
-      // Serial must be tied to an active Goods In document
-      const goodsInDocId = serial.goodsInDocumentId || serial.goods_in_document_id;
-      if (!goodsInDocId) return acc;
-      const linkedDoc = (rawDocuments ?? []).find((d) => d.id === goodsInDocId);
-      if (!linkedDoc || (linkedDoc.document_type !== 'goods_in' && linkedDoc.type !== 'goods_in') || linkedDoc.status === 'cancelled') {
-        return acc;
-      }
-
-      let unit = serial.metadata?.serialUnit || serial.serialUnit || serial.unit;
-      const sn = String(serial.serialNumber ?? serial.serial_number ?? '').toLowerCase();
-
-      if (!unit || unit === 'piece' || unit === 'pcs') {
-        if (Array.isArray(customUnits) && customUnits.length > 0) {
-          const sorted = [...customUnits].sort((a, b) => (b.key?.length || 0) - (a.key?.length || 0));
-          for (const u of sorted) {
-            const k = String(u.key).toLowerCase().trim();
-            if (!k || k === 'pcs') continue;
-            if (sn.includes(k)) {
-              unit = k;
-              break;
-            }
-          }
-        }
-        if (!unit || unit === 'piece' || unit === 'pcs') {
-          if (sn.includes('10bl') || sn.includes('bal10')) unit = 'bal10';
-          else if (sn.includes('15bl') || sn.includes('bal15')) unit = 'bal15';
-          else if (sn.includes('20bl') || sn.includes('bal20')) unit = 'bal20';
-          else if (sn.includes('25bl') || sn.includes('bal25')) unit = 'bal25';
-          else if (sn.includes('bal5') || sn.includes('5bl')) unit = 'bal5';
-          else if (sn.includes('pack3') || sn.includes('pk3')) unit = 'pack3';
-          else if (sn.includes('pack6') || sn.includes('pk6')) unit = 'pack6';
-          else if (sn.includes('bal') || sn.includes('bl')) unit = 'bal';
-          else if (sn.includes('pack') || sn.includes('pk')) unit = 'pack';
-          else if (sn.includes('lusin') || sn.includes('doz')) unit = 'dozen';
-        }
-        if ((!unit || unit === 'piece' || unit === 'pcs') && linkedDoc.items) {
-          const sDocItemId = serial.goodsInItemId || serial.goods_in_item_id;
-          const item = linkedDoc.items.find((it) => {
-            if (sDocItemId) return it.id === sDocItemId || it.itemId === sDocItemId;
-            const itProdId = it.productId || it.product_id;
-            return prodId && (itProdId === prodId || String(itProdId) === String(prodId));
-          });
-          if (item) {
-            unit = item.metadata?.qtyUnit || item.qtyUnit || item.unit || 'pcs';
-          }
-        }
-      }
-
-      const cleanUnit = String(unit).toLowerCase();
-      const qty = multipliers[cleanUnit] || 1;
-      acc.set(prodId, (acc.get(prodId) ?? 0) + qty);
-      return acc;
-    }, new Map());
-
-    // 2. Calculate net stock strictly from active Goods In minus Goods Out documents
-    const productStockMovements = new Map();
-
-    (rawDocuments ?? []).forEach((doc) => {
-      const status = doc.status || 'draft';
-      // Draft/processing/ready documents have not posted inventory yet.
-      if (status !== 'completed') return;
-
-      const docType = doc.document_type || doc.type;
-      const isGoodsIn = docType === 'goods_in';
-      const isGoodsOut = docType === 'goods_out';
-
-      if (!isGoodsIn && !isGoodsOut) return;
-
-      const items = doc.items ?? [];
-      items.forEach((item) => {
-        const productId = item.productId ?? item.product_id;
-        if (!productId) return;
-
-        const rawQty = item.metadata?.qtyInput ?? item.quantity ?? item.qty ?? 1;
-        const unit = item.metadata?.qtyUnit || item.qtyUnit || item.unit || 'pcs';
-        const mult = multipliers[unit] || 1;
-        const qtyInPcs = rawQty * mult;
-
-        const current = productStockMovements.get(productId) ?? { in: 0, out: 0 };
-        if (isGoodsIn) current.in += qtyInPcs;
-        if (isGoodsOut) current.out += qtyInPcs;
-        productStockMovements.set(productId, current);
-      });
+    // 2. Calculate net stock movements strictly for active warehouse
+    const productStockMovements = calculateDocumentStockMovements({
+      documents: rawDocuments ?? [],
+      products: rawProducts,
+      multipliers,
+      activeWarehouseId,
     });
 
     return rawProducts.map((row) => {
       const metadata = row.metadata ?? {};
       const mov = productStockMovements.get(row.id);
-      
-      // Net stock is strictly Goods In minus Goods Out
-      const totalStock = mov ? Math.max(0, mov.in - mov.out) : 0;
-      const serialAvailableCount = availableSerialCountByProduct.get(row.id) ?? 0;
-      const nonSerialStock = Math.max(0, totalStock - serialAvailableCount);
+      const netMovementStock = mov ? mov.net : 0;
+      const serialAvailablePcs = availableSerialCountByProduct.get(row.id) ?? 0;
+      const hasSerials = (rawSerials ?? []).some((s) => (s.product_id ?? s.productId) === row.id);
+
+      const totalStock = getProductEffectiveStockInPcs({
+        product: { ...row, trackingMode: metadata.trackingMode ?? 'non_serial' },
+        availableSerialPcs: serialAvailablePcs,
+        netMovementPcs: netMovementStock,
+        hasSerials,
+      });
+
+      const nonSerialStock = Math.max(0, totalStock - serialAvailablePcs);
 
       return {
         id: row.id,
@@ -270,7 +210,7 @@ export default function ProductsPage() {
         imageUrl: metadata.imageUrl ?? metadata.image ?? metadata.photoUrl ?? '',
       };
     });
-  }, [rawProducts, rawSerials, rawDocuments, multipliers, customUnits]);
+  }, [rawProducts, rawSerials, rawDocuments, multipliers, customUnits, activeWarehouseId]);
 
   // Hook filters management
   const {
@@ -383,7 +323,7 @@ export default function ProductsPage() {
             {t('products.subtitle', { count: totalItems })}
           </p>
         </div>
-        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+        <div className="products-page__header-actions">
           {canExport && (
             <button
               type="button"
@@ -400,6 +340,16 @@ export default function ProductsPage() {
               )}
             </button>
           )}
+          <button
+            type="button"
+            className="btn btn-secondary interactive btn-md"
+            onClick={() => setShowGroupModal(true)}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+            title="Kelompokkan nomor seri dari berbagai produk"
+          >
+            <Layers size={16} />
+            <span>Grouping Serial</span>
+          </button>
           <button
             type="button"
             className="btn btn-primary interactive btn-md"
@@ -539,6 +489,14 @@ export default function ProductsPage() {
         onClose={() => setShowAddModal(false)}
         products={productsList}
         onSuccess={() => queryClient.invalidateQueries({ queryKey: ['products'] })}
+      />
+      <SerialGroupModal
+        isOpen={showGroupModal}
+        onClose={() => setShowGroupModal(false)}
+        onSuccess={() => {
+          queryClient.invalidateQueries({ queryKey: ['products'] });
+          queryClient.invalidateQueries({ queryKey: ['product-serials'] });
+        }}
       />
     </div>
   );

@@ -1,6 +1,16 @@
 {
   "version": 2,
   "regions": ["sin1"],
+  "crons": [
+    {
+      "path": "/api/cron/daily-report",
+      "schedule": "0 12 * * *"
+    },
+    {
+      "path": "/api/cron/retry-emails",
+      "schedule": "0 13 * * *"
+    }
+  ],
   "rewrites": [
     {
       "source": "/",
